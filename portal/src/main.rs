@@ -11,7 +11,6 @@ mod tools;
 mod kits;
 mod mcp;
 mod protocol;
-mod cowork;
 mod relay_client;
 mod single_instance;
 mod upgrade;
@@ -22,7 +21,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::TcpListener;
-use tracing::{info, warn, error, debug, trace};
+use tracing::{info, warn, debug, trace};
 
 use crate::config::PortalConfig;
 use crate::protocol::{JsonRpcRequest, JsonRpcResponse, JsonRpcError, PORTAL_VERSION};
@@ -153,8 +152,8 @@ async fn main() -> Result<()> {
 
     if connect_link.is_some() {
         info!(
-            "Portal '{}' connect mode (Cowork HTTP on :{}) — MCP via Hearth relay :4000",
-            config.name, config.cowork.http_port
+            "Portal '{}' connect mode — MCP via Hearth relay",
+            config.name
         );
     } else {
         info!("Portal '{}' starting on {}:{}", config.name, config.bind_host, config.bind_port);
@@ -190,54 +189,6 @@ async fn main() -> Result<()> {
 
     let tool_list = tool_host.list_tools().await;
     info!("Portal tools: {}", tool_list.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", "));
-
-    // Cowork HTTP server (replaces old health endpoint)
-    if config.cowork.enabled {
-        if cowork::cowork_token().is_none() {
-            warn!("══════════════════════════════════════════════════════════════════════");
-            warn!("Cowork token not set (PORTAL_TOKEN / LOOM_TOKEN): HTTP API and WebSocket are");
-            warn!("unauthenticated. Set a token for any network-exposed deployment.");
-            warn!("══════════════════════════════════════════════════════════════════════");
-        }
-        let cowork_config = config.clone();
-        let workspace = config.security.workspace_root.clone();
-        let (file_tx, _) = tokio::sync::broadcast::channel::<cowork::FileEvent>(256);
-        
-        // Start file watcher
-        cowork::start_file_watcher(workspace.clone(), file_tx.clone());
-        
-        let state = cowork::CoworkState {
-            config: cowork_config.clone(),
-            workspace,
-            file_events: file_tx,
-        };
-        let router = cowork::cowork_router(state);
-        let http_port = cowork_config.cowork.http_port;
-        let http_addr = format!("{}:{}", cowork_config.bind_host, http_port);
-        info!("Cowork HTTP server starting on {}", http_addr);
-        
-        tokio::spawn(async move {
-            match tokio::net::TcpListener::bind(&http_addr).await {
-                Ok(listener) => {
-                    if let Err(e) = axum::serve(listener, router).await {
-                        error!("Cowork server failed: {}", e);
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to bind cowork HTTP server to {}: {}", http_addr, e);
-                }
-            }
-        });
-    } else {
-        // Fallback: simple health endpoint
-        let health_port = config.bind_port + 1;
-        let health_name = config.name.clone();
-        tokio::spawn(async move {
-            if let Err(e) = run_health_server(&health_name, health_port).await {
-                warn!("Health server failed: {}", e);
-            }
-        });
-    }
 
     if let Some(ref loom) = connect_link {
         // Relay handshake identity: --name, non-generic config name, then host name.
@@ -284,8 +235,7 @@ async fn main() -> Result<()> {
     // Listen for MCP supervisor connections
     let addr = format!("{}:{}", config.bind_host, config.bind_port);
     let listener = TcpListener::bind(&addr).await?;
-    let http_port = config.cowork.http_port;
-    info!("Portal listening on {} (HTTP on :{})", addr, http_port);
+    info!("Portal MCP listening on {}", addr);
 
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
     let mut shutdown_rx = shutdown_tx.subscribe();
@@ -769,29 +719,6 @@ async fn handle_request(
                 }),
             }
         }
-    }
-}
-
-/// Simple HTTP health endpoint
-async fn run_health_server(portal_name: &str, port: u16) -> Result<()> {
-    let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
-    info!("Health server on :{}", port);
-
-    let name = portal_name.to_string();
-    loop {
-        let (mut stream, _) = listener.accept().await?;
-        let name = name.clone();
-        tokio::spawn(async move {
-            use tokio::io::AsyncReadExt;
-            let mut buf = [0u8; 1024];
-            let _ = stream.read(&mut buf).await;
-            let body = format!("{{\"status\":\"ok\",\"name\":\"{}\",\"version\":\"{}\"}}", name, PORTAL_VERSION);
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                body.len(), body
-            );
-            let _ = stream.write_all(response.as_bytes()).await;
-        });
     }
 }
 

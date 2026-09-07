@@ -75,7 +75,14 @@ class LifecycleTests(unittest.TestCase):
             (root / 'target/release').mkdir(parents=True)
             shutil.copy2(REPO / 'scripts/portal-launchagent.sh', root / 'scripts')
             shutil.copy2(binary, root / 'target/release/heart-portal')
-            (root / 'portal.toml').write_text('name = "fixture"\nworkspace = "./workspace"\nbind = "127.0.0.1:0"\nkits_enabled = false\n[cowork]\nhttp_port = 0\n')
+            # Existing configs remain usable, but must not start the retired
+            # HTTP server alongside the relay/MCP connection.
+            with socket.socket() as unused_http:
+                unused_http.bind(('127.0.0.1', 0))
+                retired_http_port = unused_http.getsockname()[1]
+            (root / 'portal.toml').write_text(
+                'name = "fixture"\nworkspace = "./workspace"\nbind = "127.0.0.1:0"\n'
+                f'kits_enabled = false\n[cowork]\nenabled = true\nhttp_port = {retired_http_port}\n')
             relay.bind(('127.0.0.1', 0))
             relay.listen()
             relay.settimeout(25)
@@ -139,6 +146,8 @@ class LifecycleTests(unittest.TestCase):
                     send(stream, {'ok': True, 'relay_keepalive': 'text-v1'})
                     send(stream, {'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list', 'params': {}})
                     self.assertIn('portal_restart', [tool['name'] for tool in receive(stream)['result']['tools']])
+                    with self.assertRaises(ConnectionRefusedError):
+                        socket.create_connection(('127.0.0.1', retired_http_port), timeout=2)
                     pid = manager.checkout_pids(root)[0]
                     # A rotated token cannot create a competing process for this identity.
                     env = dict(os.environ, PORTAL_CONNECT_LINK=link.replace('fake-token', 'rotated-token'))

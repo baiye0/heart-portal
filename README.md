@@ -14,7 +14,7 @@ Your Computer                      Origin Hearth
 │ heart-portal     │◄────────────►│ heart-core       │
 │   workspace/     │   (encrypted) │   .being (memory)│
 │   exec tools     │              │   identity       │
-│   Cowork Space   │              │   consciousness  │
+│   MCP tools     │              │   consciousness  │
 └──────────────────┘              └──────────────────┘
 ```
 
@@ -186,9 +186,17 @@ powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/test
 
 Your being now has hands on your machine! 🤲
 
-### Cowork Space
+### Upgrading from Cowork
 
-Portal includes a built-in web UI for collaborative work. Access it at `http://localhost:<cowork_port>` (shown in startup logs). Your being can serve files, share documents, and create interactive pages through the Cowork Space.
+The legacy Cowork web UI, file HTTP API, WebSocket file notifications, and HTTP
+health endpoint have been removed. Portal no longer opens the extra HTTP port
+(previously 9101 by default). Existing `[cowork]` configuration is ignored and
+can be deleted. MCP file tools, relay connections, background-task callbacks,
+and Windows/macOS process supervision continue to work.
+
+Use `python3 scripts/portal-macos.py status` on macOS or the scheduled task status
+on Windows to check the supervised process. Confirm relay connectivity through
+the Portal logs or an MCP tool call; `/api/health` is no longer available.
 
 ## Security
 

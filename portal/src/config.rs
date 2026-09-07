@@ -49,9 +49,6 @@ struct RawConfig {
     #[serde(default)]
     security: Option<RawSecurityConfig>,
 
-    #[serde(default)]
-    cowork: Option<RawCoworkConfig>,
-
     /// MCP TCP pre-auth token (also settable via PORTAL_MCP_TOKEN env)
     #[serde(default)]
     portal_mcp_token: Option<String>,
@@ -63,14 +60,6 @@ struct RawConfig {
     /// Enable kit discovery and tool proxying.
     #[serde(default)]
     kits_enabled: Option<bool>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawCoworkConfig {
-    #[serde(default)]
-    enabled: Option<bool>,
-    #[serde(default)]
-    http_port: Option<u16>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -91,17 +80,10 @@ pub struct PortalConfig {
     pub bind_port: u16,
     pub tools: ToolsConfig,
     pub security: SecurityConfig,
-    pub cowork: CoworkConfig,
     /// When set, MCP TCP clients must send `auth` as the first JSON-RPC message.
     pub portal_mcp_token: Option<String>,
     pub kits_dir: Option<String>,
     pub kits_enabled: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct CoworkConfig {
-    pub enabled: bool,
-    pub http_port: u16,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -129,15 +111,6 @@ pub struct SecurityConfig {
     pub max_file_size: usize,
 }
 
-impl Default for CoworkConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            http_port: 9101,
-        }
-    }
-}
-
 impl Default for PortalConfig {
     fn default() -> Self {
         Self {
@@ -146,7 +119,6 @@ impl Default for PortalConfig {
             bind_port: 9100,
             tools: ToolsConfig::default(),
             security: SecurityConfig::default(),
-            cowork: CoworkConfig::default(),
             portal_mcp_token: None,
             kits_dir: Some(default_kits_dir()),
             kits_enabled: true,
@@ -227,15 +199,6 @@ impl PortalConfig {
                 .unwrap_or(10 * 1024 * 1024),
         };
 
-        let cowork = CoworkConfig {
-            enabled: raw.cowork.as_ref().and_then(|c| c.enabled).unwrap_or(true),
-            http_port: raw
-                .cowork
-                .as_ref()
-                .and_then(|c| c.http_port)
-                .unwrap_or(port + 1),
-        };
-
         let name = raw.name.unwrap_or_else(|| "portal".to_string());
 
         Ok(PortalConfig {
@@ -244,7 +207,6 @@ impl PortalConfig {
             bind_port: port,
             tools: raw.tools.unwrap_or_default(),
             security,
-            cowork,
             portal_mcp_token: raw.portal_mcp_token.clone().filter(|s| !s.is_empty()),
             kits_dir: raw
                 .kits_dir
@@ -389,6 +351,27 @@ web_fetch = false
         assert_eq!(config.tools.web_fetch, false);
         assert_eq!(config.kits_dir.as_deref(), Some("~/.heart-portal/kits/"));
         assert!(config.kits_enabled);
+    }
+
+    #[test]
+    fn legacy_cowork_settings_do_not_prevent_config_loading() {
+        let path = std::env::temp_dir().join(format!(
+            "heart-portal-legacy-config-{}.toml",
+            uuid::Uuid::new_v4()
+        ));
+        for enabled in [true, false] {
+            std::fs::write(&path, format!(
+                "name = 'legacy'\nbind = '127.0.0.1:65535'\nworkspace = './workspace'\n[cowork]\nenabled = {enabled}\nhttp_port = 9101\n"
+            )).unwrap();
+            let config = PortalConfig::load(path.to_str().unwrap()).unwrap();
+            assert_eq!(config.name, "legacy");
+            assert_eq!(config.bind_port, 65535);
+            assert_eq!(
+                config.security.workspace_root,
+                path.parent().unwrap().join("workspace")
+            );
+        }
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
