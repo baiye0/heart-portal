@@ -29,6 +29,8 @@ pub struct McpServerConfig {
 /// A stdio JSON-RPC connection to a single MCP server.
 pub struct McpConnection {
     child: Option<Child>,
+    reader_task: Option<tokio::task::JoinHandle<()>>,
+    stderr_task: Option<tokio::task::JoinHandle<()>>,
     writer: Arc<Mutex<BufWriter<Box<dyn AsyncWrite + Send + Unpin>>>>,
     responses: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcResponse>>>>,
     next_id: AtomicU64,
@@ -80,8 +82,10 @@ impl McpConnection {
 
         let responses = Arc::new(Mutex::new(HashMap::new()));
         let alive = Arc::new(AtomicBool::new(true));
-        let connection = Self {
+        let mut connection = Self {
             child: Some(child),
+            reader_task: None,
+            stderr_task: None,
             writer: Arc::new(Mutex::new(BufWriter::new(Box::new(stdin)))),
             responses: responses.clone(),
             next_id: AtomicU64::new(1),
@@ -90,15 +94,15 @@ impl McpConnection {
         };
 
         let server_name = connection.config.name.clone();
-        tokio::spawn(async move {
+        connection.reader_task = Some(tokio::spawn(async move {
             if let Err(e) = Self::reader_task(BufReader::new(stdout), responses, alive, &server_name).await {
                 error!("MCP server '{}' reader failed: {}", server_name, e);
             }
-        });
+        }));
 
         if let Some(stderr) = stderr {
             let server_name = connection.config.name.clone();
-            tokio::spawn(async move {
+            connection.stderr_task = Some(tokio::spawn(async move {
                 let mut reader = BufReader::new(stderr);
                 let mut line = Vec::new();
                 loop {
@@ -121,7 +125,7 @@ impl McpConnection {
                         }
                     }
                 }
-            });
+            }));
         }
 
         if let Err(e) = connection.initialize().await {
@@ -439,8 +443,37 @@ impl McpConnection {
     pub async fn shutdown(&mut self) -> Result<()> {
         debug!("Shutting down MCP server '{}'", self.config.name);
 
-        if let Some(ref mut child) = self.child {
-            terminate_child(child, &self.config.name).await;
+        // Publish the shutdown while holding the response-map lock used by new
+        // requests, so none can slip in and wait on a connection being closed.
+        {
+            let mut pending = self.responses.lock().await;
+            self.alive.store(false, Ordering::SeqCst);
+            if !pending.is_empty() {
+                debug!(
+                    "MCP server '{}' shutdown: cancelling {} pending response(s)",
+                    self.config.name,
+                    pending.len()
+                );
+            }
+            pending.clear();
+        }
+
+        // Drop the child's stdin pipe first. This lets line-oriented servers
+        // observe EOF and, on Windows, avoids retaining a pipe handle after the
+        // process tree has been terminated.
+        {
+            let mut writer = self.writer.lock().await;
+            if let Err(e) = writer.shutdown().await {
+                warn!(
+                    "Failed to close stdin for MCP server '{}': {}",
+                    self.config.name, e
+                );
+            }
+            *writer = BufWriter::new(Box::new(tokio::io::sink()));
+        }
+
+        if let Some(mut child) = self.child.take() {
+            terminate_child(&mut child, &self.config.name).await;
 
             match tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await {
                 Ok(Ok(status)) => {
@@ -456,12 +489,49 @@ impl McpConnection {
                     warn!("Timeout waiting for MCP server '{}' process to exit", self.config.name);
                     if let Err(e) = child.kill().await {
                         warn!("Failed to kill MCP server '{}' process: {}", self.config.name, e);
+                    } else if let Err(e) = child.wait().await {
+                        warn!("Error reaping MCP server '{}' process: {}", self.config.name, e);
                     }
                 }
             }
         }
 
+        // Child processes may still be releasing inherited stdout/stderr handles
+        // after their launcher exits. Await the readers so Windows releases the
+        // kit's working directory before callers remove or replace it.
+        let reader_task = self.reader_task.take();
+        let stderr_task = self.stderr_task.take();
+        tokio::join!(
+            finish_io_task(reader_task, "stdout", &self.config.name),
+            finish_io_task(stderr_task, "stderr", &self.config.name),
+        );
+
         Ok(())
+    }
+}
+
+async fn finish_io_task(
+    task: Option<tokio::task::JoinHandle<()>>,
+    stream: &str,
+    server_name: &str,
+) {
+    let Some(mut task) = task else {
+        return;
+    };
+    match tokio::time::timeout(Duration::from_secs(2), &mut task).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!(
+            "MCP server '{}' {} reader task failed: {}",
+            server_name, stream, e
+        ),
+        Err(_) => {
+            warn!(
+                "Timeout waiting for MCP server '{}' {} reader task",
+                server_name, stream
+            );
+            task.abort();
+            let _ = task.await;
+        }
     }
 }
 
@@ -529,6 +599,8 @@ mod tests {
         let (writer, mut peer) = tokio::io::duplex(4096);
         let connection = McpConnection {
             child: None,
+            reader_task: None,
+            stderr_task: None,
             writer: Arc::new(Mutex::new(BufWriter::new(Box::new(writer)))),
             responses: Arc::new(Mutex::new(HashMap::new())),
             next_id: AtomicU64::new(1),

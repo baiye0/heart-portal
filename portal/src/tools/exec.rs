@@ -1,7 +1,9 @@
 //! Exec tool — run shell commands.
 
 use crate::config::PortalConfig;
-use crate::exec_policy::{configure_shell_command, validate_exec_allowlist, ExecShell};
+use crate::exec_policy::{
+    configure_shell_command, validate_exec_allowlist, validate_shell_command, ExecShell,
+};
 use crate::process_manager::ProcessManager;
 use anyhow::Result;
 use serde_json::Value;
@@ -19,6 +21,7 @@ pub async fn execute(
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("Missing 'command' argument"))?;
     let shell = ExecShell::parse(arguments.get("shell"))?;
+    validate_shell_command(shell, command)?;
 
     let workdir = arguments
         .get("workdir")

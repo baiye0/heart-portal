@@ -38,6 +38,44 @@ impl ExecShell {
 }
 
 #[cfg(any(windows, test))]
+fn first_windows_command_token(command: &str) -> Option<&str> {
+    let command = command.trim_start();
+    if let Some(quoted) = command.strip_prefix('"') {
+        let end = quoted.find('"')?;
+        Some(&quoted[..end])
+    } else {
+        command.split_whitespace().next()
+    }
+}
+
+#[cfg(any(windows, test))]
+fn invokes_powershell(command: &str) -> bool {
+    let Some(token) = first_windows_command_token(command) else {
+        return false;
+    };
+    let executable = token.rsplit(['\\', '/']).next().unwrap_or(token);
+    executable.eq_ignore_ascii_case("powershell")
+        || executable.eq_ignore_ascii_case("powershell.exe")
+        || executable.eq_ignore_ascii_case("pwsh")
+        || executable.eq_ignore_ascii_case("pwsh.exe")
+}
+
+/// A nested PowerShell process inherits cmd.exe's legacy console code page on
+/// many Windows hosts. Require the dedicated shell mode, which transports the
+/// script losslessly and explicitly configures UTF-8 for redirected output.
+pub(crate) fn validate_shell_command(shell: ExecShell, command: &str) -> Result<()> {
+    #[cfg(windows)]
+    if shell == ExecShell::Default && invokes_powershell(command) {
+        anyhow::bail!(
+            "PowerShell commands require shell='powershell'; pass the script directly instead of invoking powershell.exe or pwsh.exe"
+        );
+    }
+    #[cfg(not(windows))]
+    let _ = (shell, command);
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
 fn powershell_encoded_command(command: &str) -> String {
     use base64::Engine;
     // -EncodedCommand transports source as UTF-16LE; the launched shell's
@@ -225,8 +263,8 @@ pub(crate) fn configure_shell_command(
     {
         cmd.env("PYTHONIOENCODING", "utf-8");
         cmd.env("PYTHONUTF8", "1");
-        // Force .NET/PowerShell to use UTF-8
-        cmd.env("DOTNET_CLI_UI_LANGUAGE", "en");
+        // This controls .NET CLI console encoding without forcing its UI language.
+        cmd.env("DOTNET_CLI_FORCE_UTF8_ENCODING", "1");
     }
 }
 
@@ -320,6 +358,35 @@ mod tests {
         assert!(ExecShell::parse(Some(&serde_json::json!(42))).is_err());
         #[cfg(not(windows))]
         assert!(ExecShell::parse(Some(&serde_json::json!("powershell"))).is_err());
+    }
+
+    #[test]
+    fn recognizes_direct_windows_powershell_invocations() {
+        for command in [
+            "powershell -NoProfile -Command echo",
+            "PowerShell.EXE -Command echo",
+            "pwsh -Command echo",
+            r#""C:\Program Files\PowerShell\7\pwsh.exe" -Command echo"#,
+            r#"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe -Command echo"#,
+        ] {
+            assert!(invokes_powershell(command), "{command}");
+        }
+        for command in ["echo powershell", "powershell-script.cmd", ""] {
+            assert!(!invokes_powershell(command), "{command}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn default_shell_rejects_nested_powershell() {
+        let err = validate_shell_command(
+            ExecShell::Default,
+            "powershell.exe -NoProfile -Command Write-Output 中文",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("shell='powershell'"));
+
+        validate_shell_command(ExecShell::PowerShell, "Write-Output 中文").unwrap();
     }
 
     #[test]

@@ -162,13 +162,13 @@ impl ToolHost {
         if self.config.tools.exec {
             tools.push(ToolInfo {
                 name: "portal_exec".to_string(),
-                description: "Execute a shell command. With background=true it returns a session_id immediately and, when the task finishes, Portal notifies you automatically — you will be woken with the exit code and output, so you can let go of it instead of polling. Prefer background=true for anything slow (builds, tests, long downloads).".to_string(),
+                description: "Execute a shell command. With background=true it returns a session_id immediately and, when the task finishes, Portal notifies you automatically — you will be woken with the exit code and output, so you can let go of it instead of polling. Prefer background=true for anything slow (builds, tests, long downloads). On Windows, select shell='powershell' and pass the script directly for PowerShell; do not invoke powershell.exe from the default cmd shell.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "command": {
                             "type": "string",
-                            "description": "Shell command to execute"
+                            "description": "Shell command to execute. On Windows, PowerShell scripts require shell='powershell' and must be passed directly."
                         },
                         "shell": {
                             "type": "string",

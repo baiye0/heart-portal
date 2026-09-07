@@ -437,6 +437,22 @@ kits_enabled = false
             .as_str()
             .unwrap()
             .contains("中文正常"));
+        let list = host
+            .call("portal_file_list", serde_json::json!({"path": "."}))
+            .await
+            .unwrap();
+        assert!(list["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("中文.txt"));
+        let search = host
+            .call(
+                "portal_search",
+                serde_json::json!({"path": ".", "pattern": "中文正常"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(search["match_count"], 1);
         let outside = temp.join("outside.txt");
         let error = host
             .call(
