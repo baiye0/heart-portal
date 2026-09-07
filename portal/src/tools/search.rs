@@ -1,7 +1,7 @@
 //! Workspace search — recursive grep under the portal workspace root.
 
 use crate::config::PortalConfig;
-use crate::tools::file::resolve_path_logical;
+use crate::tools::file::{canonical_workspace_root, resolve_existing_path};
 use anyhow::Result;
 use regex::Regex;
 use serde_json::Value;
@@ -27,18 +27,14 @@ pub async fn search(config: &PortalConfig, arguments: Value) -> Result<Value> {
         .and_then(|v| v.as_str())
         .unwrap_or(".");
 
-    let root = resolve_path_logical(config, path_filter)?;
-    if !root.starts_with(&config.security.workspace_root) {
-        anyhow::bail!("Search path outside workspace");
-    }
-    if !root.exists() {
-        anyhow::bail!("Path does not exist: {}", path_filter);
-    }
+    let root = resolve_existing_path(config, path_filter)?;
 
     let re = Regex::new(pattern)
         .map_err(|e| anyhow::anyhow!("Invalid regex: {}", e))?;
 
-    let workspace = config.security.workspace_root.clone();
+    // Keep both paths in canonical form. This is especially important on
+    // Windows, where canonicalization may use the verbatim-path prefix.
+    let workspace = canonical_workspace_root(config)?;
     let max_file = config.security.max_file_size;
 
     debug!(
@@ -86,11 +82,18 @@ fn grep_workspace(
         }
 
         let path = entry.path();
-        if path.is_dir() {
+        // Never follow a nested symlink/reparse point. `follow_links(false)`
+        // prevents directory traversal, while this also protects file reads.
+        if entry.file_type().is_symlink() || entry.file_type().is_dir() {
             continue;
         }
 
-        let meta = match std::fs::metadata(path) {
+        let canonical = match path.canonicalize() {
+            Ok(path) if path.starts_with(workspace_root) => path,
+            _ => continue,
+        };
+
+        let meta = match std::fs::metadata(&canonical) {
             Ok(m) => m,
             Err(_) => continue,
         };
@@ -98,12 +101,12 @@ fn grep_workspace(
             continue;
         }
 
-        let rel = match path.strip_prefix(workspace_root) {
+        let rel = match canonical.strip_prefix(workspace_root) {
             Ok(p) => p.to_string_lossy().to_string(),
             Err(_) => continue,
         };
 
-        let bytes = match std::fs::read(path) {
+        let bytes = match std::fs::read(&canonical) {
             Ok(b) => b,
             Err(_) => continue,
         };
@@ -132,4 +135,39 @@ fn grep_workspace(
     }
 
     Ok(out)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn nested_file_symlink_cannot_escape_workspace() {
+        let temp = std::env::temp_dir().join(format!(
+            "portal-search-symlink-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let workspace = temp.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("inside.txt"), "search-marker inside").unwrap();
+
+        let outside = temp.join("outside.txt");
+        std::fs::write(&outside, "search-marker outside").unwrap();
+        symlink(&outside, workspace.join("leak.txt")).unwrap();
+
+        let workspace = workspace.canonicalize().unwrap();
+        let re = Regex::new("search-marker").unwrap();
+        let matches = grep_workspace(&workspace, &workspace, &re, 10, 1024).unwrap();
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].path, "inside.txt");
+        assert_eq!(matches[0].text, "search-marker inside");
+
+        std::fs::remove_dir_all(&temp).unwrap();
+    }
 }

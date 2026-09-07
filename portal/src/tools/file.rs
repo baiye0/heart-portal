@@ -3,12 +3,39 @@
 use crate::config::PortalConfig;
 use anyhow::Result;
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::debug;
+
+/// File/search tools are exposed only after `PortalConfig::prepare_workspace`.
+/// Reject an unprepared relative root instead of trying to reinterpret it
+/// relative to the process working directory and weakening the sandbox.
+fn prepared_workspace_root(config: &PortalConfig) -> Result<&Path> {
+    let root = config.security.workspace_root.as_path();
+    anyhow::ensure!(!root.as_os_str().is_empty(), "workspace root is empty");
+    anyhow::ensure!(
+        root.is_absolute(),
+        "workspace root is not prepared: {}",
+        root.display()
+    );
+    Ok(root)
+}
+
+pub(crate) fn canonical_workspace_root(config: &PortalConfig) -> Result<PathBuf> {
+    let root = prepared_workspace_root(config)?;
+    let canonical = root.canonicalize().map_err(|e| {
+        anyhow::anyhow!(
+            "workspace root cannot be canonicalized ({}): {}",
+            root.display(),
+            e
+        )
+    })?;
+    anyhow::ensure!(canonical.is_dir(), "workspace root is not a directory");
+    Ok(canonical)
+}
 
 /// Resolve a path relative to workspace root. Prevent logical `..` traversal only.
 pub(crate) fn resolve_path_logical(config: &PortalConfig, path_str: &str) -> Result<PathBuf> {
-    let root = &config.security.workspace_root;
+    let root = prepared_workspace_root(config)?;
     let path = PathBuf::from(path_str);
     
     // Build the full path
@@ -47,15 +74,9 @@ pub(crate) fn resolve_path_logical(config: &PortalConfig, path_str: &str) -> Res
 }
 
 /// Existing path: follow symlinks and ensure the real path stays under workspace.
-fn resolve_existing_path(config: &PortalConfig, path_str: &str) -> Result<PathBuf> {
+pub(crate) fn resolve_existing_path(config: &PortalConfig, path_str: &str) -> Result<PathBuf> {
     let logical = resolve_path_logical(config, path_str)?;
-    let root_canon = config.security.workspace_root.canonicalize().map_err(|e| {
-        anyhow::anyhow!(
-            "workspace root cannot be canonicalized ({}): {}",
-            config.security.workspace_root.display(),
-            e
-        )
-    })?;
+    let root_canon = canonical_workspace_root(config)?;
     if !logical.exists() {
         anyhow::bail!("Path does not exist: {}", path_str);
     }
@@ -76,10 +97,8 @@ fn resolve_existing_path(config: &PortalConfig, path_str: &str) -> Result<PathBu
 /// (prevents `create_dir_all` from following a symlink that escapes the workspace).
 pub(crate) fn resolve_write_path(config: &PortalConfig, path_str: &str) -> Result<PathBuf> {
     let logical = resolve_path_logical(config, path_str)?;
-    let root = &config.security.workspace_root;
-    let root_canon = root.canonicalize().map_err(|e| {
-        anyhow::anyhow!("workspace root cannot be canonicalized ({}): {}", root.display(), e)
-    })?;
+    let root = prepared_workspace_root(config)?;
+    let root_canon = canonical_workspace_root(config)?;
     let rel = logical.strip_prefix(root).map_err(|_| {
         anyhow::anyhow!("Path outside workspace: {}", path_str)
     })?;
@@ -434,29 +453,37 @@ mod tests {
 
     fn test_config() -> PortalConfig {
         let mut config = PortalConfig::default();
-        config.security.workspace_root = std::path::PathBuf::from("/workspace");
+        config.security.workspace_root = if cfg!(windows) {
+            std::path::PathBuf::from(r"C:\workspace")
+        } else {
+            std::path::PathBuf::from("/workspace")
+        };
         config
+    }
+
+    fn expected_path(path: &str) -> PathBuf {
+        test_config().security.workspace_root.join(path)
     }
 
     #[test]
     fn test_resolve_relative_path() {
         let config = test_config();
         let result = resolve_path_logical(&config, "hello.txt").unwrap();
-        assert_eq!(result, std::path::PathBuf::from("/workspace/hello.txt"));
+        assert_eq!(result, expected_path("hello.txt"));
     }
 
     #[test]
     fn test_resolve_nested_path() {
         let config = test_config();
         let result = resolve_path_logical(&config, "subdir/file.md").unwrap();
-        assert_eq!(result, std::path::PathBuf::from("/workspace/subdir/file.md"));
+        assert_eq!(result, expected_path("subdir/file.md"));
     }
 
     #[test]
     fn test_resolve_dot_path() {
         let config = test_config();
         let result = resolve_path_logical(&config, "./hello.txt").unwrap();
-        assert_eq!(result, std::path::PathBuf::from("/workspace/hello.txt"));
+        assert_eq!(result, expected_path("hello.txt"));
     }
 
     #[test]
@@ -474,20 +501,35 @@ mod tests {
     #[test]
     fn test_reject_absolute_outside() {
         let config = test_config();
-        assert!(resolve_path_logical(&config, "/etc/passwd").is_err());
+        let outside = if cfg!(windows) {
+            r"C:\outside\file.txt"
+        } else {
+            "/etc/passwd"
+        };
+        assert!(resolve_path_logical(&config, outside).is_err());
     }
 
     #[test]
     fn test_allow_absolute_inside() {
         let config = test_config();
-        let result = resolve_path_logical(&config, "/workspace/file.txt").unwrap();
-        assert_eq!(result, std::path::PathBuf::from("/workspace/file.txt"));
+        let inside = expected_path("file.txt");
+        let result = resolve_path_logical(&config, inside.to_str().unwrap()).unwrap();
+        assert_eq!(result, inside);
     }
 
     #[test]
     fn test_reject_traversal_escape() {
         let config = test_config();
         assert!(resolve_path_logical(&config, "a/b/c/../../../../etc/passwd").is_err());
+    }
+
+    #[test]
+    fn test_reject_unprepared_relative_workspace_root() {
+        let mut config = PortalConfig::default();
+        config.security.workspace_root = PathBuf::from(".");
+
+        let err = resolve_path_logical(&config, "hello.txt").unwrap_err();
+        assert!(err.to_string().contains("workspace root is not prepared"));
     }
 
     #[cfg(unix)]
