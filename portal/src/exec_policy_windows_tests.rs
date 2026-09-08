@@ -63,13 +63,8 @@ async fn execute_with_shell(
         loop {
             let result = manager.poll(session, 0, 100).await.unwrap();
             if let ProcessStatus::Exited(code) = result.status {
-                // Exit and pipe-reader completion are independently scheduled.
-                tokio::time::sleep(Duration::from_millis(100)).await;
                 let output = manager.log(session, 0, 100_000).await.unwrap();
-                return (
-                    code != 0,
-                    String::from_utf8_lossy(&output.output).into_owned(),
-                );
+                return (code != 0, String::from_utf8(output.output).unwrap());
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -77,6 +72,25 @@ async fn execute_with_shell(
     .await;
     manager.kill_all().await;
     outcome.expect("background command must exit")
+}
+
+#[tokio::test]
+#[cfg(windows)]
+async fn cmd_oem_chinese_output_is_decoded_in_both_modes() {
+    if crate::tools::text::windows_oem_code_page() != 936 {
+        // 中文 cannot be represented by every Windows OEM code page. The
+        // code-page conversion itself is covered separately with fixed CP936
+        // bytes; this integration case targets Chinese Windows hosts.
+        eprintln!("requires Windows OEM code page 936; skipping");
+        return;
+    }
+
+    let workspace = Workspace::new();
+    for background in [false, true] {
+        let (failed, output) = execute(&workspace.config(), "echo 中文", background).await;
+        assert!(!failed, "background={background}: {output}");
+        assert_eq!(output.trim(), "中文", "background={background}");
+    }
 }
 
 #[tokio::test]

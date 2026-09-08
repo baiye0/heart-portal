@@ -9,7 +9,7 @@ mod screenshot;
 mod search;
 mod web;
 mod web_search;
-mod text;
+pub(crate) mod text;
 #[cfg(test)]
 mod utf8_tests;
 pub mod custom;
@@ -189,6 +189,11 @@ impl ToolHost {
                         "background": {
                             "type": "boolean",
                             "description": "If true, spawn in background and return session_id + pid (default: false)"
+                        },
+                        "output_encoding": {
+                            "type": "string",
+                            "enum": text::OutputEncoding::supported_values(),
+                            "description": "Source output decoding (default: auto). PowerShell and non-Windows default to UTF-8. Windows cmd auto tries UTF-8 then system OEM per line; non-ASCII lines may wait for newline/EOF (buffer capped at 64KiB). Use utf8 or oem for known encodings and immediate streaming; oem requires Windows. A mixed-encoding line is ambiguous. Responses are always UTF-8 text, including poll/log and callbacks."
                         }
                     },
                     "required": ["command"]
@@ -208,8 +213,8 @@ impl ToolHost {
                         },
                         "session_id": { "type": "string", "description": "Session id (required for poll, log, write, kill)" },
                         "timeout_ms": { "type": "integer", "description": "poll: wait up to this many ms for new output (default 5000, max 300000)" },
-                        "offset": { "type": "integer", "description": "Byte offset into captured output (poll/log)" },
-                        "limit": { "type": "integer", "description": "Max bytes for log" },
+                        "offset": { "type": "integer", "minimum": 0, "description": "UTF-8 byte offset into normalized output (poll/log, default 0); use the returned next_offset. total_output_bytes uses the same units, not source-encoding bytes." },
+                        "limit": { "type": "integer", "minimum": 1, "description": "Max UTF-8 bytes for log (default 65536). Must fit the next complete character; at least 4 avoids character-size errors." },
                         "data": { "type": "string", "description": "Data to write to stdin (write action, max 256KiB)" }
                     },
                     "required": ["action"]

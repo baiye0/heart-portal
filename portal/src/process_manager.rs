@@ -2,6 +2,7 @@
 
 use crate::config::PortalConfig;
 use crate::exec_policy::{configure_shell_command, validate_exec_allowlist, ExecShell};
+use crate::tools::text::{OutputDecoder, OutputEncoding};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -39,8 +40,8 @@ const CALLBACK_ATTEMPTS: usize = 3;
 /// Backoff before retry N (index 0 = before the 2nd attempt).
 const CALLBACK_BACKOFF: [Duration; CALLBACK_ATTEMPTS - 1] =
     [Duration::from_secs(2), Duration::from_secs(4)];
-/// How long a callback waits for stdout/stderr readers to drain after exit.
-const CALLBACK_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bound the wait when descendants retain the exited process's pipe handles.
+const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const CALLBACK_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const CALLBACK_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -69,6 +70,7 @@ pub struct ManagedProcess {
     pub stdin: Option<ChildStdin>,
     pub output: Arc<AsyncMutex<OutputBuffer>>,
     pub status: Arc<AsyncMutex<ProcessStatus>>,
+    pub output_encoding: OutputEncoding,
     /// Set before we signal the process; suppresses the exit callback so
     /// `portal_process kill` and Portal shutdown never wake the being.
     pub(crate) killed: Arc<AtomicBool>,
@@ -77,6 +79,7 @@ pub struct ManagedProcess {
 }
 
 pub struct OutputBuffer {
+    /// Normalized UTF-8, always beginning and ending on character boundaries.
     pub data: Vec<u8>,
     pub max_bytes: usize,
     total_written: u64,
@@ -103,44 +106,68 @@ impl OutputBuffer {
         self.last_output_at.elapsed().as_secs()
     }
 
-    pub fn append(&mut self, chunk: &[u8]) {
+    pub fn append(&mut self, chunk: &str) {
         if chunk.is_empty() {
             return;
         }
         self.last_output_at = time::Instant::now();
         self.total_written += chunk.len() as u64;
-        self.data.extend_from_slice(chunk);
+        self.data.extend_from_slice(chunk.as_bytes());
         if self.data.len() > self.max_bytes {
-            let drop = self.data.len() - self.max_bytes;
+            let mut drop = self.data.len() - self.max_bytes;
+            while !self.is_char_boundary(drop) {
+                drop += 1;
+            }
             self.data.drain(..drop);
         }
     }
 
+    fn is_char_boundary(&self, index: usize) -> bool {
+        index == self.data.len() || self.data[index] & 0xc0 != 0x80
+    }
+
     /// Returns bytes from logical `offset` to current end, whether data was dropped before `offset`, and `total_written`.
-    pub fn bytes_since(&self, offset: u64) -> (Vec<u8>, bool, u64) {
-        let start_offset = self
-            .total_written
-            .saturating_sub(self.data.len() as u64);
+    pub fn bytes_since(&self, offset: u64) -> Result<(Vec<u8>, bool, u64)> {
+        let start_offset = self.total_written.saturating_sub(self.data.len() as u64);
         let truncated = offset < start_offset;
         let from = offset.max(start_offset);
         if from >= self.total_written || self.data.is_empty() {
-            return (vec![], truncated, self.total_written);
+            return Ok((vec![], truncated, self.total_written));
         }
         let start_idx = (from - start_offset) as usize;
-        (self.data[start_idx..].to_vec(), truncated, self.total_written)
+        anyhow::ensure!(
+            self.is_char_boundary(start_idx),
+            "offset must be a UTF-8 character boundary; use next_offset from the previous response"
+        );
+        Ok((
+            self.data[start_idx..].to_vec(),
+            truncated,
+            self.total_written,
+        ))
     }
 
-    pub fn bytes_range(&self, offset: u64, limit: usize) -> (Vec<u8>, u64) {
-        let start_offset = self
-            .total_written
-            .saturating_sub(self.data.len() as u64);
+    pub fn bytes_range(&self, offset: u64, limit: usize) -> Result<(Vec<u8>, u64)> {
+        anyhow::ensure!(limit > 0, "limit must be positive");
+        let start_offset = self.total_written.saturating_sub(self.data.len() as u64);
         let from = offset.max(start_offset);
         if from >= self.total_written || self.data.is_empty() {
-            return (vec![], self.total_written);
+            return Ok((vec![], self.total_written));
         }
         let start_idx = (from - start_offset) as usize;
-        let end = (start_idx + limit).min(self.data.len());
-        (self.data[start_idx..end].to_vec(), self.total_written)
+        anyhow::ensure!(
+            self.is_char_boundary(start_idx),
+            "offset must be a UTF-8 character boundary; use next_offset from the previous response"
+        );
+        let mut end = start_idx.saturating_add(limit).min(self.data.len());
+        while !self.is_char_boundary(end) {
+            end -= 1;
+        }
+        anyhow::ensure!(
+            end > start_idx,
+            "limit is too small for the next UTF-8 character; use at least 4 bytes"
+        );
+        let next_offset = start_offset + end as u64;
+        Ok((self.data[start_idx..end].to_vec(), next_offset))
     }
 }
 
@@ -159,8 +186,9 @@ pub struct SessionInfo {
     pub uptime_s: u64,
     /// Seconds since last stdout/stderr chunk (sensory: silence vs progress).
     pub idle_s: u64,
-    /// Total bytes captured (may exceed ring size; monotonic).
+    /// Total normalized UTF-8 bytes (may exceed ring size; monotonic).
     pub total_output_bytes: u64,
+    pub output_encoding: OutputEncoding,
 }
 
 #[derive(Clone, Debug)]
@@ -171,6 +199,7 @@ pub struct PollResult {
     pub status: ProcessStatus,
     pub idle_s: u64,
     pub total_output_bytes: u64,
+    pub output_encoding: OutputEncoding,
 }
 
 #[derive(Clone, Debug)]
@@ -181,6 +210,7 @@ pub struct LogResult {
     pub status: ProcessStatus,
     pub idle_s: u64,
     pub total_output_bytes: u64,
+    pub output_encoding: OutputEncoding,
 }
 
 pub fn validate_session_id(session_id: &str) -> Result<()> {
@@ -197,7 +227,9 @@ async fn read_into_buffer<R: tokio::io::AsyncRead + Unpin>(
     mut stream: R,
     output: Arc<AsyncMutex<OutputBuffer>>,
     notify: Arc<Notify>,
+    encoding: OutputEncoding,
 ) {
+    let mut decoder = OutputDecoder::new(encoding);
     let mut buf = [0u8; 8192];
     loop {
         let n = match stream.read(&mut buf).await {
@@ -205,11 +237,18 @@ async fn read_into_buffer<R: tokio::io::AsyncRead + Unpin>(
             Ok(n) => n,
             Err(_) => break,
         };
+        let text = decoder.push(&buf[..n], false);
         let mut o = output.lock().await;
-        o.append(&buf[..n]);
+        o.last_output_at = time::Instant::now();
+        o.append(&text);
         drop(o);
         notify.notify_waiters();
     }
+    // EOF (or a read error) is final, even for an unterminated line or an
+    // incomplete source character. Poll/log/callback all see this same text.
+    let remaining = decoder.push(&[], true);
+    output.lock().await.append(&remaining);
+    notify.notify_waiters();
 }
 
 /// A finished background session, as reported to Heart.
@@ -220,11 +259,16 @@ struct CallbackTask {
     workdir: String,
     exit_code: i32,
     elapsed_secs: u64,
+    output_encoding: OutputEncoding,
 }
 
 /// Last `max` bytes of `data` (tail — the interesting end of a build/test log).
 fn tail(data: &[u8], max: usize) -> &[u8] {
-    &data[data.len().saturating_sub(max)..]
+    let mut start = data.len().saturating_sub(max);
+    while start < data.len() && data[start] & 0xc0 == 0x80 {
+        start += 1;
+    }
+    &data[start..]
 }
 
 /// Head of `s` capped at `max` bytes, never splitting a UTF-8 char.
@@ -260,6 +304,7 @@ fn payload_with_tail(
             "session_id": task.session_id,
             "exit_code": task.exit_code,
             "output": String::from_utf8_lossy(slice),
+            "output_encoding": task.output_encoding.as_str(),
             "command": command,
             "workdir": task.workdir,
             "elapsed_secs": task.elapsed_secs,
@@ -398,6 +443,7 @@ impl ProcessManager {
         });
     }
 
+    #[cfg(test)]
     pub async fn spawn(
         &self,
         config: &PortalConfig,
@@ -405,7 +451,15 @@ impl ProcessManager {
         workdir: &str,
         extra_env: &[(String, String)],
     ) -> Result<SessionInfo> {
-        self.spawn_with_shell(config, command, workdir, extra_env, ExecShell::Default).await
+        self.spawn_with_shell(
+            config,
+            command,
+            workdir,
+            extra_env,
+            ExecShell::Default,
+            OutputEncoding::Auto.for_shell(ExecShell::Default),
+        )
+        .await
     }
 
     pub(crate) async fn spawn_with_shell(
@@ -415,6 +469,7 @@ impl ProcessManager {
         workdir: &str,
         extra_env: &[(String, String)],
         shell: ExecShell,
+        output_encoding: OutputEncoding,
     ) -> Result<SessionInfo> {
         validate_exec_allowlist(command, &config.security.exec_allowlist)?;
 
@@ -470,16 +525,32 @@ impl ProcessManager {
         let out_a = Arc::clone(&output);
         let n_a = Arc::clone(&notify);
         let stdout_reader = tokio::spawn(async move {
-            read_into_buffer(stdout, out_a, n_a).await;
+            read_into_buffer(stdout, out_a, n_a, output_encoding).await;
         });
         let out_b = Arc::clone(&output);
         let n_b = Arc::clone(&notify);
         let stderr_reader = tokio::spawn(async move {
-            read_into_buffer(stderr, out_b, n_b).await;
+            read_into_buffer(stderr, out_b, n_b, output_encoding).await;
         });
 
         let started_at = tokio::time::Instant::now();
         let killed = Arc::new(AtomicBool::new(false));
+
+        // Register before the exit watcher runs, even for very short commands.
+        let proc = ManagedProcess {
+            session_id: session_id.clone(),
+            pid,
+            command: command.to_string(),
+            started_at,
+            stdin,
+            output: Arc::clone(&output),
+            status: Arc::clone(&status),
+            output_encoding,
+            killed: Arc::clone(&killed),
+            notify: Arc::clone(&notify),
+            exited_at: None,
+        };
+        self.sessions.lock().await.insert(session_id.clone(), proc);
 
         let st_b = Arc::clone(&status);
         let n_exit = Arc::clone(&notify);
@@ -490,6 +561,7 @@ impl ProcessManager {
         let output_wait = Arc::clone(&output);
         let callback_config = Arc::clone(&self.callback_config);
         let killed_wait = Arc::clone(&killed);
+        let callback_output_encoding = output_encoding;
         tokio::spawn(async move {
             let code = match child.wait().await {
                 Ok(s) => s.code().unwrap_or_else(|| {
@@ -504,6 +576,19 @@ impl ProcessManager {
                 if let Some(p) = g.get_mut(&sid_wait) {
                     p.exited_at = Some(now);
                 }
+            }
+            // EOF must flush both decoders before an ordinary exit is exposed
+            // to poll/log, including standalone sessions without callbacks.
+            if time::timeout(OUTPUT_DRAIN_TIMEOUT, async {
+                let _ = stdout_reader.await;
+                let _ = stderr_reader.await;
+            })
+            .await
+            .is_err()
+            {
+                warn!(
+                    "session {sid_wait}: output drain timed out; descendants may still hold pipes"
+                );
             }
             let mut st = st_b.lock().await;
             *st = ProcessStatus::Exited(code);
@@ -527,16 +612,10 @@ impl ProcessManager {
                 workdir: workdir_wait,
                 exit_code: code,
                 elapsed_secs: now.saturating_duration_since(started_at).as_secs(),
+                output_encoding: callback_output_encoding,
             };
             // Detached: the exit watcher must never wait on the network.
             tokio::spawn(async move {
-                // `child.wait()` can win the race against the pipe readers; give
-                // them a moment so the callback carries the final bytes.
-                let _ = time::timeout(CALLBACK_DRAIN_TIMEOUT, async {
-                    let _ = stdout_reader.await;
-                    let _ = stderr_reader.await;
-                })
-                .await;
                 let (data, total) = {
                     let buf = output_wait.lock().await;
                     (buf.data.clone(), buf.total_written())
@@ -545,21 +624,6 @@ impl ProcessManager {
                 deliver_callback(cfg, task.session_id, payload).await;
             });
         });
-
-        let proc = ManagedProcess {
-            session_id: session_id.clone(),
-            pid,
-            command: command.to_string(),
-            started_at,
-            stdin,
-            output: Arc::clone(&output),
-            status: Arc::clone(&status),
-            killed: Arc::clone(&killed),
-            notify: Arc::clone(&notify),
-            exited_at: None,
-        };
-
-        self.sessions.lock().await.insert(session_id.clone(), proc);
 
         debug!(
             "spawned background session {} pid {} ({})",
@@ -574,6 +638,7 @@ impl ProcessManager {
             uptime_s: 0,
             idle_s: 0,
             total_output_bytes: 0,
+            output_encoding,
         })
     }
 
@@ -592,21 +657,30 @@ impl ProcessManager {
         };
 
         loop {
-            let (bytes, truncated, next, st, notify, idle_s, total_out) = {
+            let (bytes, truncated, next, st, notify, idle_s, total_out, output_encoding) = {
                 let guard = self.sessions.lock().await;
                 let s = guard
                     .get(session_id)
                     .ok_or_else(|| anyhow::anyhow!("Unknown session: {}", session_id))?;
+                let st = s.status.lock().await.clone();
                 let (bytes, truncated, next, idle_s, total_out) = {
                     let buf = s.output.lock().await;
-                    let (bytes, truncated, next) = buf.bytes_since(offset);
+                    let (bytes, truncated, next) = buf.bytes_since(offset)?;
                     let idle_s = buf.idle_s();
                     let total_out = buf.total_written();
                     (bytes, truncated, next, idle_s, total_out)
                 };
-                let st = s.status.lock().await.clone();
                 let n = Arc::clone(&s.notify);
-                (bytes, truncated, next, st, n, idle_s, total_out)
+                (
+                    bytes,
+                    truncated,
+                    next,
+                    st,
+                    n,
+                    idle_s,
+                    total_out,
+                    s.output_encoding,
+                )
             };
 
             if !bytes.is_empty() || matches!(st, ProcessStatus::Exited(_)) {
@@ -617,6 +691,7 @@ impl ProcessManager {
                     status: st,
                     idle_s,
                     total_output_bytes: total_out,
+                    output_encoding,
                 });
             }
 
@@ -628,6 +703,7 @@ impl ProcessManager {
                     status: st,
                     idle_s,
                     total_output_bytes: total_out,
+                    output_encoding,
                 });
             };
 
@@ -639,6 +715,7 @@ impl ProcessManager {
                     status: st,
                     idle_s,
                     total_output_bytes: total_out,
+                    output_encoding,
                 });
             }
 
@@ -657,18 +734,16 @@ impl ProcessManager {
         let s = guard
             .get(session_id)
             .ok_or_else(|| anyhow::anyhow!("Unknown session: {}", session_id))?;
+        let st = s.status.lock().await.clone();
         let (output, next_offset, truncated, idle_s, total_out) = {
             let buf = s.output.lock().await;
             let idle_s = buf.idle_s();
             let total_out = buf.total_written();
-            let (output, next_offset) = buf.bytes_range(offset, limit);
-            let start_offset = buf
-                .total_written()
-                .saturating_sub(buf.data.len() as u64);
+            let (output, next_offset) = buf.bytes_range(offset, limit)?;
+            let start_offset = buf.total_written().saturating_sub(buf.data.len() as u64);
             let truncated = offset < start_offset;
             (output, next_offset, truncated, idle_s, total_out)
         };
-        let st = s.status.lock().await.clone();
         Ok(LogResult {
             output,
             next_offset,
@@ -676,6 +751,7 @@ impl ProcessManager {
             status: st,
             idle_s,
             total_output_bytes: total_out,
+            output_encoding: s.output_encoding,
         })
     }
 
@@ -691,7 +767,7 @@ impl ProcessManager {
         let s = guard
             .get_mut(session_id)
             .ok_or_else(|| anyhow::anyhow!("Unknown session: {}", session_id))?;
-        if matches!(*s.status.lock().await, ProcessStatus::Exited(_)) {
+        if s.exited_at.is_some() || matches!(*s.status.lock().await, ProcessStatus::Exited(_)) {
             anyhow::bail!("Session has exited");
         }
         let stdin = s
@@ -712,6 +788,12 @@ impl ProcessManager {
                 .ok_or_else(|| anyhow::anyhow!("Unknown session: {}", session_id))?;
             // Set before any signal: the exit watcher may run the moment we signal.
             s.killed.store(true, Ordering::SeqCst);
+            // Output may still be draining after child.wait() reaped the PID.
+            // Never signal that PID again: it may already have been reused.
+            if s.exited_at.is_some() || matches!(*s.status.lock().await, ProcessStatus::Exited(_)) {
+                return Ok(());
+            }
+            anyhow::ensure!(s.pid != 0, "Cannot kill a session without a process ID");
             s.pid
         };
 
@@ -724,7 +806,8 @@ impl ProcessManager {
             let still_running = {
                 let guard = self.sessions.lock().await;
                 if let Some(s) = guard.get(session_id) {
-                    matches!(*s.status.lock().await, ProcessStatus::Running)
+                    s.exited_at.is_none()
+                        && matches!(*s.status.lock().await, ProcessStatus::Running)
                 } else {
                     false
                 }
@@ -748,7 +831,8 @@ impl ProcessManager {
             let still_running = {
                 let guard = self.sessions.lock().await;
                 if let Some(s) = guard.get(session_id) {
-                    matches!(*s.status.lock().await, ProcessStatus::Running)
+                    s.exited_at.is_none()
+                        && matches!(*s.status.lock().await, ProcessStatus::Running)
                 } else {
                     false
                 }
@@ -796,6 +880,7 @@ impl ProcessManager {
                 uptime_s,
                 idle_s,
                 total_output_bytes,
+                output_encoding: s.output_encoding,
             });
         }
         out
@@ -855,19 +940,115 @@ mod tests {
     #[test]
     fn output_buffer_ring_and_offsets() {
         let mut b = OutputBuffer::new(10);
-        b.append(b"0123456789");
-        let (chunk, trunc, n) = b.bytes_since(0);
+        b.append("0123456789");
+        let (chunk, trunc, n) = b.bytes_since(0).unwrap();
         assert!(!trunc);
         assert_eq!(n, 10);
         assert_eq!(chunk, b"0123456789");
 
-        b.append(b"ABCDE");
+        b.append("ABCDE");
         assert_eq!(b.data.len(), 10);
-        let (_, trunc, n2) = b.bytes_since(0);
+        let (_, trunc, n2) = b.bytes_since(0).unwrap();
         assert!(trunc);
         assert_eq!(n2, 15);
-        let (chunk2, _, _) = b.bytes_since(10);
+        let (chunk2, _, _) = b.bytes_since(10).unwrap();
         assert_eq!(chunk2, b"ABCDE");
+
+        let (range, next) = b.bytes_range(7, 3).unwrap();
+        assert_eq!(range, b"789");
+        assert_eq!(next, 10, "range cursor must not skip bytes after its limit");
+    }
+
+    #[test]
+    fn output_ring_and_callback_tail_never_split_utf8() {
+        let text = "a中🙂éz";
+        for max in 0..=text.len() {
+            let mut buffer = OutputBuffer::new(max);
+            buffer.append("a中");
+            buffer.append("🙂éz");
+            let retained = std::str::from_utf8(&buffer.data).unwrap();
+            assert!(text.ends_with(retained));
+            assert!(buffer.data.len() <= max);
+            assert_eq!(buffer.total_written(), text.len() as u64);
+            let (bytes, truncated, next) = buffer.bytes_since(0).unwrap();
+            assert_eq!(bytes, buffer.data);
+            assert_eq!(truncated, max < text.len());
+            assert_eq!(next, text.len() as u64);
+            assert!(text.ends_with(std::str::from_utf8(tail(text.as_bytes(), max)).unwrap()));
+        }
+        let mut task = sample_task();
+        task.output_encoding = OutputEncoding::Oem;
+        let payload = payload_with_tail(&task, "p", text.as_bytes(), text.len() as u64, 8);
+        assert_eq!(
+            payload["result"]["output"], "🙂éz",
+            "normalized output must not be decoded twice"
+        );
+    }
+
+    #[test]
+    fn log_pagination_makes_progress_or_reports_an_invalid_boundary() {
+        let mut buffer = OutputBuffer::new(64);
+        buffer.append("中🙂z");
+        assert!(buffer.bytes_range(0, 0).is_err());
+        assert!(buffer.bytes_range(0, 2).is_err());
+        assert!(buffer.bytes_range(1, 4).is_err());
+        assert!(buffer.bytes_since(1).is_err());
+        let (first, next) = buffer.bytes_range(0, 4).unwrap();
+        assert_eq!(first, "中".as_bytes());
+        assert_eq!(next, 3);
+        let (second, next) = buffer.bytes_range(next, 4).unwrap();
+        assert_eq!(second, "🙂".as_bytes());
+        assert_eq!(next, 7);
+        let (last, next) = buffer.bytes_range(next, usize::MAX).unwrap();
+        assert_eq!(last, b"z");
+        assert_eq!(next, 8);
+        assert_eq!(buffer.bytes_range(next, 4).unwrap(), (vec![], next));
+    }
+
+    #[tokio::test]
+    async fn pipe_reader_flushes_eof_and_keeps_streams_separate() {
+        let output = Arc::new(AsyncMutex::new(OutputBuffer::new(64)));
+        let notify = Arc::new(Notify::new());
+        let (mut writer, reader) = tokio::io::duplex(1);
+        let task = tokio::spawn(read_into_buffer(
+            reader,
+            output.clone(),
+            notify.clone(),
+            OutputEncoding::Utf8,
+        ));
+        writer.write_all(b"\xe4\xb8").await.unwrap();
+        // stderr must not be spliced into the middle of stdout's character.
+        read_into_buffer(
+            b"error".as_slice(),
+            output.clone(),
+            notify,
+            OutputEncoding::Utf8,
+        )
+        .await;
+        writer.write_all(b"\xad\xf0\x9f").await.unwrap();
+        drop(writer);
+        task.await.unwrap();
+        assert_eq!(output.lock().await.data, "error中�".as_bytes());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn pipe_reader_flushes_unterminated_oem_line_at_eof() {
+        if crate::tools::text::windows_oem_code_page() != 936 {
+            return; // Fixed-CP936 decoder tests run on every Windows locale.
+        }
+        let output = Arc::new(AsyncMutex::new(OutputBuffer::new(64)));
+        read_into_buffer(
+            b"\xe4\xb8".as_slice(),
+            output.clone(),
+            Arc::new(Notify::new()),
+            OutputEncoding::Auto,
+        )
+        .await;
+        let buffer = output.lock().await;
+        let (text, _, next) = buffer.bytes_since(0).unwrap();
+        assert_eq!(text, "涓".as_bytes());
+        assert_eq!(next, 3, "cursor counts normalized UTF-8 bytes");
     }
 
     #[test]
@@ -889,6 +1070,7 @@ mod tests {
             workdir: "/home/alice/project".to_string(),
             exit_code: 0,
             elapsed_secs: 42,
+            output_encoding: OutputEncoding::Utf8,
         }
     }
 
@@ -903,6 +1085,7 @@ mod tests {
         assert_eq!(v["result"]["session_id"], "sess_abc");
         assert_eq!(v["result"]["exit_code"], 0);
         assert_eq!(v["result"]["output"], "hello");
+        assert_eq!(v["result"]["output_encoding"], "utf8");
         assert_eq!(v["result"]["command"], "make test");
         assert_eq!(v["result"]["workdir"], "/home/alice/project");
         assert_eq!(v["result"]["elapsed_secs"], 42);

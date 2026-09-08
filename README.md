@@ -220,6 +220,23 @@ this selects UTF-8 output/text defaults and transports the script without code-p
 loss. `Path outside workspace` remains a boundary rejection, not a reason to
 create a different workspace or retry via shell commands.
 
+Command output supports `output_encoding: "auto" | "utf8" | "oem"` (`oem`
+is Windows-only). The default uses UTF-8 for PowerShell and macOS/Linux. For
+Windows cmd, `auto` prefers UTF-8 and otherwise uses the system OEM code page,
+independently for each stdout/stderr line. Non-ASCII output without a newline
+may wait until EOF or a 64KiB buffer limit; at the limit, the decoder locks its
+choice until the next newline. Use an explicit encoding for interactive output
+or ambiguous legacy bytes; mixed encodings within one line cannot be reliably
+auto-detected. This decodes captured output, not arbitrary file contents or stdin.
+
+Background output is normalized once to UTF-8. `portal_process` offsets,
+`next_offset`, limits, and `total_output_bytes` count **normalized UTF-8 bytes**,
+not OEM source bytes. Reuse `next_offset` for pagination; invalid character
+offsets or a limit too small for the next character return an error (a limit
+of at least 4 bytes fits any UTF-8 character). Normal process exit drains both
+pipes before reporting completion, with a 5-second bound if descendants retain
+the pipe handles; such descendants may still produce later output.
+
 | Problem | Solution |
 |---------|----------|
 | `relay: connection refused` | Check `hearth_url` and that your being is running |

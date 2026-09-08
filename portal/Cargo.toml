@@ -35,6 +35,9 @@ clap = { version = "4", features = ["derive"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Globalization"] }
+
 [dev-dependencies]
 # Local HTTP receiver used by background-task callback tests.
 axum = "0.8"
