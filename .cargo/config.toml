@@ -4,5 +4,9 @@ linker = "x86_64-linux-musl-gcc"
 [target.x86_64-pc-windows-gnu]
 linker = "x86_64-w64-mingw32-gcc"
 
+[target.'cfg(all(windows, target_env = "msvc"))']
+# A downloaded single exe must work without the Visual C++ redistributable.
+rustflags = ["-C", "target-feature=+crt-static"]
+
 [env]
 CC_x86_64_unknown_linux_musl = "x86_64-linux-musl-gcc"

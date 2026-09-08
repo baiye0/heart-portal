@@ -8,10 +8,13 @@ param(
 $ErrorActionPreference = 'Stop'
 $Root = (Resolve-Path -LiteralPath $Root).Path
 . (Join-Path $PSScriptRoot 'portal-task-common.ps1')
+$maintenance = Enter-PortalMaintenance $Root
+try {
 $supervisor = Join-Path $Root 'scripts\portal-supervisor.ps1'
 $hiddenLauncher = Join-Path $Root 'scripts\portal-supervisor-hidden.vbs'
 if (-not (Test-Path -LiteralPath $supervisor)) { throw "Supervisor script not found: $supervisor" }
 if (-not (Test-Path -LiteralPath $hiddenLauncher)) { throw "Hidden launcher not found: $hiddenLauncher" }
+if (-not (Test-Path -LiteralPath (Join-Path $Root 'scripts\portal-supervisor-bootstrap.ps1'))) { throw 'Portal supervisor bootstrap is missing.' }
 
 if ([string]::IsNullOrWhiteSpace($PortalName)) { $PortalName = Get-PortalSavedValue $Root '.portal-name' }
 if ($PortalName -notmatch '^[A-Za-z0-9][A-Za-z0-9_-]*$') {
@@ -24,7 +27,7 @@ if ($TaskName.IndexOfAny([char[]]'\/:*?"<>|') -ge 0) { throw 'TaskName contains 
 Assert-PortalTaskOwnership $Root $TaskName
 if ($previousTask -and $previousTask -ne $TaskName) { Assert-PortalTaskOwnership $Root $previousTask }
 
-$portalExe = Join-Path $Root 'target\release\heart-portal.exe'
+$portalExe = Get-PortalExecutable $Root
 if (-not (Test-Path -LiteralPath $portalExe)) {
     throw "Portal binary not found: $portalExe. Run 'cargo build --release --locked' first."
 }
@@ -51,10 +54,16 @@ if ($previousTask -and $previousTask -ne $TaskName) {
     Unregister-ScheduledTask -TaskName $previousTask -Confirm:$false
 }
 Stop-PortalCheckoutProcesses $Root
+if (Test-Path -LiteralPath (Join-Path $Root '.portal-upgrade.json')) {
+    Restore-PortalUpgrade $Root (Read-PortalJson (Join-Path $Root '.portal-upgrade.json'))
+}
 if (-not [string]::IsNullOrWhiteSpace($ConnectLink)) {
     Set-Content -LiteralPath (Join-Path $Root '.portal-connection.url') -Value $ConnectLink.Trim() -NoNewline
 }
 Set-Content -LiteralPath (Join-Path $Root '.portal-name') -Value $PortalName -NoNewline
 Set-Content -LiteralPath (Join-Path $Root '.portal-task-name') -Value $TaskName -NoNewline
+$relativeExe = if ($portalExe -eq (Join-Path $Root 'heart-portal.exe')) { 'heart-portal.exe' } else { 'target\release\heart-portal.exe' }
+Set-Content -LiteralPath (Join-Path $Root '.portal-executable') -Value $relativeExe -NoNewline
 Start-ScheduledTask -TaskName $TaskName
 Write-Output "Installed and started scheduled task '$TaskName' for Portal '$PortalName'."
+} finally { foreach ($lock in $maintenance) { $lock.Dispose() } }

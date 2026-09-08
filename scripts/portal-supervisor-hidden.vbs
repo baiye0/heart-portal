@@ -11,7 +11,7 @@ portalName = WScript.Arguments(1)
 
 Set shell = CreateObject("WScript.Shell")
 powershell = shell.ExpandEnvironmentStrings("%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe")
-supervisor = root & "\scripts\portal-supervisor.ps1"
+supervisor = root & "\scripts\portal-supervisor-bootstrap.ps1"
 
 command = Quote(powershell) _
     & " -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File " _

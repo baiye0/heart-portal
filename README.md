@@ -47,7 +47,7 @@ Download the latest binary from [Releases](https://github.com/d5z/heart-portal/r
 | macOS (Apple Silicon) | `heart-portal-aarch64-apple-darwin` |
 | macOS (Intel) | `heart-portal-x86_64-apple-darwin` |
 | Linux (x86_64) | `heart-portal-x86_64-unknown-linux-musl` |
-| Windows | `heart-portal-x86_64-pc-windows-msvc.exe` |
+| Windows | `heart-portal-windows-x86_64.exe` |
 
 ```bash
 # macOS / Linux
@@ -134,24 +134,39 @@ python3 scripts/tests/macos-lifecycle.tests.py
 
 ### Windows background recovery
 
-Build from the checkout with `cargo build --release --locked` (Rust MSVC
-toolchain and the Visual Studio C++ Build Tools are required), then install:
+Download just `heart-portal-windows-x86_64.exe` into a writable folder and run it.
+The exe embeds its supervisor and updater: on the first normal launch it creates
+`portal.toml`, extracts the scripts, registers a current-user logon task, and
+starts Portal under supervision. No installer, separate script download, Rust,
+Python, VBScript, or Visual C++ redistributable is needed for Portal itself.
+Windows 10/11's built-in Windows PowerShell 5.1 runs the embedded scripts.
+Kits may still require their own runtimes.
 
 ```powershell
-.\scripts\install-portal-windows.ps1 -ConnectLink "https://echo.beings.town/<being>/?token=<token>" -PortalName "<machine-name>"
+.\heart-portal-windows-x86_64.exe --connect "https://echo.beings.town/<being>/?token=<token>" --name "<machine-name>"
+.\heart-portal-windows-x86_64.exe status
 ```
 
-For an existing Portal, use its original `--name` on the first installation.
-If omitted, the first installation derives a name from the Being and computer
-name. Later installations and restarts reuse the saved name and scheduled task.
-Use a different name on each machine.
+Double-clicking without a connection link starts local MCP on `127.0.0.1:9100`.
+Connecting to a Being requires its Loom link. For an existing Portal, keep its
+original `--name`; use different names on different computers.
 
-The installer creates a local config from `portal.example.toml` if absent.
-It saves the connection link, name, and task in the Git-ignored
-`.portal-connection.url`, `.portal-name`, and `.portal-task-name`.
-The task starts at user logon through a windowless launcher; Windows Script
-Host/VBScript must be available. Portal and its supervisor each reject a
-duplicate instance for the same relay/Being in the current Windows session.
+Launch arguments, connection link, selected environment and working directory
+are saved in `.portal-launch.json`. Keep this credential-bearing file private.
+Subsequent launches reuse those settings and the existing process. The logon
+task starts a hidden bootstrap; it runs after this Windows user logs in, not
+before login. If Windows policy blocks task registration, current-session
+supervision still starts and the CLI reports that logon recovery is unavailable.
+Keep the exe and generated files together at their original location.
+
+Use `stop` to stop both Portal and its supervisors and disable logon recovery.
+Running the exe again re-enables the task and resumes supervision. To change
+connection or launch arguments, stop first, then run with the new arguments.
+
+```powershell
+.\heart-portal-windows-x86_64.exe stop
+.\heart-portal-windows-x86_64.exe
+```
 
 After updating a kit, the Being should call `portal_restart`, not kill
 Portal or launch another supervisor. The tool is available only under supervision:
@@ -165,7 +180,37 @@ Kits remain under the current user's `~/.heart-portal/kits` or configured
 pre-flight checks and the runtime logs for startup errors. `portal_kit_usage`
 counts successful calls since its last read; `{}` is not a kit inventory.
 
-To update the Portal binary locally (kit-only updates do not need this):
+To upgrade a running Windows Portal to the latest GitHub release:
+
+```powershell
+.\heart-portal-windows-x86_64.exe upgrade
+.\heart-portal-windows-x86_64.exe upgrade --status
+# Or apply an already downloaded newer exe through the same transaction:
+.\heart-portal-windows-x86_64.exe upgrade --file C:\Downloads\new-portal.exe
+```
+
+The exe remains a directly runnable program; no installer is added. The upgrade
+command downloads the asset for the exact release tag, validates it, and hands
+off to a windowless update worker before exiting to release the exe file.
+The command reports **accepted**, not completed; `upgrade --status` reports the
+final result. `--upgrade` remains supported as a legacy spelling.
+
+The updater and supervisor share an installation lock. While replacing files,
+the updater prevents relaunches, stops only this installation, and retains a
+backup. The supervisor then launches the new binary. Success requires the new
+version to finish local initialization and remain alive for five seconds;
+relay reachability is independent of this check. Failed startup rolls back.
+The current user's config, Portal name, connection link and kits are preserved.
+
+Each exe embeds its matching supervisor scripts. They are upgraded and rolled
+back together with the binary. A small stable bootstrap remains running while
+the supervisor implementation is replaced; if the update worker crashes, it
+uses the saved recovery worker to restore the interrupted transaction.
+Ordinary crash recovery, duplicate prevention and `portal_restart` still work.
+See [Windows upgrade details](docs/windows-upgrade.md)
+for recovery, status and packaging instructions.
+
+For a local **source rebuild** (kit-only updates do not need this):
 
 ```powershell
 .\scripts\uninstall-portal-task.ps1
@@ -178,10 +223,14 @@ run the uninstall command without rebuilding/reinstalling. Unrestricted scripts
 run as the same Windows user and can still stop the supervisor; this is recovery
 from ordinary exits/crashes, not a security boundary against deliberate termination.
 
-Windows recovery regression tests (temporary fixtures, no real relay/task changes):
+Windows verification uses temporary fixtures. Package tests create and remove
+their own scheduled tasks and do not connect to a real Being:
 
 ```powershell
 powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/tests/windows-lifecycle.tests.ps1
+.\scripts\package-portal-windows.ps1
+.\scripts\tests\windows-package.tests.ps1 -LocalOnly
+.\scripts\tests\windows-upgrade-e2e.ps1
 ```
 
 Your being now has hands on your machine! 🤲

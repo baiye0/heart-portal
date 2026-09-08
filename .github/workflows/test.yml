@@ -28,4 +28,14 @@ jobs:
       - name: Windows supervisor lifecycle
         if: runner.os == 'Windows'
         shell: powershell
-        run: .\scripts\tests\windows-lifecycle.tests.ps1
+        run: |
+          .\scripts\tests\windows-lifecycle.tests.ps1
+          .\scripts\tests\windows-start-fallback.tests.ps1
+      - name: Windows single-exe first launch and upgrade
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          cargo build --locked
+          if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
+          .\scripts\tests\windows-package.tests.ps1 -Binary '.\target\debug\heart-portal.exe'
+          .\scripts\tests\windows-package.tests.ps1 -Binary '.\target\debug\heart-portal.exe' -LocalOnly

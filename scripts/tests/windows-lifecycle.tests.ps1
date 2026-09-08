@@ -5,8 +5,9 @@ $tempBase = [IO.Path]::GetTempPath()
 $testRoot = Join-Path $tempBase ("portal Windows test " + [char]0x6D4B + '-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path (Join-Path $testRoot 'target\release') -Force | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $testRoot 'scripts') | Out-Null
+$supervisorDiagnostics = [Collections.Generic.List[object]]::new()
 Copy-Item -LiteralPath (Join-Path $repo 'portal.example.toml') -Destination $testRoot
-foreach ($script in @('portal-supervisor.ps1', 'portal-supervisor-hidden.vbs', 'portal-task-common.ps1', 'install-portal-task.ps1', 'install-portal-windows.ps1', 'uninstall-portal-task.ps1')) {
+foreach ($script in @('portal-lifecycle.ps1', 'portal-supervisor.ps1', 'portal-supervisor-bootstrap.ps1', 'portal-supervisor-hidden.vbs', 'portal-task-common.ps1', 'install-portal-task.ps1', 'install-portal-windows.ps1', 'uninstall-portal-task.ps1')) {
     Copy-Item -LiteralPath (Join-Path $repo "scripts\$script") -Destination (Join-Path $testRoot 'scripts')
 }
 
@@ -22,9 +23,18 @@ function Wait-Until([scriptblock]$Condition, [string]$Message, [int]$TimeoutSeco
     throw "Timed out: $Message (test files: $testRoot)"
 }
 function Launch-Supervisor {
-    $supervisor = Join-Path $testRoot 'scripts\portal-supervisor.ps1'
+    $supervisor = Join-Path $testRoot 'scripts\portal-supervisor-bootstrap.ps1'
     $arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -Root "{1}" -RestartDelaySeconds 1' -f $supervisor, $testRoot
-    Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') -ArgumentList $arguments -WindowStyle Hidden -PassThru
+    $info = [Diagnostics.ProcessStartInfo]::new()
+    $info.FileName = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $info.Arguments = $arguments
+    $info.UseShellExecute = $false
+    $info.CreateNoWindow = $true
+    $info.RedirectStandardOutput = $true
+    $info.RedirectStandardError = $true
+    $child = [Diagnostics.Process]::Start($info)
+    $supervisorDiagnostics.Add(@{ Output = $child.StandardOutput.ReadToEndAsync(); Error = $child.StandardError.ReadToEndAsync() })
+    return $child
 }
 function Get-Launches {
     $path = Join-Path $testRoot 'launches.txt'
@@ -139,6 +149,95 @@ try {
     }
     Assert (-not $supervisorProcess.HasExited) 'supervisor survives Portal kill'
     Write-Output 'PASS: duplicate supervisor rejected; crash restart keeps original name'
+
+    $gate = Open-PortalLock $testRoot '.portal-lifecycle.lock' 15
+    try {
+        $countBefore = @(Get-Launches).Count
+        Stop-PortalRuntime $testRoot
+        Start-Sleep -Seconds 3
+        Assert (@(Get-Launches).Count -eq $countBefore) 'maintenance gate prevents a relaunch after the runtime exits'
+    } finally { $gate.Dispose() }
+    Wait-Until { @(Get-Launches).Count -gt $countBefore } 'restart after maintenance releases its handle'
+    Write-Output 'PASS: supervisor cannot race the maintenance gate'
+
+    function Launch-Upgrade([string]$Version, [switch]$FailStartup, [switch]$FailSupervisor) {
+        $stage = Join-Path $testRoot ('.portal-upgrades\' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $stage -Force | Out-Null
+        foreach ($name in @('portal-lifecycle.ps1', 'portal-upgrade-worker.ps1')) {
+            Copy-Item -LiteralPath (Join-Path $repo "scripts\$name") -Destination $stage
+        }
+        $candidate = Join-Path $stage 'heart-portal.exe'
+        $fixtureSupport = Join-Path $stage 'fixture-support'
+        New-Item -ItemType Directory -Path $fixtureSupport | Out-Null
+        foreach ($name in @('portal-lifecycle.ps1', 'portal-supervisor.ps1', 'portal-supervisor-hidden.vbs', 'portal-supervisor-bootstrap.ps1')) {
+            Copy-Item -LiteralPath (Join-Path $repo "scripts\$name") -Destination $fixtureSupport
+        }
+        Add-Content -LiteralPath (Join-Path $fixtureSupport 'portal-supervisor.ps1') -Value "# Fixture supervisor version $Version"
+        if ($FailSupervisor) { [IO.File]::WriteAllText((Join-Path $fixtureSupport 'portal-supervisor.ps1'), 'exit 0') }
+        $code = $fixture.Replace('0.8.0', $Version)
+        if ($FailStartup) { $code = $code.Replace('string root = Environment.CurrentDirectory;', 'return 23; /*').Replace('while (true) { Thread.Sleep(100); }', '*/') }
+        Add-Type -TypeDefinition $code -OutputAssembly $candidate -OutputType ConsoleApplication
+        $request = @{
+            root = $testRoot; target = (Get-PortalExecutable $testRoot); candidate = $candidate
+            version = $Version; sha256 = (Get-FileHash -LiteralPath $candidate).Hash
+            parent_pid = [int]::MaxValue; ack = (Join-Path $stage 'accepted.json'); error = (Join-Path $stage 'error.json')
+        }
+        Write-PortalJson (Join-Path $stage 'request.json') $request
+        $info = [Diagnostics.ProcessStartInfo]::new()
+        $info.FileName = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $info.Arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' + (ConvertTo-PortalArgument (Join-Path $stage 'portal-upgrade-worker.ps1'))
+        $info.UseShellExecute = $false
+        $info.CreateNoWindow = $true
+        return [Diagnostics.Process]::Start($info)
+    }
+    $oldHash = (Get-FileHash -LiteralPath (Get-PortalExecutable $testRoot)).Hash
+    $upgradeProcess = Launch-Upgrade '0.8.1'
+    try {
+        Wait-Until { (Read-PortalJson (Join-Path $testRoot '.portal-upgrade-status.json')).state -eq 'verifying' } 'upgrade reaches supervised verification'
+        $failed = $false
+        try { $locks = Enter-PortalMaintenance $testRoot; foreach ($lock in $locks) { $lock.Dispose() } } catch { $failed = $true }
+        Assert $failed 'install/uninstall rejected while upgrade owns transaction'
+        $duplicateUpgrade = Launch-Upgrade '0.8.2'
+        try { Assert ($duplicateUpgrade.WaitForExit(10000) -and $duplicateUpgrade.ExitCode -ne 0) 'concurrent upgrade rejected' }
+        finally { $duplicateUpgrade.Dispose() }
+        Assert ($upgradeProcess.WaitForExit(30000) -and $upgradeProcess.ExitCode -eq 0) 'upgrade worker succeeds'
+        Assert ((Read-PortalJson (Join-Path $testRoot '.portal-upgrade-status.json')).state -eq 'succeeded') 'upgrade reports committed success'
+        Assert (Test-PortalReady $testRoot '0.8.1') 'new version is running and locally ready'
+        Assert ((Get-FileHash -LiteralPath (Get-PortalExecutable $testRoot)).Hash -ne $oldHash) 'running exe was replaced'
+        Assert (-not (Test-Path -LiteralPath (Join-Path $testRoot '.portal-upgrade.json'))) 'successful upgrade commits journal'
+    } finally { if (-not $upgradeProcess.HasExited) { $upgradeProcess.Kill() }; $upgradeProcess.Dispose() }
+    Write-Output 'PASS: upgrade replaces the actual executable, blocks concurrent maintenance/upgrades, and verifies the new version'
+
+    $goodHash = (Get-FileHash -LiteralPath (Get-PortalExecutable $testRoot)).Hash
+    $goodSupervisorHash = (Get-FileHash -LiteralPath (Join-Path $testRoot 'scripts\portal-supervisor.ps1')).Hash
+    $upgradeProcess = Launch-Upgrade '0.8.3' -FailStartup
+    try {
+        Wait-Until { (Read-PortalJson (Join-Path $testRoot '.portal-upgrade-status.json')).state -eq 'verifying' } 'broken binary reaches runtime verification'
+        $upgradeProcess.Kill()
+        Assert ($upgradeProcess.WaitForExit(5000)) 'interrupted updater exits'
+        Wait-Until { (Read-PortalJson (Join-Path $testRoot '.portal-upgrade-status.json')).state -eq 'rolled_back' -and (Test-PortalReady $testRoot '0.8.1') } 'supervisor recovers interrupted upgrade' 30
+        Assert ((Get-FileHash -LiteralPath (Get-PortalExecutable $testRoot)).Hash -eq $goodHash) 'interrupted upgrade restores exact previous binary'
+        Assert ((Get-FileHash -LiteralPath (Join-Path $testRoot 'scripts\portal-supervisor.ps1')).Hash -eq $goodSupervisorHash) 'interrupted upgrade restores matching supervisor code'
+    } finally { if (-not $upgradeProcess.HasExited) { $upgradeProcess.Kill() }; $upgradeProcess.Dispose() }
+    Write-Output 'PASS: killed updater releases its OS lock and supervisor restores the previous binary'
+
+    $upgradeProcess = Launch-Upgrade '0.8.4' -FailStartup
+    try {
+        Assert ($upgradeProcess.WaitForExit(90000) -and $upgradeProcess.ExitCode -ne 0) 'startup failure rolls back and reports failure'
+        Assert ((Read-PortalJson (Join-Path $testRoot '.portal-upgrade-status.json')).state -eq 'rolled_back') 'startup failure records rollback'
+        Assert (Test-PortalReady $testRoot '0.8.1') 'old version is ready after failed upgrade'
+    } finally { if (-not $upgradeProcess.HasExited) { $upgradeProcess.Kill() }; $upgradeProcess.Dispose() }
+    Write-Output 'PASS: startup timeout rolls back and verifies the old version'
+
+    $upgradeProcess = Launch-Upgrade '0.8.5' -FailSupervisor
+    try {
+        Assert ($upgradeProcess.WaitForExit(90000) -and $upgradeProcess.ExitCode -ne 0) 'broken supervisor rolls back and reports failure'
+        Assert ((Read-PortalJson (Join-Path $testRoot '.portal-upgrade-status.json')).state -eq 'rolled_back') 'broken supervisor records rollback'
+        Assert (Test-PortalReady $testRoot '0.8.1') 'old Portal and supervisor work after supervisor update failure'
+        Assert ((Get-FileHash -LiteralPath (Join-Path $testRoot 'scripts\portal-supervisor.ps1')).Hash -eq $goodSupervisorHash) 'broken supervisor restores the exact previous script'
+    } finally { if (-not $upgradeProcess.HasExited) { $upgradeProcess.Kill() }; $upgradeProcess.Dispose() }
+    Write-Output 'PASS: supervisor update failure restores the matching Portal and supervisor as one transaction'
+
     Stop-PortalCheckoutProcesses $testRoot
     $supervisorProcess.Dispose()
 
@@ -157,6 +256,10 @@ try {
     . (Join-Path $testRoot 'scripts\portal-task-common.ps1')
     Stop-PortalCheckoutProcesses $testRoot
     $resolvedTestRoot = (Resolve-Path -LiteralPath $testRoot).Path
+    foreach ($diagnostic in $supervisorDiagnostics) {
+        if ($diagnostic.Output.Wait(2000)) { Write-Output $diagnostic.Output.Result }
+        if ($diagnostic.Error.Wait(2000)) { Write-Output $diagnostic.Error.Result }
+    }
     if (-not $resolvedTestRoot.StartsWith([IO.Path]::GetFullPath($tempBase), [StringComparison]::OrdinalIgnoreCase) -or
         (Split-Path $resolvedTestRoot -Leaf) -notlike 'portal Windows test *') { throw 'Unsafe test cleanup path' }
     Remove-Item -LiteralPath $resolvedTestRoot -Recurse -Force

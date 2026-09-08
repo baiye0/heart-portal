@@ -52,6 +52,16 @@ jobs:
         if: runner.os == 'Windows'
         run: cp target/${{ matrix.target }}/release/heart-portal.exe ${{ matrix.name }}
 
+      - name: Verify Windows recovery and upgrade lifecycle
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          .\scripts\tests\windows-lifecycle.tests.ps1
+          .\scripts\tests\windows-start-fallback.tests.ps1
+          .\scripts\tests\windows-package.tests.ps1 -Binary '${{ matrix.name }}'
+          .\scripts\tests\windows-package.tests.ps1 -Binary '${{ matrix.name }}' -LocalOnly
+          .\scripts\tests\windows-upgrade-e2e.ps1 -Binary '${{ matrix.name }}'
+
       - name: Import Apple Developer ID certificate
         if: runner.os == 'macOS'
         env:

@@ -6,6 +6,8 @@ param(
 $ErrorActionPreference = 'Stop'
 $Root = (Resolve-Path -LiteralPath $Root).Path
 . (Join-Path $PSScriptRoot 'portal-task-common.ps1')
+$maintenance = Enter-PortalMaintenance $Root
+try {
 $nameFile = Join-Path $Root '.portal-name'
 $taskNameFile = Join-Path $Root '.portal-task-name'
 if ([string]::IsNullOrWhiteSpace($TaskName)) {
@@ -27,5 +29,9 @@ Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
 
 Stop-PortalCheckoutProcesses $Root
+if (Test-Path -LiteralPath (Join-Path $Root '.portal-upgrade.json')) {
+    Restore-PortalUpgrade $Root (Read-PortalJson (Join-Path $Root '.portal-upgrade.json'))
+}
 
 Write-Output "Removed scheduled task '$TaskName'."
+} finally { foreach ($lock in $maintenance) { $lock.Dispose() } }

@@ -14,6 +14,10 @@ mod protocol;
 mod relay_client;
 mod single_instance;
 mod upgrade;
+#[cfg(windows)]
+mod windows_upgrade;
+#[cfg(windows)]
+mod windows_start;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -34,6 +38,12 @@ use crate::tools::ToolHost;
     about = "Heart Portal — Being's gateway to the world"
 )]
 struct Cli {
+    /// Export version-matched Windows supervision code for the update worker
+    #[arg(long, hide = true)]
+    export_windows_runtime: Option<PathBuf>,
+    /// Legacy spelling for the upgrade subcommand
+    #[arg(long = "upgrade", hide = true)]
+    legacy_upgrade: bool,
     #[command(subcommand)]
     command: Option<Commands>,
 
@@ -56,8 +66,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Stop this Windows Portal and its supervisors until the next manual start
+    Stop,
+    /// Show the running Windows Portal and supervisor status
+    Status,
     /// Check GitHub releases and upgrade to the latest version
-    Upgrade,
+    Upgrade {
+        /// Apply a pre-downloaded newer Windows exe through the same updater
+        #[arg(long, conflicts_with = "status")]
+        file: Option<PathBuf>,
+        /// Show the last Windows upgrade transaction without downloading
+        #[arg(long)]
+        status: bool,
+    },
     /// Manage installed Portal kits
     Kit {
         #[command(subcommand)]
@@ -76,10 +97,38 @@ enum KitCommands {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Some(path) = &cli.export_windows_runtime {
+        #[cfg(windows)]
+        return windows_upgrade::export_runtime(path);
+        #[cfg(not(windows))]
+        anyhow::bail!("Windows runtime export is available only on Windows");
+    }
     let command = cli.command;
 
-    if matches!(&command, Some(Commands::Upgrade)) {
+    if matches!(&command, Some(Commands::Upgrade { status: true, .. })) {
+        #[cfg(windows)]
+        return windows_upgrade::show_status();
+        #[cfg(not(windows))]
+        anyhow::bail!("Upgrade status is currently supported only on Windows");
+    }
+    if let Some(Commands::Upgrade { file: Some(path), .. }) = &command {
+        #[cfg(windows)]
+        return windows_upgrade::upgrade_file(path).await;
+        #[cfg(not(windows))]
+        anyhow::bail!("Local executable upgrades are currently supported only on Windows");
+    }
+    if cli.legacy_upgrade || matches!(&command, Some(Commands::Upgrade { .. })) {
         return upgrade::run_upgrade().await;
+    }
+    if matches!(&command, Some(Commands::Stop | Commands::Status)) {
+        #[cfg(windows)]
+        return windows_start::run(if matches!(&command, Some(Commands::Stop)) { "stop" } else { "status" }, None, None, None).await;
+        #[cfg(not(windows))]
+        anyhow::bail!("Use your OS service manager for start/stop/status on this platform");
+    }
+    #[cfg(windows)]
+    if command.is_none() && std::env::var("HEART_PORTAL_SUPERVISED").as_deref() != Ok("1") {
+        return windows_start::run("start", cli.config.as_deref().or(cli.config_positional.as_deref()), cli.connect.as_deref(), cli.name.as_deref()).await;
     }
 
     tracing_subscriber::fmt()
@@ -133,6 +182,10 @@ async fn main() -> Result<()> {
     // Key the instance guard by relay host + Being rather than by the whole
     // Loom URL. Rotating a token must not allow a second local instance to
     // bypass the duplicate-process guard.
+    #[cfg(windows)]
+    if windows_upgrade::recover_interrupted()? { return Ok(()); }
+    #[cfg(windows)]
+    let startup_guard = windows_upgrade::startup_guard()?;
     let instance_identity = match connect_link.as_deref() {
         Some(link) => {
             let (host, being_id, _) = relay_client::parse_loom_link(link)?;
@@ -207,6 +260,9 @@ async fn main() -> Result<()> {
             Err(e) => warn!("async callback disabled (invalid Loom link): {e:#}"),
         }
 
+        publish_supervisor_ready()?;
+        #[cfg(windows)]
+        drop(startup_guard);
         let tool_shutdown = tool_host.clone();
         let restart_waiter = tool_host.clone();
         tokio::select! {
@@ -236,6 +292,9 @@ async fn main() -> Result<()> {
     let addr = format!("{}:{}", config.bind_host, config.bind_port);
     let listener = TcpListener::bind(&addr).await?;
     info!("Portal MCP listening on {}", addr);
+    publish_supervisor_ready()?;
+    #[cfg(windows)]
+    drop(startup_guard);
 
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
     let mut shutdown_rx = shutdown_tx.subscribe();
@@ -294,6 +353,15 @@ async fn main() -> Result<()> {
     }
 
     drop(listener);
+    Ok(())
+}
+
+/// Local readiness is independent of relay availability: a network outage must
+/// not turn a working binary into a failed upgrade. The supervisor checks the
+/// PID, a fresh per-launch nonce, and the process creation time as well.
+fn publish_supervisor_ready() -> Result<()> {
+    #[cfg(windows)]
+    windows_upgrade::publish_ready()?;
     Ok(())
 }
 
