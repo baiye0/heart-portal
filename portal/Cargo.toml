@@ -16,14 +16,9 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 toml = "0.8"
-axum = { version = "0.8", features = ["ws"] }
-axum-extra = { version = "0.10", features = ["multipart"] }
-tower-http = { version = "0.6", features = ["cors", "limit"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
-notify = "7"
 futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "json", "gzip"] }
-bytes = "1"
 regex = "1"
 scraper = "0.22"
 walkdir = "2"
@@ -41,4 +36,5 @@ clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 
 [dev-dependencies]
-tower = { version = "0.5", features = ["util"] }
+# Local HTTP receiver used by background-task callback tests.
+axum = "0.8"

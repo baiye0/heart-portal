@@ -11,10 +11,6 @@ kits_enabled = true
 # %USERPROFILE%/.heart-portal/kits on Windows.
 # kits_dir = "C:/Users/you/.heart-portal/kits"
 
-[cowork]
-enabled = true
-http_port = 9101
-
 [tools]
 exec = true
 file = true
