@@ -211,7 +211,7 @@ pub async fn read(config: &PortalConfig, arguments: Value) -> Result<Value> {
     }
 
     // Truncate large responses to avoid flooding the being's context
-    const MAX_RESPONSE_CHARS: usize = 100_000; // 100KB
+    const MAX_RESPONSE_BYTES: usize = 100_000; // 100KB
 
     // Line-based partial read
     let lines: Vec<&str> = content.lines().collect();
@@ -234,10 +234,11 @@ pub async fn read(config: &PortalConfig, arguments: Value) -> Result<Value> {
         (format!("{}{}", header, slice), start > 0 || end < total_lines)
     } else {
         // Existing truncation logic for full read
-        if content.len() > MAX_RESPONSE_CHARS {
+        if content.len() > MAX_RESPONSE_BYTES {
+            let prefix = super::text::byte_prefix(&content, MAX_RESPONSE_BYTES);
             (
                 format!("{}...\n\n(truncated: showing {}/{} bytes. Use offset/limit to read specific sections.)",
-                    &content[..MAX_RESPONSE_CHARS], MAX_RESPONSE_CHARS, content.len()),
+                    prefix, prefix.len(), content.len()),
                 true
             )
         } else {

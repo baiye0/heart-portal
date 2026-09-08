@@ -9,6 +9,9 @@ mod screenshot;
 mod search;
 mod web;
 mod web_search;
+mod text;
+#[cfg(test)]
+mod utf8_tests;
 pub mod custom;
 
 use crate::config::PortalConfig;
@@ -227,7 +230,7 @@ impl ToolHost {
                         },
                         "max_chars": {
                             "type": "integer",
-                            "description": "Maximum characters to return (default: 50000)"
+                            "description": "Maximum response body bytes (default: 50000); preserves complete UTF-8 characters"
                         }
                     },
                     "required": ["url"]

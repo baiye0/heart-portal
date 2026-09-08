@@ -104,13 +104,14 @@ pub async fn execute(
     }
 
     // Truncate large outputs to avoid flooding the being's context
-    const MAX_OUTPUT_CHARS: usize = 100_000;
-    let truncated = text.len() > MAX_OUTPUT_CHARS;
+    const MAX_OUTPUT_BYTES: usize = 100_000;
+    let truncated = text.len() > MAX_OUTPUT_BYTES;
     if truncated {
-        text.truncate(MAX_OUTPUT_CHARS);
+        let end = super::text::byte_prefix(&text, MAX_OUTPUT_BYTES).len();
+        text.truncate(end);
         text.push_str(&format!(
-            "\n...\n(output truncated at {} chars)",
-            MAX_OUTPUT_CHARS
+            "\n...\n(output truncated at {} bytes)",
+            end
         ));
     }
 
