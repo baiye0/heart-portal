@@ -79,6 +79,35 @@ function Set-PortalUpgradeStatus([string]$Root, [string]$State, [string]$Message
     }
 }
 
+# Callers hold the lifecycle gate when using this handle to take ownership.
+# PID alone is insufficient: Windows reuses it, and start/upgrade CLIs use the
+# same executable. Only a published runtime with the same creation time counts.
+function Get-PortalRecordedProcess([string]$Root, $Runtime) {
+    if (-not $Runtime -or $Runtime.protocol -ne 1 -or -not $Runtime.pid -or
+        -not $Runtime.started -or -not $Runtime.nonce) { return $null }
+    $process = Get-Process -Id $Runtime.pid -ErrorAction SilentlyContinue
+    if (-not $process) { return $null }
+    try {
+        if (-not $process.HasExited -and $process.StartTime.ToUniversalTime().Ticks -eq $Runtime.started -and
+            $process.Path.Equals((Get-PortalExecutable $Root), [StringComparison]::OrdinalIgnoreCase)) {
+            # Open the process handle before returning so waits still work if
+            # this non-child exits before the new supervisor starts waiting.
+            [void]$process.Handle
+            return $process
+        }
+    } catch { $process.Dispose(); throw }
+    $process.Dispose()
+    return $null
+}
+
+function Test-SavedSupervisor($Runtime) {
+    if (-not $Runtime.supervisor_pid) { return $false }
+    $process = Get-Process -Id $Runtime.supervisor_pid -ErrorAction SilentlyContinue
+    if (-not $process) { return $false }
+    try { return -not $process.HasExited -and $process.StartTime.ToUniversalTime().Ticks -eq $Runtime.supervisor_started }
+    finally { $process.Dispose() }
+}
+
 function Stop-PortalRuntime([string]$Root, [string]$Exe = (Get-PortalExecutable $Root)) {
     # Never use taskkill /IM: other installations and concurrent upgrade CLIs
     # must survive. Recheck the actual process path after enumerating PIDs.

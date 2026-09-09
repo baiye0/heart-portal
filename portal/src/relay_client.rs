@@ -95,6 +95,8 @@ pub async fn connect_and_serve(
     let (host, being_id, token) = match parse_loom_link(loom_link) {
         Ok(x) => x,
         Err(e) => {
+            #[cfg(windows)]
+            crate::connection_status::publish("invalid");
             warn!("invalid Loom link: {e:#}");
             return;
         }
@@ -107,6 +109,8 @@ pub async fn connect_and_serve(
 
     let mut backoff = Duration::from_secs(BACKOFF_MIN_SECS);
     loop {
+        #[cfg(windows)]
+        crate::connection_status::publish("connecting");
         let session_start = Instant::now();
         match run_one_session(&relay_url, &being_id, &token, tool_host, portal_name).await {
             Ok(()) => {
@@ -134,6 +138,8 @@ pub async fn connect_and_serve(
                 }
             }
         }
+        #[cfg(windows)]
+        crate::connection_status::publish("retrying");
         tokio::time::sleep(Duration::from_millis(backoff_sleep_ms(backoff, jitter_ratio())))
             .await;
         backoff = next_backoff(backoff);
@@ -242,6 +248,8 @@ async fn run_one_session(
         handshake_resp.relay_keepalive.as_deref() == Some("text-v1");
 
     info!("Portal relay handshake OK — starting MCP server on WebSocket bridge");
+    #[cfg(windows)]
+    crate::connection_status::publish("connected");
 
     let (portal_stream, bridge_stream) = tokio::io::duplex(65536);
 

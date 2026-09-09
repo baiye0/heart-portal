@@ -51,6 +51,10 @@ public class FakePortal
             Thread.Sleep(100);
             return 17;
         }
-        while (true) { Thread.Sleep(100); }
+        while (true) {
+            Console.WriteLine("fixture heartbeat");
+            Console.Error.WriteLine("fixture stderr heartbeat");
+            Thread.Sleep(100);
+        }
     }
 }

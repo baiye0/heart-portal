@@ -22,6 +22,8 @@ mod macos_supervisor;
 mod windows_upgrade;
 #[cfg(windows)]
 mod windows_start;
+#[cfg(windows)]
+mod connection_status;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -321,6 +323,8 @@ async fn main() -> Result<()> {
     let addr = format!("{}:{}", config.bind_host, config.bind_port);
     let listener = TcpListener::bind(&addr).await?;
     info!("Portal MCP listening on {}", addr);
+    #[cfg(windows)]
+    connection_status::publish("local");
     publish_supervisor_ready()?;
     #[cfg(any(windows, target_os = "macos"))]
     drop(startup_guard);

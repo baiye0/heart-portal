@@ -135,6 +135,37 @@ try {
     } finally { $duplicate.Dispose() }
     Assert (@(Get-Launches).Count -eq 1) 'only one Portal created'
 
+    Wait-Until { Test-PortalReady $testRoot '0.8.0' } 'runtime identity and readiness are published'
+    $original = Read-PortalJson (Join-Path $testRoot '.portal-runtime.json')
+    # Stale/PID-reused records must not authorize adoption or termination.
+    $stale = Read-PortalJson (Join-Path $testRoot '.portal-runtime.json')
+    $stale.started = 1
+    Assert ($null -eq (Get-PortalRecordedProcess $testRoot $stale)) 'creation time mismatch is not a runtime'
+    $unrelated = Get-Process -Id $PID
+    try {
+        $stale.pid = $PID; $stale.started = $unrelated.StartTime.ToUniversalTime().Ticks
+        Assert ($null -eq (Get-PortalRecordedProcess $testRoot $stale)) 'matching PID/time with another executable is not a runtime'
+    } finally { $unrelated.Dispose() }
+    foreach ($attempt in 1..2) {
+        $before = Read-PortalJson (Join-Path $testRoot '.portal-runtime.json')
+        $oldCore = Get-Process -Id $before.supervisor_pid
+        try { $oldCore.Kill(); Assert ($oldCore.WaitForExit(5000)) 'core really exits' }
+        finally { $oldCore.Dispose() }
+        Wait-Until {
+            $current = Read-PortalJson (Join-Path $testRoot '.portal-runtime.json')
+            (Test-SavedSupervisor $current) -and $current.supervisor_pid -ne $before.supervisor_pid
+        } 'new core adopts the live runtime'
+        $current = Read-PortalJson (Join-Path $testRoot '.portal-runtime.json')
+        Assert ($current.pid -eq $original.pid -and $current.started -eq $original.started -and $current.nonce -eq $original.nonce) 'adoption preserves the exact runtime'
+        Assert ((Test-PortalReady $testRoot '0.8.0') -and @(Get-Launches).Count -eq 1) 'adoption keeps readiness and never launches a duplicate'
+        foreach ($file in @('portal-runtime.log','portal-runtime.err.log')) {
+            $log = Join-Path $testRoot $file
+            $length = (Get-Item -LiteralPath $log).Length
+            Wait-Until { (Get-Item -LiteralPath $log).Length -gt $length } 'runtime writes logs after its original parent exits'
+        }
+    }
+    Write-Output 'PASS: repeated core failures adopt the same PID/nonce; stdout/stderr and readiness remain live'
+
     $launches = @(Get-Launches)
     $portalPid = [int]$launches[0].Split('|')[0]
     $portalProcess = Get-Process -Id $portalPid
@@ -175,7 +206,7 @@ try {
         Add-Content -LiteralPath (Join-Path $fixtureSupport 'portal-supervisor.ps1') -Value "# Fixture supervisor version $Version"
         if ($FailSupervisor) { [IO.File]::WriteAllText((Join-Path $fixtureSupport 'portal-supervisor.ps1'), 'exit 0') }
         $code = $fixture.Replace('0.8.0', $Version)
-        if ($FailStartup) { $code = $code.Replace('string root = Environment.CurrentDirectory;', 'return 23; /*').Replace('while (true) { Thread.Sleep(100); }', '*/') }
+        if ($FailStartup) { $code = $code.Replace('string root = Environment.CurrentDirectory;', 'if (args != null) return 23; string root = Environment.CurrentDirectory;') }
         Add-Type -TypeDefinition $code -OutputAssembly $candidate -OutputType ConsoleApplication
         $request = @{
             root = $testRoot; target = (Get-PortalExecutable $testRoot); candidate = $candidate

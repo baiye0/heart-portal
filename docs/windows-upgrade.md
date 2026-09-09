@@ -19,6 +19,44 @@ path, name, connection link, selected environment and working directory;
 normal relaunches, logon recovery and upgrades reuse them. This file can contain
 credentials. Keep it private and keep the generated files with the exe.
 
+Manual Windows launches print configuration/connection guidance immediately and
+stream startup progress while the worker configures supervision. A missing Being
+link is explicitly reported as local MCP mode, with commands for connecting later.
+Configured links are not reported as connected until the runtime reports a successful
+relay handshake; startup messages never echo the connection credential.
+The connection banner is repeated after startup and after the initial log history.
+Its PowerShell commands prompt for the complete Being link using `Read-Host` and
+include the saved absolute config path and Portal name. Run them in another
+PowerShell window, not in the log reader or Command Prompt (`cmd.exe`).
+
+The live console uses a colored banner and window title for missing configuration,
+connecting, connected, and retrying. `.portal-connection-status.json` is published
+by the runtime and matched to its PID and launch nonce; historical log messages
+cannot mark a new process as connected. Connection telemetry is separate from
+local readiness, so a relay outage does not trigger binary upgrade rollback.
+
+In an interactive console, startup hands live log viewing to a separate PowerShell
+process in that console. The launcher EXE exits so it can still be replaced during
+an upgrade. Closing the console or pressing Ctrl+C ends only log viewing; use the
+EXE's `stop` command to stop Portal and supervision. The reader follows runtime
+restarts and hides the saved connection token. Redirected/script launches print
+startup progress and log paths, then return without starting a persistent reader.
+
+If the supervisor core exits while Portal is still running, its replacement
+checks the recorded PID, process creation time and exact executable path under
+the lifecycle lock, then adopts that process. It retains the PID, launch nonce,
+readiness and Being connection, and only updates guardian ownership. Launching
+the EXE again also recovers missing supervision without stopping that runtime;
+changing its launch settings still requires `stop` first. An exited runtime is
+restarted normally. Upgrade and stop retain the same exclusive lifecycle gate.
+
+New supervisor launches give Portal its own stdout/stderr file handles, with
+inheritance limited to standard I/O. Logging therefore survives the original
+guardian's exit. Adoption cannot recreate anonymous log pipes from an already
+running older supervisor; the new file-handle behavior takes effect on the next
+normal Portal launch or upgrade. Adoption requires a valid runtime ownership
+record; it does not guess ownership from an executable name or a stale PID.
+
 `status` reports Portal/guardian state. `stop` stops both supervisor levels and
 Portal and disables the logon task; the next normal launch enables it again.
 Stop before changing launch arguments. If Windows policy denies task creation,
@@ -100,6 +138,8 @@ connection identity, workspaces and kits are not migrated by binary upgrades.
 .\scripts\package-portal-windows.ps1
 .\scripts\tests\windows-lifecycle.tests.ps1
 .\scripts\tests\windows-start-fallback.tests.ps1
+.\scripts\tests\windows-console.tests.ps1
+.\scripts\tests\windows-connection-guidance.tests.ps1
 .\scripts\tests\windows-package.tests.ps1
 .\scripts\tests\windows-package.tests.ps1 -LocalOnly
 .\scripts\tests\windows-upgrade-e2e.ps1
@@ -111,6 +151,15 @@ an isolated profile. They create/remove their own real logon task and check
 concurrent first launches, crash recovery, upgrade, config preservation and
 stop/resume. `-LocalOnly` tests the no-link default listener; the other mode uses
 a unique invalid relay address. Neither connects to a real Being.
+The connection-guidance fixture additionally requires Python for a standard-library
+loopback WebSocket relay. It executes the printed PowerShell commands against the
+real EXE and checks the handshake, custom config/name preservation, and disconnect
+status without using external credentials or connecting to a real Being.
+It kills the guardian core and both guardian levels, verifies the original
+WebSocket still responds to ping with the same Portal PID/nonce, and checks
+continued logging and `stop`. Lifecycle fixtures verify repeated adoption,
+stale process identity rejection, and crash recovery after adoption; package
+upgrade tests start from an adopted runtime.
 
 Lifecycle fixtures also test worker termination, startup failure and supervisor
 failure/rollback. The fallback fixture simulates denied task registration and

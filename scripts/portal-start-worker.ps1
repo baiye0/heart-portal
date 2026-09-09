@@ -11,20 +11,13 @@ $started = $false
 $createdTask = $false
 $taskName = ''
 
-function Test-SavedSupervisor($Runtime) {
-    if (-not $Runtime.supervisor_pid) { return $false }
-    $process = Get-Process -Id $Runtime.supervisor_pid -ErrorAction SilentlyContinue
-    if (-not $process) { return $false }
-    try { return -not $process.HasExited -and $process.StartTime.ToUniversalTime().Ticks -eq $Runtime.supervisor_started }
-    finally { $process.Dispose() }
-}
-
 try {
     if ($request.action -eq 'status') {
         $runtime = Read-PortalJson (Join-Path $root '.portal-runtime.json')
         [pscustomobject]@{ ready = (Test-PortalReady $root); supervised = (Test-SavedSupervisor $runtime); pid = $runtime.pid; root = $root } | ConvertTo-Json -Compress | Write-Output
         exit 0
     }
+    if ($request.action -eq 'start') { Write-Output 'PORTAL_PROGRESS:lock' }
     $startLock = Open-PortalLock $root '.portal-start.lock' 65
     if (-not $startLock) { throw 'Another Portal start/stop is still running.' }
     $owner = Open-PortalLock $root '.portal-upgrade.lock'
@@ -46,20 +39,35 @@ try {
     }
 
     $runtime = Read-PortalJson (Join-Path $root '.portal-runtime.json')
-    if (Test-SavedSupervisor $runtime) {
+    $running = Get-PortalRecordedProcess $root $runtime
+    $hasRuntime = $null -ne $running
+    if ($running) { $running.Dispose() }
+    if ((Test-SavedSupervisor $runtime) -or $hasRuntime) {
         if ($request.explicit) {
             $saved = Read-PortalJson (Join-Path $root '.portal-launch.json')
             if ($saved -and (($saved.arguments | ConvertTo-Json -Compress) -ne ($request.launch.arguments | ConvertTo-Json -Compress) -or
                 $saved.environment.PORTAL_CONNECT_LINK -ne $request.launch.environment.PORTAL_CONNECT_LINK)) {
-                throw 'Portal is already supervised with different settings. Run the exe with stop before changing its launch arguments.'
+                throw 'Portal is already running with different settings. Run the exe with stop before changing its launch arguments.'
             }
+        }
+        Write-Output 'PORTAL_PROGRESS:reuse'
+        if (-not (Test-SavedSupervisor $runtime)) {
+            # Leave the live runtime and its launch settings intact. The new
+            # core takes ownership under this same gate after we release it.
+            Ensure-PortalBootstrap $root $runtime (Join-Path $PSScriptRoot 'support')
         }
         $gate.Dispose(); $gate = $null
         Wait-PortalReady $root ''
+        $timer = [Diagnostics.Stopwatch]::StartNew()
+        while (-not (Test-SavedSupervisor (Read-PortalJson (Join-Path $root '.portal-runtime.json')))) {
+            if ($timer.Elapsed.TotalSeconds -ge 30) { throw 'Portal is running, but supervisor recovery timed out; the existing Portal was left running.' }
+            Start-Sleep -Milliseconds 200
+        }
         Write-Output 'Portal is already running under supervision.'
         exit 0
     }
 
+    Write-Output 'PORTAL_PROGRESS:config'
     $relative = $request.target.Substring($root.TrimEnd('\').Length + 1)
     if ($relative -notin @('heart-portal.exe', 'heart-portal-windows-x86_64.exe', 'heart-portal-windows-aarch64.exe', 'target\release\heart-portal.exe')) { throw 'Invalid Portal executable path.' }
     $savedExe = Get-PortalSavedValue $root '.portal-executable'
@@ -102,6 +110,7 @@ try {
     Assert-PortalTaskOwnership $root $taskName
     $autostart = $true
     $warning = ''
+    Write-Output 'PORTAL_PROGRESS:task'
     try {
         $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
         if (-not $task) {
@@ -127,6 +136,7 @@ try {
     }
     $started = $true
     $gate.Dispose(); $gate = $null
+    Write-Output 'PORTAL_PROGRESS:ready'
     Wait-PortalReady $root $request.version
     $runtime = Read-PortalJson (Join-Path $root '.portal-runtime.json')
     if (-not (Test-SavedSupervisor $runtime)) { throw 'Portal started without a live supervisor.' }
