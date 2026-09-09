@@ -1,11 +1,17 @@
 //! Self-upgrade: check GitHub releases, download, backup, replace, restart.
 
 use std::cmp::Ordering;
-use std::path::{Path, PathBuf};
+#[cfg(not(any(windows, target_os = "macos")))]
+use std::path::Path;
+#[cfg(not(any(windows, target_os = "macos")))]
+use std::path::PathBuf;
+#[cfg(not(any(windows, target_os = "macos")))]
 use std::process::Stdio;
+#[cfg(not(any(windows, target_os = "macos")))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
+#[cfg(not(any(windows, target_os = "macos")))]
 use tracing::info;
 
 pub const PORTAL_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -72,6 +78,7 @@ pub fn compare_versions(a: &str, b: &str) -> Ordering {
     Ordering::Equal
 }
 
+#[cfg(not(any(windows, target_os = "macos")))]
 fn install_dir() -> Result<PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
@@ -88,21 +95,16 @@ fn install_dir() -> Result<PathBuf> {
     bail!("Could not determine install directory (~/.heart-portal)")
 }
 
+#[cfg(not(any(windows, target_os = "macos")))]
 fn dirs_home() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
 }
 
+#[cfg(not(any(windows, target_os = "macos")))]
 fn binary_path(install_dir: &Path) -> PathBuf {
-    #[cfg(windows)]
-    {
-        install_dir.join("heart-portal.exe")
-    }
-    #[cfg(not(windows))]
-    {
-        install_dir.join("heart-portal")
-    }
+    install_dir.join("heart-portal")
 }
 
 fn asset_name(platform: &Platform) -> String {
@@ -114,15 +116,17 @@ fn asset_name(platform: &Platform) -> String {
     format!("heart-portal-{}{}", platform.slug, suffix)
 }
 
-fn latest_download_url(platform: &Platform) -> String {
-    format!(
-        "https://github.com/{}/releases/latest/download/{}",
-        REPO,
-        asset_name(platform)
-    )
+fn release_download_url(platform: &Platform, tag: &str) -> Result<url::Url> {
+    let mut url = url::Url::parse(&format!("https://github.com/{REPO}/releases/download/"))?;
+    url.path_segments_mut()
+        .map_err(|_| anyhow::anyhow!("Invalid release URL"))?
+        .pop_if_empty()
+        .push(tag)
+        .push(&asset_name(platform));
+    Ok(url)
 }
 
-async fn fetch_latest_release_tag(client: &reqwest::Client) -> Result<String> {
+async fn fetch_latest_release(client: &reqwest::Client) -> Result<serde_json::Value> {
     let response = client
         .get(GITHUB_API_LATEST)
         .header(reqwest::header::USER_AGENT, "heart-portal-upgrader")
@@ -138,14 +142,30 @@ async fn fetch_latest_release_tag(client: &reqwest::Client) -> Result<String> {
         .await
         .context("Failed to parse GitHub release metadata")?;
 
-    let tag = body
-        .get("tag_name")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("GitHub release response missing tag_name"))?;
-
-    Ok(tag.trim_start_matches('v').to_string())
+    Ok(body)
 }
 
+fn verify_release_digest(release: &serde_json::Value, platform: &Platform, bytes: &[u8]) -> Result<()> {
+    let digest = release["assets"]
+        .as_array()
+        .and_then(|assets| assets.iter().find(|asset| asset["name"].as_str() == Some(asset_name(platform).as_str())))
+        .and_then(|asset| asset["digest"].as_str());
+    // Windows releases have no Authenticode signature. Require the checksum
+    // supplied independently by GitHub's HTTPS API before staging or executing
+    // downloaded code; the worker's own hash only protects the local handoff.
+    anyhow::ensure!(digest.is_some() || !platform.slug.starts_with("windows-"),
+        "Windows release is missing its GitHub SHA-256 digest; the installed Portal was left unchanged");
+    if let Some(digest) = digest {
+        use sha2::{Digest, Sha256};
+        anyhow::ensure!(
+            digest.eq_ignore_ascii_case(&format!("sha256:{:x}", Sha256::digest(bytes))),
+            "Release asset checksum mismatch; the installed Portal was left unchanged"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn backup_stamp() -> String {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -153,6 +173,7 @@ fn backup_stamp() -> String {
         .unwrap_or_else(|_| "unknown".to_string())
 }
 
+#[cfg(not(any(windows, target_os = "macos")))]
 fn stop_running_portal(install_dir: &Path) {
     #[cfg(unix)]
     {
@@ -172,53 +193,13 @@ fn stop_running_portal(install_dir: &Path) {
             .stderr(Stdio::null())
             .status();
     }
-    #[cfg(windows)]
-    {
-        for script in ["stop.bat", "stop.cmd"] {
-            let stop_script = install_dir.join(script);
-            if stop_script.is_file() {
-                let _ = std::process::Command::new("cmd")
-                    .arg("/C")
-                    .arg(&stop_script)
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
-                return;
-            }
-        }
-
-        let _ = std::process::Command::new("taskkill")
-            .args(["/IM", "heart-portal.exe"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
     #[cfg(not(any(unix, windows)))]
     {
         let _ = install_dir;
     }
 }
 
-#[cfg(target_os = "macos")]
-pub fn unlock_gatekeeper(path: &Path) {
-    // Remove ALL extended attributes — including com.apple.provenance
-    // which macOS adds to files transferred via scp/AirDrop/download.
-    // Without this, macOS sends SIGKILL (-9) on exec.
-    let _ = std::process::Command::new("xattr")
-        .args(["-cr", &path.to_string_lossy()])
-        .status();
-
-    // Ad-hoc re-sign: the linker signature from the build machine may be
-    // invalidated by transfer.  A fresh ad-hoc signature lets Gatekeeper
-    // and the hardened-runtime check pass without a Developer ID.
-    let _ = std::process::Command::new("codesign")
-        .args(["-s", "-", "--force", "--deep", &path.to_string_lossy()])
-        .status();
-}
-
-#[cfg(not(target_os = "macos"))]
-pub fn unlock_gatekeeper(_path: &Path) {}
-
+#[cfg(not(any(windows, target_os = "macos")))]
 fn restart_portal(install_dir: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -239,36 +220,6 @@ fn restart_portal(install_dir: &Path) -> Result<()> {
         eprintln!("Portal restarted.");
         Ok(())
     }
-    #[cfg(windows)]
-    {
-        let mut start_target = None;
-        for script in ["start.bat", "start.cmd"] {
-            let start_script = install_dir.join(script);
-            if start_script.is_file() {
-                start_target = Some(start_script);
-                break;
-            }
-        }
-        let start_target = start_target.unwrap_or_else(|| binary_path(install_dir));
-        if !start_target.is_file() {
-            info!("No Windows start script or binary found — start Portal manually when ready");
-            return Ok(());
-        }
-
-        eprintln!("Restarting Portal...");
-        std::process::Command::new("cmd")
-            .arg("/C")
-            .arg("start")
-            .arg("")
-            .arg(&start_target)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("Failed to restart Portal via cmd /C start")?;
-        eprintln!("Portal restarted.");
-        Ok(())
-    }
     #[cfg(not(any(unix, windows)))]
     {
         let _ = install_dir;
@@ -280,19 +231,24 @@ fn restart_portal(install_dir: &Path) -> Result<()> {
 pub async fn run_upgrade() -> Result<()> {
     eprintln!("Checking for updates...");
     let platform = detect_platform()?;
-    let install_dir = install_dir()?;
-    std::fs::create_dir_all(&install_dir)
-        .with_context(|| format!("Creating install dir {}", install_dir.display()))?;
-
-    let target = binary_path(&install_dir);
+    #[cfg(windows)]
+    crate::windows_upgrade::installation_root(&std::env::current_exe()?)?;
+    #[cfg(target_os = "macos")]
+    crate::macos_upgrade::installation_root(&std::env::current_exe()?)?;
     let current_version = PORTAL_VERSION.to_string();
 
     let client = reqwest::Client::builder()
         .user_agent("heart-portal-upgrader")
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(300))
         .build()
         .context("Failed to create HTTP client")?;
 
-    let latest_version = fetch_latest_release_tag(&client).await?;
+    let release = fetch_latest_release(&client).await?;
+    let tag = release["tag_name"]
+        .as_str()
+        .context("GitHub release response missing tag_name")?;
+    let latest_version = tag.trim_start_matches('v');
     eprintln!("  Current: {}", current_version);
     eprintln!("  Latest:  {}", latest_version);
 
@@ -309,9 +265,9 @@ pub async fn run_upgrade() -> Result<()> {
     }
 
     eprintln!("Downloading {}...", asset_name(&platform));
-    let download_url = latest_download_url(&platform);
+    let download_url = release_download_url(&platform, tag)?;
     let bytes = client
-        .get(&download_url)
+        .get(download_url.clone())
         .send()
         .await
         .context("Download failed — check your internet connection")?
@@ -321,58 +277,98 @@ pub async fn run_upgrade() -> Result<()> {
         .await
         .context("Failed to read downloaded binary")?;
 
-    let temp_path = install_dir.join(format!("heart-portal.new.{}", backup_stamp()));
-    tokio::fs::write(&temp_path, &bytes)
-        .await
-        .with_context(|| format!("Writing {}", temp_path.display()))?;
+    verify_release_digest(&release, &platform, &bytes)?;
 
-    #[cfg(unix)]
+    #[cfg(windows)]
+    return crate::windows_upgrade::handoff(&bytes, latest_version).await;
+    #[cfg(target_os = "macos")]
+    return crate::macos_upgrade::handoff(&bytes, Some(latest_version)).await;
+
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = tokio::fs::metadata(&temp_path)
+        let install_dir = install_dir()?;
+        std::fs::create_dir_all(&install_dir)
+            .with_context(|| format!("Creating install dir {}", install_dir.display()))?;
+        let target = binary_path(&install_dir);
+
+        let temp_path = install_dir.join(format!("heart-portal.new.{}", backup_stamp()));
+        tokio::fs::write(&temp_path, &bytes)
             .await
-            .context("Reading permissions on downloaded binary")?
-            .permissions();
-        perms.set_mode(0o755);
-        tokio::fs::set_permissions(&temp_path, perms)
-            .await
-            .context("Setting executable permissions on downloaded binary")?;
-    }
+            .with_context(|| format!("Writing {}", temp_path.display()))?;
 
-    eprintln!("Replacing binary...");
-    stop_running_portal(&install_dir);
-
-    if target.is_file() {
-        let backup_path = install_dir.join(format!("heart-portal.bak.{}", backup_stamp()));
-        std::fs::copy(&target, &backup_path).with_context(|| {
-            format!(
-                "Backing up {} to {}",
-                target.display(),
-                backup_path.display()
-            )
-        })?;
-        eprintln!("  Backup: {}", backup_path.display());
-    }
-
-    std::fs::rename(&temp_path, &target).or_else(|rename_err| {
-        std::fs::copy(&temp_path, &target)
-            .with_context(|| format!("Copying upgrade into {}", target.display()))?;
-        std::fs::remove_file(&temp_path).ok();
-        if rename_err.kind() == std::io::ErrorKind::CrossesDevices {
-            Ok(())
-        } else {
-            Err(rename_err).with_context(|| format!("Replacing {}", target.display()))
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = tokio::fs::metadata(&temp_path)
+                .await
+                .context("Reading permissions on downloaded binary")?
+                .permissions();
+            perms.set_mode(0o755);
+            tokio::fs::set_permissions(&temp_path, perms)
+                .await
+                .context("Setting executable permissions on downloaded binary")?;
         }
-    })?;
 
-    unlock_gatekeeper(&target);
-    eprintln!("Done — upgraded to {}", latest_version);
-    restart_portal(&install_dir)
+        eprintln!("Replacing binary...");
+        stop_running_portal(&install_dir);
+
+        if target.is_file() {
+            let backup_path = install_dir.join(format!("heart-portal.bak.{}", backup_stamp()));
+            std::fs::copy(&target, &backup_path).with_context(|| {
+                format!(
+                    "Backing up {} to {}",
+                    target.display(),
+                    backup_path.display()
+                )
+            })?;
+            eprintln!("  Backup: {}", backup_path.display());
+        }
+
+        std::fs::rename(&temp_path, &target).or_else(|rename_err| {
+            std::fs::copy(&temp_path, &target)
+                .with_context(|| format!("Copying upgrade into {}", target.display()))?;
+            std::fs::remove_file(&temp_path).ok();
+            if rename_err.kind() == std::io::ErrorKind::CrossesDevices {
+                Ok(())
+            } else {
+                Err(rename_err).with_context(|| format!("Replacing {}", target.display()))
+            }
+        })?;
+
+        eprintln!("Done — upgraded to {}", latest_version);
+        restart_portal(&install_dir)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_release_requires_matching_asset_digest() {
+        use serde_json::json;
+        use sha2::{Digest, Sha256};
+        let platform = Platform { slug: "windows-x86_64".into() };
+        let name = asset_name(&platform);
+        let bytes = b"release executable";
+        let digest = format!("sha256:{:x}", Sha256::digest(bytes));
+        let valid = json!({"assets": [{"name": name, "digest": digest}]});
+        verify_release_digest(&valid, &platform, bytes).unwrap();
+        assert!(verify_release_digest(&valid, &platform, b"tampered executable").is_err());
+        for invalid in [
+            json!({}), json!({"assets": []}),
+            json!({"assets": [{"name": name}]}),
+            json!({"assets": [{"name": name, "digest": null}]}),
+            json!({"assets": [{"name": name, "digest": ""}]}),
+            json!({"assets": [{"name": name, "digest": "md5:1234"}]}),
+            json!({"assets": [{"name": "another-platform", "digest": digest}]}),
+        ] {
+            assert!(verify_release_digest(&invalid, &platform, bytes).is_err(), "{invalid}");
+        }
+        // Preserve older macOS metadata compatibility; its worker independently
+        // enforces the Developer ID requirement before replacement.
+        verify_release_digest(&json!({}), &Platform { slug: "macos-arm64".into() }, bytes).unwrap();
+    }
 
     #[test]
     fn compare_versions_orders_semver() {
@@ -396,8 +392,14 @@ mod tests {
 
     #[test]
     fn platform_slug_supports_windows() {
-        assert_eq!(platform_slug("windows", "x86_64").unwrap(), "windows-x86_64");
-        assert_eq!(platform_slug("windows", "aarch64").unwrap(), "windows-aarch64");
+        assert_eq!(
+            platform_slug("windows", "x86_64").unwrap(),
+            "windows-x86_64"
+        );
+        assert_eq!(
+            platform_slug("windows", "aarch64").unwrap(),
+            "windows-aarch64"
+        );
         assert!(platform_slug("windows", "i686").is_err());
     }
 
@@ -407,6 +409,7 @@ mod tests {
             slug: "windows-x86_64".to_string(),
         };
         assert_eq!(asset_name(&platform), "heart-portal-windows-x86_64.exe");
-        assert!(latest_download_url(&platform).ends_with("heart-portal-windows-x86_64.exe"));
+        assert_eq!(release_download_url(&platform, "v0.8.1").unwrap().as_str(),
+            "https://github.com/d5z/heart-portal/releases/download/v0.8.1/heart-portal-windows-x86_64.exe");
     }
 }

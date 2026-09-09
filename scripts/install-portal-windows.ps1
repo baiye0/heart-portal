@@ -28,7 +28,7 @@ if ($PortalName -notmatch '^[A-Za-z0-9][A-Za-z0-9_-]*$') {
     throw 'PortalName must contain only letters, numbers, hyphens, or underscores.'
 }
 
-$exe = Join-Path $Root 'target\release\heart-portal.exe'
+$exe = Get-PortalExecutable $Root
 $config = Join-Path $Root 'portal.toml'
 $exampleConfig = Join-Path $Root 'portal.example.toml'
 

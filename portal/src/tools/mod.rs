@@ -6,9 +6,14 @@ mod file;
 mod oauth;
 mod process;
 mod screenshot;
+#[cfg(target_os = "macos")]
+mod permissions;
 mod search;
 mod web;
 mod web_search;
+pub(crate) mod text;
+#[cfg(test)]
+mod utf8_tests;
 pub mod custom;
 
 use crate::config::PortalConfig;
@@ -69,7 +74,12 @@ impl ToolHost {
             restart_notify: Arc::new(tokio::sync::Notify::new()),
             restart_supported: std::env::var("HEART_PORTAL_SUPERVISED")
                 .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-                .unwrap_or(false),
+                .unwrap_or(false) || {
+                    #[cfg(target_os = "macos")]
+                    { crate::macos_supervisor::attached() }
+                    #[cfg(not(target_os = "macos"))]
+                    { false }
+                },
         }
     }
 
@@ -186,6 +196,11 @@ impl ToolHost {
                         "background": {
                             "type": "boolean",
                             "description": "If true, spawn in background and return session_id + pid (default: false)"
+                        },
+                        "output_encoding": {
+                            "type": "string",
+                            "enum": text::OutputEncoding::supported_values(),
+                            "description": "Source output decoding (default: auto). PowerShell and non-Windows default to UTF-8. Windows cmd auto tries UTF-8 then system OEM per line; non-ASCII lines may wait for newline/EOF (buffer capped at 64KiB). Use utf8 or oem for known encodings and immediate streaming; oem requires Windows. A mixed-encoding line is ambiguous. Responses are always UTF-8 text, including poll/log and callbacks."
                         }
                     },
                     "required": ["command"]
@@ -205,8 +220,8 @@ impl ToolHost {
                         },
                         "session_id": { "type": "string", "description": "Session id (required for poll, log, write, kill)" },
                         "timeout_ms": { "type": "integer", "description": "poll: wait up to this many ms for new output (default 5000, max 300000)" },
-                        "offset": { "type": "integer", "description": "Byte offset into captured output (poll/log)" },
-                        "limit": { "type": "integer", "description": "Max bytes for log" },
+                        "offset": { "type": "integer", "minimum": 0, "description": "UTF-8 byte offset into normalized output (poll/log, default 0); use the returned next_offset. total_output_bytes uses the same units, not source-encoding bytes." },
+                        "limit": { "type": "integer", "minimum": 1, "description": "Max UTF-8 bytes for log (default 65536). Must fit the next complete character; at least 4 avoids character-size errors." },
                         "data": { "type": "string", "description": "Data to write to stdin (write action, max 256KiB)" }
                     },
                     "required": ["action"]
@@ -227,7 +242,7 @@ impl ToolHost {
                         },
                         "max_chars": {
                             "type": "integer",
-                            "description": "Maximum characters to return (default: 50000)"
+                            "description": "Maximum response body bytes (default: 50000); preserves complete UTF-8 characters"
                         }
                     },
                     "required": ["url"]
@@ -418,6 +433,13 @@ impl ToolHost {
             }),
         });
 
+        #[cfg(target_os = "macos")]
+        tools.push(ToolInfo {
+            name: "portal_permissions".to_string(),
+            description: "Check this running Portal process's macOS screen recording, accessibility and input monitoring permissions without prompting or changing grants. Use before and after an upgrade; kit permissions are separate.".to_string(),
+            input_schema: serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false}),
+        });
+
         // Always include tools_reload
         tools.push(ToolInfo {
             name: "portal_tools_reload".to_string(),
@@ -500,6 +522,8 @@ impl ToolHost {
             "portal_oauth_authorize" => oauth::authorize(arguments).await,
             "portal_tools_reload" => self.handle_tools_reload().await,
             "portal_restart" => self.handle_restart().await,
+            #[cfg(target_os = "macos")]
+            "portal_permissions" => Ok(permissions::status()),
             "portal_kit_usage" => {
                 let counts = self.kits.drain_usage_counts().await;
                 let text = serde_json::to_string(&counts)?;

@@ -21,5 +21,7 @@ export RUST_LOG="${RUST_LOG:-info}"
 for log in portal-runtime.log portal-runtime.err.log; do
     if [ -f "$log" ]; then mv -f "$log" "$log.previous"; fi
 done
-exec "$root/target/release/heart-portal" --config "$root/portal.toml" --name "$portal_name" \
+portal_executable="$root/target/release/heart-portal"
+if [ -f .portal-executable ]; then portal_executable=$(cat .portal-executable); fi
+exec "$portal_executable" --config "$root/portal.toml" --name "$portal_name" \
     >portal-runtime.log 2>portal-runtime.err.log

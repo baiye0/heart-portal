@@ -21,6 +21,7 @@ fn session_row(s: SessionInfo) -> Value {
         "uptime_s": s.uptime_s,
         "idle_s": s.idle_s,
         "total_output_bytes": s.total_output_bytes,
+        "output_encoding": s.output_encoding.as_str(),
     })
 }
 
@@ -66,6 +67,7 @@ pub async fn handle(process_manager: &Arc<ProcessManager>, arguments: Value) -> 
                         "status": status_json(&r.status),
                         "idle_s": r.idle_s,
                         "total_output_bytes": r.total_output_bytes,
+                        "output_encoding": r.output_encoding.as_str(),
                     }))?
                 }],
                 "isError": false
@@ -90,6 +92,7 @@ pub async fn handle(process_manager: &Arc<ProcessManager>, arguments: Value) -> 
                         "status": status_json(&r.status),
                         "idle_s": r.idle_s,
                         "total_output_bytes": r.total_output_bytes,
+                        "output_encoding": r.output_encoding.as_str(),
                     }))?
                 }],
                 "isError": false

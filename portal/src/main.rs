@@ -14,6 +14,18 @@ mod protocol;
 mod relay_client;
 mod single_instance;
 mod upgrade;
+#[cfg(target_os = "macos")]
+mod macos_upgrade;
+#[cfg(target_os = "macos")]
+mod macos_supervisor;
+#[cfg(windows)]
+mod windows_upgrade;
+#[cfg(windows)]
+mod windows_private;
+#[cfg(windows)]
+mod windows_start;
+#[cfg(windows)]
+mod connection_status;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -34,6 +46,12 @@ use crate::tools::ToolHost;
     about = "Heart Portal — Being's gateway to the world"
 )]
 struct Cli {
+    /// Export version-matched Windows supervision code for the update worker
+    #[arg(long, hide = true)]
+    export_windows_runtime: Option<PathBuf>,
+    /// Legacy spelling for the upgrade subcommand
+    #[arg(long = "upgrade", hide = true)]
+    legacy_upgrade: bool,
     #[command(subcommand)]
     command: Option<Commands>,
 
@@ -56,8 +74,22 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Stop this Windows/macOS Portal and its supervision
+    Stop,
+    /// Show the running Windows/macOS Portal and supervisor status
+    Status,
     /// Check GitHub releases and upgrade to the latest version
-    Upgrade,
+    Upgrade {
+        /// Apply a pre-downloaded newer Windows/macOS binary through the same updater
+        #[arg(long, conflicts_with = "status")]
+        file: Option<PathBuf>,
+        /// Show the last Windows/macOS upgrade transaction without downloading
+        #[arg(long)]
+        status: bool,
+        /// Migrate an existing macOS installation using this downloaded new executable
+        #[arg(long, conflicts_with_all = ["file", "status"])]
+        target: Option<PathBuf>,
+    },
     /// Manage installed Portal kits
     Kit {
         #[command(subcommand)]
@@ -76,10 +108,57 @@ enum KitCommands {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Some(path) = &cli.export_windows_runtime {
+        #[cfg(windows)]
+        return windows_upgrade::export_runtime(path);
+        #[cfg(not(windows))]
+        anyhow::bail!("Windows runtime export is available only on Windows");
+    }
     let command = cli.command;
 
-    if matches!(&command, Some(Commands::Upgrade)) {
+    if matches!(&command, Some(Commands::Upgrade { status: true, .. })) {
+        #[cfg(windows)]
+        return windows_upgrade::show_status();
+        #[cfg(target_os = "macos")]
+        return macos_upgrade::show_status();
+        #[cfg(not(any(windows, target_os = "macos")))]
+        anyhow::bail!("Upgrade status is supported on Windows and macOS");
+    }
+    if let Some(Commands::Upgrade { file: Some(path), .. }) = &command {
+        #[cfg(windows)]
+        return windows_upgrade::upgrade_file(path).await;
+        #[cfg(target_os = "macos")]
+        return macos_upgrade::handoff(&tokio::fs::read(path).await?, None).await;
+        #[cfg(not(any(windows, target_os = "macos")))]
+        anyhow::bail!("Local executable upgrades are supported on Windows and macOS");
+    }
+    if let Some(Commands::Upgrade { target: Some(path), .. }) = &command {
+        #[cfg(target_os = "macos")]
+        return macos_upgrade::migrate(path).await;
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = path;
+            anyhow::bail!("Installation migration is supported on macOS");
+        }
+    }
+    if cli.legacy_upgrade || matches!(&command, Some(Commands::Upgrade { .. })) {
         return upgrade::run_upgrade().await;
+    }
+    if matches!(&command, Some(Commands::Stop | Commands::Status)) {
+        #[cfg(windows)]
+        return windows_start::run(if matches!(&command, Some(Commands::Stop)) { "stop" } else { "status" }, None, None, None).await;
+        #[cfg(target_os = "macos")]
+        return macos_supervisor::action(if matches!(&command, Some(Commands::Stop)) { "stop" } else { "status" }).await;
+        #[cfg(not(any(windows, target_os = "macos")))]
+        anyhow::bail!("Use your OS service manager for start/stop/status on this platform");
+    }
+    #[cfg(windows)]
+    if command.is_none() && std::env::var("HEART_PORTAL_SUPERVISED").as_deref() != Ok("1") {
+        return windows_start::run("start", cli.config.as_deref().or(cli.config_positional.as_deref()), cli.connect.as_deref(), cli.name.as_deref()).await;
+    }
+    #[cfg(target_os = "macos")]
+    if command.is_none() {
+        macos_upgrade::recover_interrupted()?;
     }
 
     tracing_subscriber::fmt()
@@ -133,6 +212,12 @@ async fn main() -> Result<()> {
     // Key the instance guard by relay host + Being rather than by the whole
     // Loom URL. Rotating a token must not allow a second local instance to
     // bypass the duplicate-process guard.
+    #[cfg(windows)]
+    if windows_upgrade::recover_interrupted()? { return Ok(()); }
+    #[cfg(windows)]
+    let startup_guard = windows_upgrade::startup_guard()?;
+    #[cfg(target_os = "macos")]
+    let startup_guard = macos_upgrade::startup_guard()?;
     let instance_identity = match connect_link.as_deref() {
         Some(link) => {
             let (host, being_id, _) = relay_client::parse_loom_link(link)?;
@@ -145,6 +230,9 @@ async fn main() -> Result<()> {
 
     config.prepare_workspace()?;
     info!("Workspace ready: {}", config.security.workspace_root.display());
+
+    #[cfg(target_os = "macos")]
+    macos_supervisor::start(&config_path, connect_link.as_deref(), cli_portal_name.as_deref()).await?;
 
     if config.portal_mcp_token.is_none() {
         warn!("PORTAL_MCP_TOKEN is not set — MCP TCP connections are unauthenticated (set token for public deployments)");
@@ -183,12 +271,15 @@ async fn main() -> Result<()> {
         Err(e) => warn!("Failed to load custom tools: {}", e),
     }
 
-    // Pre-spawn eager kits (manifest.eager == true) so the first call has
-    // no cold-start latency. Failures are logged, not fatal.
-    tool_host.warmup_kits().await;
-
     let tool_list = tool_host.list_tools().await;
     info!("Portal tools: {}", tool_list.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", "));
+
+    // Eager kits are optional. Start warming them after initial tool discovery
+    // without holding up listener/relay readiness or the upgrade deadline.
+    // Cancel warmup before shutdown so it cannot spawn kits after cleanup.
+    let mut warmup = tokio::task::JoinSet::new();
+    let warmup_host = tool_host.clone();
+    warmup.spawn(async move { warmup_host.warmup_kits().await; });
 
     if let Some(ref loom) = connect_link {
         // Relay handshake identity: --name, non-generic config name, then host name.
@@ -207,6 +298,9 @@ async fn main() -> Result<()> {
             Err(e) => warn!("async callback disabled (invalid Loom link): {e:#}"),
         }
 
+        publish_supervisor_ready()?;
+        #[cfg(any(windows, target_os = "macos"))]
+        drop(startup_guard);
         let tool_shutdown = tool_host.clone();
         let restart_waiter = tool_host.clone();
         tokio::select! {
@@ -214,14 +308,19 @@ async fn main() -> Result<()> {
                 let _ = tokio::signal::ctrl_c().await;
             } => {
                 info!("Portal shutting down (Ctrl+C)");
+                #[cfg(target_os = "macos")]
+                macos_supervisor::stop_on_interrupt();
+                warmup.shutdown().await;
                 tool_shutdown.kill_all_managed_processes().await;
             }
             _ = wait_sigterm() => {
                 info!("Portal shutting down (termination signal)");
+                warmup.shutdown().await;
                 tool_shutdown.kill_all_managed_processes().await;
             }
             _ = restart_waiter.wait_for_restart() => {
                 info!("Portal restarting after a controlled tool request");
+                warmup.shutdown().await;
                 tool_shutdown.kill_all_managed_processes().await;
             }
             _ = relay_client::connect_and_serve(loom, &tool_host, &relay_portal_name) => {}
@@ -236,6 +335,11 @@ async fn main() -> Result<()> {
     let addr = format!("{}:{}", config.bind_host, config.bind_port);
     let listener = TcpListener::bind(&addr).await?;
     info!("Portal MCP listening on {}", addr);
+    #[cfg(windows)]
+    connection_status::publish("local");
+    publish_supervisor_ready()?;
+    #[cfg(any(windows, target_os = "macos"))]
+    drop(startup_guard);
 
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
     let mut shutdown_rx = shutdown_tx.subscribe();
@@ -247,6 +351,8 @@ async fn main() -> Result<()> {
             tokio::select! {
                 r = tokio::signal::ctrl_c() => {
                     let _ = r;
+                    #[cfg(target_os = "macos")]
+                    macos_supervisor::stop_on_interrupt();
                 }
                 _ = wait_sigterm() => {}
                 _ = restart_waiter.wait_for_restart() => {
@@ -267,6 +373,7 @@ async fn main() -> Result<()> {
                     Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 }
+                warmup.shutdown().await;
                 shutdown_cleanup.kill_all_managed_processes().await;
                 break;
             }
@@ -294,6 +401,17 @@ async fn main() -> Result<()> {
     }
 
     drop(listener);
+    Ok(())
+}
+
+/// Local readiness is independent of relay availability: a network outage must
+/// not turn a working binary into a failed upgrade. The supervisor checks the
+/// PID, a fresh per-launch nonce, and the process creation time as well.
+fn publish_supervisor_ready() -> Result<()> {
+    #[cfg(windows)]
+    windows_upgrade::publish_ready()?;
+    #[cfg(target_os = "macos")]
+    macos_upgrade::publish_ready()?;
     Ok(())
 }
 

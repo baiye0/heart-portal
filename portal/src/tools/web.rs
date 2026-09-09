@@ -8,12 +8,18 @@ use tracing::debug;
 /// Returns true if `url` may be fetched (http/https only; blocks common SSRF targets).
 pub fn is_safe_url(url: &str) -> bool {
     let url = url.trim();
-    if url.len() >= 5 && url[..5].eq_ignore_ascii_case("file:") {
+    if url.get(..5).is_some_and(|prefix| prefix.eq_ignore_ascii_case("file:")) {
         return false;
     }
-    let rest = if url.len() >= 8 && url[..8].eq_ignore_ascii_case("https://") {
+    let rest = if url
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+    {
         &url[8..]
-    } else if url.len() >= 7 && url[..7].eq_ignore_ascii_case("http://") {
+    } else if url
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+    {
         &url[7..]
     } else {
         return false;
@@ -92,11 +98,12 @@ pub async fn fetch(arguments: Value) -> Result<Value> {
         anyhow::bail!("URL is not allowed (blocked for SSRF protection)");
     }
 
-    let max_chars = arguments.get("max_chars")
+    // Keep the existing parameter name and byte budget for compatibility.
+    let max_bytes = arguments.get("max_chars")
         .and_then(super::value_as_u64)
         .unwrap_or(50_000) as usize;
 
-    debug!("web_fetch: {} (max_chars: {})", url, max_chars);
+    debug!("web_fetch: {} (max_bytes: {})", url, max_bytes);
 
     // Use a simple HTTP client via command (keeps binary small, no reqwest dep)
     // For v0.2+, consider adding reqwest as optional dependency
@@ -118,8 +125,9 @@ pub async fn fetch(arguments: Value) -> Result<Value> {
     }
 
     let body = String::from_utf8_lossy(&output.stdout);
-    let truncated = if body.len() > max_chars {
-        format!("{}...\n(truncated at {} chars)", &body[..max_chars], max_chars)
+    let truncated = if body.len() > max_bytes {
+        let prefix = super::text::byte_prefix(&body, max_bytes);
+        format!("{}...\n(truncated at {} bytes)", prefix, prefix.len())
     } else {
         body.to_string()
     };
@@ -132,6 +140,13 @@ pub async fn fetch(arguments: Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_multibyte_scheme_without_panicking() {
+        for url in ["中文🙂", "https中://example.com", "http中://example.com"] {
+            assert!(!is_safe_url(url));
+        }
+    }
 
     #[test]
     fn allows_public_https() {

@@ -5,6 +5,7 @@ use crate::exec_policy::{
     configure_shell_command, validate_exec_allowlist, validate_shell_command, ExecShell,
 };
 use crate::process_manager::ProcessManager;
+use crate::tools::text::OutputEncoding;
 use anyhow::Result;
 use serde_json::Value;
 use std::sync::Arc;
@@ -22,6 +23,7 @@ pub async fn execute(
         .ok_or_else(|| anyhow::anyhow!("Missing 'command' argument"))?;
     let shell = ExecShell::parse(arguments.get("shell"))?;
     validate_shell_command(shell, command)?;
+    let output_encoding = OutputEncoding::parse(arguments.get("output_encoding"))?.for_shell(shell);
 
     let workdir = arguments
         .get("workdir")
@@ -49,18 +51,17 @@ pub async fn execute(
     validate_exec_allowlist(command, &config.security.exec_allowlist)?;
 
     if background {
-        let info = if shell == ExecShell::Default {
-            process_manager.spawn(config, command, &workdir, &[]).await?
-        } else {
-            process_manager.spawn_with_shell(config, command, &workdir, &[], shell).await?
-        };
+        let info = process_manager
+            .spawn_with_shell(config, command, &workdir, &[], shell, output_encoding)
+            .await?;
         return Ok(serde_json::json!({
             "content": [{
                 "type": "text",
                 "text": serde_json::to_string(&serde_json::json!({
                     "session_id": info.session_id,
                     "pid": info.pid,
-                    "status": "running"
+                    "status": "running",
+                    "output_encoding": info.output_encoding.as_str()
                 }))?
             }],
             "isError": false
@@ -83,8 +84,8 @@ pub async fn execute(
     .map_err(|_| anyhow::anyhow!("Command timed out after {}s", timeout_secs))?
     .map_err(|e| anyhow::anyhow!("Failed to execute: {}", e))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = output_encoding.decode(&output.stdout);
+    let stderr = output_encoding.decode(&output.stderr);
     let exit_code = output.status.code().unwrap_or_else(|| {
         debug!("Process terminated by signal, no exit code available");
         -1
@@ -104,13 +105,14 @@ pub async fn execute(
     }
 
     // Truncate large outputs to avoid flooding the being's context
-    const MAX_OUTPUT_CHARS: usize = 100_000;
-    let truncated = text.len() > MAX_OUTPUT_CHARS;
+    const MAX_OUTPUT_BYTES: usize = 100_000;
+    let truncated = text.len() > MAX_OUTPUT_BYTES;
     if truncated {
-        text.truncate(MAX_OUTPUT_CHARS);
+        let end = super::text::byte_prefix(&text, MAX_OUTPUT_BYTES).len();
+        text.truncate(end);
         text.push_str(&format!(
-            "\n...\n(output truncated at {} chars)",
-            MAX_OUTPUT_CHARS
+            "\n...\n(output truncated at {} bytes)",
+            end
         ));
     }
 

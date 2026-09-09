@@ -19,6 +19,7 @@ import unittest
 from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parents[2]
+BINARY = Path(os.environ.get('PORTAL_TEST_BINARY', str(REPO / 'target/release/heart-portal'))).resolve()
 sys.dont_write_bytecode = True
 spec = importlib.util.spec_from_file_location('portal_macos', REPO / 'scripts/portal-macos.py')
 manager = importlib.util.module_from_spec(spec)
@@ -41,7 +42,7 @@ class LifecycleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='portal signature test ') as temporary:
             root = Path(temporary)
             binary = root / 'heart-portal'
-            shutil.copy2(REPO / 'target/release/heart-portal', binary)
+            shutil.copy2(BINARY, binary)
             config = root / 'portal.toml'
             config.write_text('kits_enabled = false\n')
             subprocess.run(['/usr/bin/xattr', '-w', 'com.beings.portal-test', 'preserve', str(binary)],
@@ -59,7 +60,7 @@ class LifecycleTests(unittest.TestCase):
     def test_missing_explicit_config_does_not_start_with_defaults(self):
         with tempfile.TemporaryDirectory(prefix='portal missing config ') as temporary:
             root = Path(temporary)
-            result = subprocess.run([str(REPO / 'target/release/heart-portal'),
+            result = subprocess.run([str(BINARY),
                                      '--config', str(root / 'missing.toml')],
                                     cwd=root, capture_output=True, text=True, timeout=10)
             self.assertNotEqual(result.returncode, 0)
@@ -67,7 +68,7 @@ class LifecycleTests(unittest.TestCase):
             self.assertFalse(list(root.iterdir()))
 
     def test_real_portal_relay_restart(self):
-        binary = REPO / 'target/release/heart-portal'
+        binary = BINARY
         self.assertTrue(binary.exists(), 'Run cargo build --release --locked first')
         with tempfile.TemporaryDirectory(prefix='portal relay test ') as temporary, socket.socket() as relay:
             root = Path(temporary).resolve()
