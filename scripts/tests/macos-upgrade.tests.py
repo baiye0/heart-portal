@@ -370,6 +370,21 @@ spec.loader.exec_module(worker)
         self.assertFalse(manager.checkout_pids(self.root))
         self.assertFalse((self.root / '.portal-upgrade.json').exists())
 
+    def test_restored_bytes_commit_even_when_previous_runtime_cannot_restart(self):
+        stage = self.root / '.portal-upgrades' / 'old-startup-failure'
+        stage.mkdir(parents=True)
+        previous = self.target.read_bytes()
+        shutil.copy2(self.target, stage / 'previous')
+        upgrade.write_json(stage / 'request.json', {'root': str(self.root), 'version': '0.8.1'})
+        upgrade.write_json(self.root / '.portal-upgrade.json', {'stage': str(stage), 'restart_mode': 'launchagent'})
+        with patch.object(upgrade, 'restart', side_effect=RuntimeError('previous runtime cannot start')):
+            upgrade.run(stage)
+        self.assertEqual(self.target.read_bytes(), previous)
+        self.assertEqual(read(stage / 'result.json')['state'], 'rolled_back')
+        self.assertTrue(read(stage / 'result.json')['restart_required'])
+        self.assertFalse((self.root / '.portal-upgrade.json').exists())
+        self.assertFalse(manager.checkout_pids(self.root))
+
 
 @unittest.skipUnless(sys.platform == 'darwin' and os.environ.get('MACOS_TEST_SIGN_IDENTITY'),
                      'optional local Developer ID signature test')

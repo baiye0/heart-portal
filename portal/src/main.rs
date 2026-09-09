@@ -154,6 +154,10 @@ async fn main() -> Result<()> {
     if command.is_none() && std::env::var("HEART_PORTAL_SUPERVISED").as_deref() != Ok("1") {
         return windows_start::run("start", cli.config.as_deref().or(cli.config_positional.as_deref()), cli.connect.as_deref(), cli.name.as_deref()).await;
     }
+    #[cfg(target_os = "macos")]
+    if command.is_none() {
+        macos_upgrade::recover_interrupted()?;
+    }
 
     tracing_subscriber::fmt()
         .with_env_filter(

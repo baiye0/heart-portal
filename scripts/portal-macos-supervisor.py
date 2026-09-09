@@ -88,7 +88,7 @@ def watch(request):
                 alive = manager.identity_alive(runtime)
                 if read(root / '.portal-ready.json').get('pid') == runtime['pid']:
                     armed = True
-                if not alive and not armed:
+                if not alive and not armed and not (root / '.portal-upgrade.json').exists():
                     # A foreground config/bind/startup failure must remain a
                     # visible failure, not turn into a background retry loop.
                     break
@@ -123,9 +123,20 @@ def watch(request):
                         (root / '.portal-ready.json').unlink(missing_ok=True)
                         env = dict(os.environ, HEART_PORTAL_SUPERVISED='1', HEART_PORTAL_MACOS_SUPERVISOR=request['token'])
                         env.pop('HEART_PORTAL_UPGRADE_START', None)
-                        with open(root / 'portal-runtime.log', 'ab') as out, open(root / 'portal-runtime.err.log', 'ab') as err:
-                            child = subprocess.Popen([str(target), *request['arguments']], cwd=request['cwd'], env=env,
-                                                     stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True)
+                        try:
+                            with open(root / 'portal-runtime.log', 'ab') as out, open(root / 'portal-runtime.err.log', 'ab') as err:
+                                child = subprocess.Popen([str(target), *request['arguments']], cwd=request['cwd'], env=env,
+                                                         stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True)
+                        except OSError as error:
+                            # Keep the original permission owner alive for the
+                            # worker's rollback request, even if exec itself fails.
+                            print(f'Portal launch failed: {error}', file=sys.stderr, flush=True)
+                            if gate:
+                                gate.close()
+                                gate = None
+                            retry_at = time.monotonic() + 5
+                            time.sleep(.2)
+                            continue
                         runtime = manager.process_identity(child.pid) or {'pid': child.pid, 'executable': str(target), 'started': ''}
                         state['runtime'] = runtime
                         write(root / '.portal-supervisor.json', state)

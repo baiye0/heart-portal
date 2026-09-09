@@ -69,18 +69,36 @@ maintenance lock is released and reruns the saved worker to roll back. An
 existing LaunchAgent installation uses its independent worker's KeepAlive.
 There is no separate recovery watcher or new LaunchAgent for a Terminal session.
 
-If an unmanaged legacy worker is killed, or the entire Terminal session/reboot
-removes its supervisor, rerun the saved worker **from the original Terminal/app**.
-Do not launch the interrupted candidate before recovery:
+If logout/reboot removes both the worker and its session supervisor, the next
+normal Portal launch detects the journal and automatically runs its saved
+recovery worker when the maintenance lock is free. It first replaces the calling
+process with Python, then reloads the restored executable with the same PID,
+arguments, working directory and environment. This keeps the user's current
+Terminal/app launch origin and never continues running the replaced candidate
+inode. A surviving supervisor/LaunchAgent retains responsibility for restart;
+the recovery entry does not start a duplicate or install a new login job.
+
+During an upgrade, an unready or unlaunchable candidate does not make the session
+supervisor exit. The original supervisor remains available for rollback. If the
+supervisor has disappeared, or the restored binary cannot restart, rollback
+still records the restored bytes, clears the completed transaction and sets
+`restart_required: true`. The original command can then start Portal normally.
+Failures to restore files or stop existing processes retain the journal for
+recovery; they are not reported as a completed rollback.
+
+If the installed candidate cannot execute at all, or predates automatic startup
+recovery, rerun the saved worker **from the original Terminal/app**:
 
 ```sh
 # Run in the installation directory, after the interrupted worker has exited.
 python3 "$(python3 -c 'import json; print(json.load(open(".portal-upgrade.json"))["stage"] + "/portal-macos-upgrade.py")')"
 ```
 
-A session whose original supervisor has gone requires manual restart after
-rollback. Backups/logs remain under `.portal-upgrades`; completed worker plists
-are removed and their loaded jobs have no running process.
+When using this fallback command without a surviving supervisor, start Portal
+with its original command after rollback. Backups/logs remain under
+`.portal-upgrades`; completed worker plists are removed and their loaded jobs
+have no running process. A new login session still uses the user's normal
+startup entry; session supervision does not promise unattended login startup.
 
 ## First migration from the real published 0.8.0
 
@@ -146,6 +164,23 @@ developer certificate/private key to verify or run an already signed artifact.
 
 Normal build/sign: `python3 scripts/package-portal-macos.py`. This helper only
 builds and signs the raw executable; it does not submit notarization requests.
+
+Default-session recovery regressions (real CLI/processes in temporary folders):
+
+```sh
+cargo build --locked
+python3 scripts/tests/macos-recovery.tests.py
+```
+
+These cover orphaned journals, re-execution of the restored bytes, active-worker
+lock exclusion, recovery path validation, candidate failure before readiness,
+exec failure and loss of the original supervisor during rollback. Fault fixtures
+isolate lifecycle from signing credentials; they do not add a production bypass.
+The signed `macos-upgrade-e2e.py` also accepts `--lifecycle inherited
+--interrupt-session`: after replacement it terminates only the test worker,
+guardian and runtime, then uses the original CLI to verify automatic recovery,
+exact restored signatures and Portal permission preflights. This simulates loss
+of the session's processes without logging out the real user.
 
 Apple references:
 

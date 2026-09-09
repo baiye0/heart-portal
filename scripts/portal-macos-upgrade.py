@@ -131,9 +131,21 @@ def restore(root, target, stage, service, domain, plist, mode):
     with open(temporary, 'rb') as backup:
         os.fsync(backup.fileno())
     os.replace(temporary, target)
+    if mode == 'supervisor' and not manager.supervisor_state(root):
+        # Restoring the signed bytes succeeded. A vanished permission owner must
+        # not leave a recoverable installation stuck behind its journal forever.
+        return False
     if mode == 'start_script':
         manager.private_write(root / '.portal-launch-nonce', stage.name.encode())
-    restart(root, domain, plist, mode)  # Older binaries may not publish readiness.
+    try:
+        restart(root, domain, plist, mode)  # Older binaries may not publish readiness.
+    except Exception as error:
+        print(f'Previous binary restored, but restart failed: {error}', file=sys.stderr, flush=True)
+        if mode == 'supervisor':
+            manager.stop_supervisor(root)
+        stop(root, service)
+        return False
+    return mode != 'manual'
 
 
 def run(stage):
@@ -154,18 +166,18 @@ def run(stage):
     # readiness and releases the shared startup lock. Wait for that short window;
     # an existing upgrade journal still rejects overlapping transactions at once.
     with manager.maintenance_lock(root, timeout=3):
-        def status(state, message):
+        def status(state, message, **extra):
             write_json(root / '.portal-upgrade-status.json', {'state': state, 'message': message,
                        'version': request.get('version'), 'transaction': stage.name,
                        'signature_identity_preserved': request.get('signature_identity_preserved'),
                        'permission_notice': ('Signing identity changed; macOS may require one-time authorization.'
-                                             if request.get('signature_identity_preserved') is False else None)})
+                                             if request.get('signature_identity_preserved') is False else None), **extra})
 
-        def finish(state, message):
-            status(state, message)
+        def finish(state, message, **extra):
+            status(state, message, **extra)
             # Durable outcome before removing the journal: recovery can repeat
             # rollback after a crash, but must never replay a committed upgrade.
-            write_json(result_file, {'state': state, 'message': message})
+            write_json(result_file, {'state': state, 'message': message, **extra})
             journal.unlink(missing_ok=True)
 
         manager.assert_owned(plist, root, label)
@@ -178,9 +190,10 @@ def run(stage):
                 # A manual recovery must not invent a different permission owner.
                 mode = 'manual'
             status('rolling_back', 'Recovering interrupted upgrade.')
-            restore(root, target, stage, service, domain, plist, mode)
+            restarted = restore(root, target, stage, service, domain, plist, mode)
             finish('rolled_back', 'Interrupted upgrade recovered; previous binary restored.' +
-                   (' Start Portal manually.' if mode == 'manual' else ' Previous Portal is running.'))
+                   (' Previous Portal is running.' if restarted else ' Start Portal manually with its original command.'),
+                   restart_required=not restarted)
             return
         try:
             candidate = stage / 'candidate'
@@ -243,9 +256,10 @@ def run(stage):
             finish('succeeded', message)
         except Exception:
             status('rolling_back', 'New Portal failed; restoring previous executable.')
-            restore(root, target, stage, service, domain, plist, mode)
+            restarted = restore(root, target, stage, service, domain, plist, mode)
             finish('rolled_back', 'Upgrade failed; previous binary restored.' +
-                   (' Start Portal manually.' if mode == 'manual' else ' Previous Portal is running.') + ' See worker.log for details.')
+                   (' Previous Portal is running.' if restarted else ' Start Portal manually with its original command.') + ' See worker.log for details.',
+                   restart_required=not restarted)
             raise
 
 

@@ -20,6 +20,66 @@ pub fn installation_root(exe: &Path) -> Result<PathBuf> {
     Ok(parent.to_path_buf())
 }
 
+/// Re-enter the saved transaction from the user's normal launch origin. Exec
+/// first replaces this process with Python so rollback cannot kill its caller
+/// or leave it executing the candidate inode after restoring the old binary.
+pub fn recover_interrupted() -> Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+
+    if std::env::var("HEART_PORTAL_SUPERVISED").as_deref() == Ok("1") {
+        return Ok(());
+    }
+    let target = std::env::current_exe()?.canonicalize()?;
+    let root = installation_root(&target)?;
+    let journal_path = root.join(".portal-upgrade.json");
+    if !journal_path.exists() {
+        return Ok(());
+    }
+    let lock = std::fs::OpenOptions::new()
+        .read(true).write(true).create(true).truncate(false).mode(0o600)
+        .open(root.join(".portal-upgrade.lock"))?;
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            return Ok(()); // The normal startup guard reports active maintenance.
+        }
+        return Err(error).context("Checking interrupted upgrade");
+    }
+    if !journal_path.exists() {
+        return Ok(());
+    }
+    let journal: serde_json::Value = serde_json::from_slice(&std::fs::read(journal_path)?)?;
+    let stage = PathBuf::from(journal["stage"].as_str().context("Upgrade journal has no stage")?)
+        .canonicalize()?;
+    anyhow::ensure!(stage.parent() == Some(root.join(".portal-upgrades").as_path()),
+        "Upgrade recovery stage is outside this installation");
+    for name in ["portal-macos-upgrade.py", "portal-macos.py", "request.json"] {
+        anyhow::ensure!(stage.join(name).canonicalize()?.parent() == Some(stage.as_path()),
+            "Upgrade recovery file is outside this installation");
+    }
+    let request: serde_json::Value = serde_json::from_slice(&std::fs::read(stage.join("request.json"))?)?;
+    anyhow::ensure!(Path::new(request["root"].as_str().context("Recovery request has no root")?)
+        .canonicalize()? == root, "Recovery request belongs to another installation");
+    if let Some(path) = request["target"].as_str() {
+        anyhow::ensure!(Path::new(path).canonicalize()? == target,
+            "Recovery request belongs to another executable");
+    }
+    let python = std::fs::read_to_string(root.join(".portal-python"))
+        .map(|s| PathBuf::from(s.trim()))
+        .unwrap_or_else(|_| PathBuf::from("/usr/bin/python3"));
+    anyhow::ensure!(python.is_absolute() && python.is_file(),
+        "Upgrade recovery requires Python 3.9+; install it or update .portal-python");
+    // The saved worker reacquires maintenance and rechecks the journal. Another
+    // recovery owner winning this handoff must never cause a second replacement.
+    drop(lock);
+    eprintln!("Recovering interrupted upgrade before starting Portal: {}", stage.display());
+    let error = std::process::Command::new(python)
+        .arg("-c").arg(include_str!("../../scripts/portal-macos-recover.py"))
+        .arg(&root).arg(&stage).arg(&target).args(std::env::args_os().skip(1)).exec();
+    Err(error).context("Starting interrupted-upgrade recovery")
+}
+
 pub fn startup_guard() -> Result<Option<std::fs::File>> {
     use std::os::fd::AsRawFd;
     let Ok(root) = installation_root(&std::env::current_exe()?) else {

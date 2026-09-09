@@ -140,7 +140,9 @@ def main():
     parser.add_argument('--root', type=Path, default=Path.home() / '.heart-portal-user-e2e')
     parser.add_argument('--require-notarization', action='store_true')
     parser.add_argument('--lifecycle', choices=['launchagent', 'inherited', 'legacy', 'manual'], default='launchagent')
-    parser.add_argument('--interrupt-worker', action='store_true', help='Kill the worker after replacement and verify recovery by the existing supervisor.')
+    interruption = parser.add_mutually_exclusive_group()
+    interruption.add_argument('--interrupt-worker', action='store_true', help='Kill the worker after replacement and verify recovery by the existing supervisor.')
+    interruption.add_argument('--interrupt-session', action='store_true', help='Kill the worker and session guardian after replacement, then recover through normal CLI startup.')
     parser.add_argument('--keep', action='store_true')
     parser.add_argument('--require-permissions', nargs='+', choices=['screen_recording', 'accessibility', 'input_monitoring'])
     args = parser.parse_args()
@@ -227,15 +229,31 @@ def main():
         previous_plist = plist.read_bytes() if plist.exists() else None
         response = relay.tool('portal_exec', {'command': f'{shlex.quote(str(target))} upgrade --file {shlex.quote(str(candidate))}', 'timeout_secs': 360})
         require('Upgrade accepted' in json.dumps(response), 'Public CLI did not return acceptance before shutdown: ' + json.dumps(response))
-        if args.interrupt_worker:
-            require(args.lifecycle == 'inherited', '--interrupt-worker requires the inherited session supervisor.')
+        if args.interrupt_worker or args.interrupt_session:
+            require(args.lifecycle == 'inherited', 'Interruption tests require the inherited session supervisor.')
             replacing = wait_for(lambda: (value if (value := read_json(root / '.portal-upgrade-status.json')).get('state') == 'verifying' else None))
             owner = read_json(root / '.portal-upgrades' / replacing['transaction'] / 'accepted.json')['worker']
             require(str(manager.executable_path(owner['pid'])) == owner['executable'], 'Detached worker PID does not match.')
+            guardian = manager.supervisor_state(root)
+            if args.interrupt_session:
+                require(guardian and manager.identity_alive(guardian['owner']), 'Session guardian is missing before interruption.')
+                os.kill(guardian['owner']['pid'], signal.SIGKILL)
             os.kill(owner['pid'], signal.SIGKILL)
+            if args.interrupt_session:
+                # Simulate session teardown only for this test installation;
+                # never log out the actual user or alter their TCC database.
+                wait_for(lambda: not manager.supervisor_state(root))
+                manager.stop_checkout(root)
+                require((root / '.portal-upgrade.json').exists(), 'Transaction committed before interruption.')
+                require(target.read_bytes() == candidate.read_bytes(), 'Interruption must occur after replacement.')
+                if direct is not None:
+                    direct.wait(timeout=20)
+                with open(root / 'recovery-start.log', 'wb') as log:
+                    direct = subprocess.Popen([str(target), '--config', str(config), '--connect', link, '--name', 'signed-e2e'],
+                                              cwd=root, stdout=log, stderr=log)
             recovered = wait_for(lambda: (value if (value := read_json(root / '.portal-upgrade-status.json')).get('state') == 'rolled_back' else None))
             require(target.read_bytes() == original.read_bytes(), 'Recovery did not restore original signed bytes.')
-            require(manager.supervisor_state(root), 'Original supervisor was lost during recovery.')
+            wait_for(lambda: manager.supervisor_state(root))
             # The killed candidate may have a stale socket queued in this
             # tiny relay's listen backlog. Drain it before accepting the
             # restored runtime, just as a real relay drops dead sessions.
@@ -249,8 +267,20 @@ def main():
                     if attempt == 4 or (isinstance(error, RuntimeError) and 'disconnected before' not in str(error)):
                         raise
             require(restored['permissions'] == baseline['permissions'], 'Recovery changed TCC grants.')
-            report['checks']['detached_crash_restores_through_original_supervisor'] = True
-            report['tcc_retention'] = {'verified_permissions': [n for n, granted in baseline['permissions'].items() if granted]}
+            require(manager.checkout_pids(root) == [restored['pid']], 'Recovery left duplicate/missing runtimes.')
+            require(not (root / '.portal-upgrade.json').exists(), 'Recovery left a blocking journal.')
+            require(all((root / name).read_bytes() == value for name, value in preserved.items()), 'Recovery changed settings.')
+            require(worker.verify_signatures(original, target), 'Recovery changed the original signing identity.')
+            if args.interrupt_session:
+                require(restored['pid'] == direct.pid, 'Normal startup did not exec the restored binary in place.')
+                require(manager.supervisor_state(root)['owner'] != guardian['owner'], 'Session guardian was not replaced.')
+            else:
+                require(manager.supervisor_state(root)['owner'] == guardian['owner'], 'Original supervisor was lost during recovery.')
+            report['checks']['session_teardown_recovers_on_normal_start' if args.interrupt_session
+                             else 'detached_crash_restores_through_original_supervisor'] = True
+            report['after'] = restored
+            report['tcc_retention'] = {'verified_permissions': [n for n, granted in baseline['permissions'].items() if granted],
+                                     'unverified_permissions': [n for n, granted in baseline['permissions'].items() if not granted]}
             report['result'] = 'passed'
             return
         if args.lifecycle != 'manual':
