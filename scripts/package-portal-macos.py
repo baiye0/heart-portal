@@ -28,16 +28,36 @@ def run(args, timeout=900, stdout_only=False):
     return result.stdout if stdout_only else result.stdout + result.stderr
 
 
+def verify_release_signature(binary):
+    run(['/usr/bin/codesign', '--verify', '--strict', '-R', REQUIREMENT, binary])
+    details = run(['/usr/bin/codesign', '-d', '--verbose=4', binary])
+    timestamp = re.search(r'^Timestamp=(.+)$', details, re.MULTILINE)
+    if not timestamp or timestamp[1].strip().lower() == 'none':
+        raise RuntimeError('Release signature is missing a secure timestamp.')
+    if not re.search(r'^CodeDirectory .+flags=.+\(.*runtime.*\)', details, re.MULTILINE):
+        raise RuntimeError('Release signature is missing the hardened runtime option.')
+    requirement = re.search(r'^designated => (.+)$', run(['/usr/bin/codesign', '-d', '-r-', binary]), re.MULTILINE)
+    if not requirement:
+        raise RuntimeError('Release signature is missing a designated requirement.')
+    return {'secure_timestamp': timestamp[1], 'designated_requirement': requirement[1]}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--target', choices=['aarch64-apple-darwin', 'x86_64-apple-darwin'],
                         default='aarch64-apple-darwin' if platform.machine() == 'arm64' else 'x86_64-apple-darwin')
     parser.add_argument('--binary', type=Path, help='Sign a copy of an already built release executable.')
+    parser.add_argument('--verify-only', type=Path, help='Verify an existing artifact without changing it.')
     parser.add_argument('--output', type=Path)
     parser.add_argument('--keychain', type=Path)
     args = parser.parse_args()
     if sys.platform != 'darwin':
         parser.error('Run on macOS.')
+    if args.verify_only:
+        if args.binary or args.output or args.keychain:
+            parser.error('--verify-only cannot be combined with signing/output options.')
+        print(json.dumps(verify_release_signature(args.verify_only.resolve(strict=True)), indent=2))
+        return
     version = re.search(r'^version = "([^"]+)"', (REPO / 'portal/Cargo.toml').read_text(), re.MULTILINE)[1]
     slug = 'macos-arm64' if args.target.startswith('aarch64') else 'macos-x86_64'
     out = (args.output or REPO / 'dist' / 'signed-unnotarized' / slug).resolve()
@@ -62,10 +82,10 @@ def main():
     if args.keychain:
         signing += ['--keychain', args.keychain]
     run(['/usr/bin/codesign', '--force', *signing, '--identifier', IDENTIFIER, '--options', 'runtime', raw])
-    run(['/usr/bin/codesign', '--verify', '--strict', '-R', REQUIREMENT, raw])
+    signature = verify_release_signature(raw)
     report = {'version': version, 'architecture': slug, 'identity': IDENTITY, 'identifier': IDENTIFIER,
               'notarized': False,
-              'designated_requirement': re.search(r'^designated => (.+)$', run(['/usr/bin/codesign', '-d', '-r-', raw]), re.MULTILINE)[1],
+              **signature,
               'files': {raw.name: hashlib.sha256(raw.read_bytes()).hexdigest()}}
     (out / f'heart-portal-{slug}-verification.json').write_text(json.dumps(report, indent=2))
     print(f'Signed standalone binary: {raw}')

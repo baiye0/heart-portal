@@ -57,6 +57,9 @@ binary only on the active worker's request, retaining its TCC responsibility.
 An existing LaunchAgent is paused and restarted from the same plist; an
 independent worker survives its bootout. Fresh PID/version/nonce readiness and
 one stable runtime are checked independently of network/relay availability.
+Eager kit warmup runs in the background after initial tool discovery; optional
+kit startup delays do not consume the upgrade's 35-second readiness window.
+Warmup is cancelled before shutdown cleanup so it cannot respawn kits afterwards.
 
 Without a guardian, an existing start.sh remains the restart entry. When a live
 legacy Portal has neither, the worker first attaches the same session guardian
@@ -139,6 +142,25 @@ without rejecting an old identity change. Stable path and TCC responsible-proces
 signing. Kits such as cua-driver need separate signature/permission validation.
 
 ## Local zero-install validation
+
+The release workflow and local packaging both use `package-portal-macos.py`:
+Developer ID, stable identifier, hardened runtime, explicit secure timestamp and
+the same publisher requirement as the updater. Verify an existing artifact
+without modifying it with:
+
+```sh
+python3 scripts/package-portal-macos.py --verify-only /path/to/heart-portal-macos-arm64
+```
+
+PR CI runs the macOS lifecycle, supervisor, recovery and upgrade regressions,
+including real slow eager kits. Release CI additionally runs signed CLI upgrade
+and interrupted-session recovery against a local relay on the native architecture.
+Its incremented candidate version exists only in a temporary source copy and is
+never uploaded. Run that same signed check locally with:
+
+```sh
+python3 scripts/tests/macos-signed-upgrade.tests.py --binary /path/to/signed-heart-portal
+```
 
 ```sh
 python3 scripts/tests/build-macos-local-test.py

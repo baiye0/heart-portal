@@ -27,6 +27,7 @@ pub async fn run(
     }
     let exe = std::env::current_exe()?;
     let root = crate::windows_upgrade::installation_root(&exe)?;
+    crate::windows_private::protect_installation(&root)?;
     let explicit = config.is_some() || connect.is_some() || name.is_some();
     let saved = root.join(".portal-launch.json");
     let (launch, default_config) = if action != "start" || (!explicit && saved.is_file()) {
@@ -68,7 +69,7 @@ pub async fn run(
         "default_config": default_config, "explicit": explicit,
         "parent_pid": std::process::id(), "version": crate::upgrade::PORTAL_VERSION,
     });
-    std::fs::write(stage.join("request.json"), serde_json::to_vec(&request)?)?;
+    crate::windows_upgrade::write_json(&stage.join("request.json"), &request)?;
     let powershell =
         PathBuf::from(std::env::var_os("SystemRoot").context("SystemRoot is missing")?)
             .join("System32/WindowsPowerShell/v1.0/powershell.exe");

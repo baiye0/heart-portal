@@ -81,7 +81,7 @@ try {
     $config = [string]$launch.arguments[1]
     if (-not (Test-Path -LiteralPath $config)) {
         if (-not $request.default_config) { throw "Config not found: $config" }
-        [IO.File]::WriteAllText($config, $request.default_config, [Text.UTF8Encoding]::new($false))
+        Write-PortalPrivateText $config $request.default_config
     }
     $scripts = Join-Path $root 'scripts'
     [IO.Directory]::CreateDirectory($scripts) | Out-Null

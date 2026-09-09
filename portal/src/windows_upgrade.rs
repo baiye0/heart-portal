@@ -159,6 +159,7 @@ pub fn recover_interrupted() -> Result<bool> {
     if !journal_path.exists() {
         return Ok(false);
     }
+    crate::windows_private::protect_installation(&root)?;
     let owner = match std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -191,13 +192,23 @@ pub fn recover_interrupted() -> Result<bool> {
     Ok(true)
 }
 
-fn write_json(path: &Path, value: &serde_json::Value) -> Result<()> {
+pub(crate) fn write_json(path: &Path, value: &serde_json::Value) -> Result<()> {
+    use std::io::Write;
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
         MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
     };
     let temp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4().simple()));
-    std::fs::write(&temp, serde_json::to_vec(value)?)?;
+    let result = (|| -> Result<()> {
+        let mut file = crate::windows_private::create(&temp)?;
+        file.write_all(&serde_json::to_vec(value)?)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
+    }
     let from: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
     let to: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
     if unsafe {
@@ -218,6 +229,9 @@ fn write_json(path: &Path, value: &serde_json::Value) -> Result<()> {
 pub fn publish_ready() -> Result<()> {
     let exe = std::env::current_exe()?;
     let root = installation_root(&exe)?;
+    // The first upgrade may be driven by old code and start us directly under
+    // its supervisor. Repair legacy copies on this path as well as CLI starts.
+    crate::windows_private::protect_installation(&root)?;
     let nonce = std::env::var("HEART_PORTAL_READY_NONCE")
         .unwrap_or_else(|_| uuid::Uuid::new_v4().simple().to_string());
     let ready_path = std::env::var_os("HEART_PORTAL_READY_FILE")
@@ -343,6 +357,7 @@ pub async fn upgrade_file(path: &Path) -> Result<()> {
 pub async fn handoff(bytes: &[u8], version: &str) -> Result<()> {
     let target = std::env::current_exe().context("Finding installed executable")?;
     let root = installation_root(&target)?;
+    crate::windows_private::protect_installation(&root)?;
     let staging = root
         .join(".portal-upgrades")
         .join(uuid::Uuid::new_v4().simple().to_string());
@@ -360,7 +375,7 @@ pub async fn handoff(bytes: &[u8], version: &str) -> Result<()> {
         "version": version, "sha256": format!("{:x}", Sha256::digest(bytes)),
         "parent_pid": std::process::id(), "ack": ack, "error": error,
     });
-    std::fs::write(staging.join("request.json"), serde_json::to_vec(&request)?)?;
+    write_json(&staging.join("request.json"), &request)?;
     let child = spawn_worker(&worker, &root, false)?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {

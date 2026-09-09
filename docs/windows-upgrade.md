@@ -17,7 +17,13 @@ Without a Loom link, Portal starts local MCP on `127.0.0.1:9100`. Supply
 `--connect <link>` to connect to a Being. `.portal-launch.json` saves config
 path, name, connection link, selected environment and working directory;
 normal relaunches, logon recovery and upgrades reuse them. This file can contain
-credentials. Keep it private and keep the generated files with the exe.
+credentials. Generated credential files now receive a protected Windows DACL
+granting access only to the current user's SID and SYSTEM, including temporary
+requests, direct-launch snapshots and rollback journals. Existing managed files
+are repaired without changing their contents on start/upgrade/recovery. Legacy
+connection URL files use the same protection. An ACL-capable volume is required;
+keep the generated files with the exe. External user-supplied configs retain
+their existing permissions and remain the user's responsibility.
 
 Manual Windows launches print configuration/connection guidance immediately and
 stream startup progress while the worker configures supervision. A missing Being
@@ -86,7 +92,11 @@ status makes `upgrade --status` return a nonzero exit code.
 ## Coordination and recovery
 
 1. Download the binary for the release tag returned by GitHub, never a second
-   mutable `latest` URL. Verify the GitHub asset digest when available and run
+   mutable `latest` URL. Require the matching asset's SHA-256 digest from GitHub's
+   HTTPS release API before handing downloaded bytes to the worker. Missing or
+   mismatched digests leave the installed Portal running unchanged. This protects
+   the download against the published checksum; it is not Authenticode signing.
+   Explicit `upgrade --file` still accepts the local file selected by the user. Run
    the candidate's version check before stopping anything.
 2. Take an OS-backed exclusive upgrade lock. Installation and uninstallation
    use this lock too. Concurrent requests fail without affecting the owner.

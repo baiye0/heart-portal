@@ -21,6 +21,8 @@ mod macos_supervisor;
 #[cfg(windows)]
 mod windows_upgrade;
 #[cfg(windows)]
+mod windows_private;
+#[cfg(windows)]
 mod windows_start;
 #[cfg(windows)]
 mod connection_status;
@@ -269,12 +271,15 @@ async fn main() -> Result<()> {
         Err(e) => warn!("Failed to load custom tools: {}", e),
     }
 
-    // Pre-spawn eager kits (manifest.eager == true) so the first call has
-    // no cold-start latency. Failures are logged, not fatal.
-    tool_host.warmup_kits().await;
-
     let tool_list = tool_host.list_tools().await;
     info!("Portal tools: {}", tool_list.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", "));
+
+    // Eager kits are optional. Start warming them after initial tool discovery
+    // without holding up listener/relay readiness or the upgrade deadline.
+    // Cancel warmup before shutdown so it cannot spawn kits after cleanup.
+    let mut warmup = tokio::task::JoinSet::new();
+    let warmup_host = tool_host.clone();
+    warmup.spawn(async move { warmup_host.warmup_kits().await; });
 
     if let Some(ref loom) = connect_link {
         // Relay handshake identity: --name, non-generic config name, then host name.
@@ -305,14 +310,17 @@ async fn main() -> Result<()> {
                 info!("Portal shutting down (Ctrl+C)");
                 #[cfg(target_os = "macos")]
                 macos_supervisor::stop_on_interrupt();
+                warmup.shutdown().await;
                 tool_shutdown.kill_all_managed_processes().await;
             }
             _ = wait_sigterm() => {
                 info!("Portal shutting down (termination signal)");
+                warmup.shutdown().await;
                 tool_shutdown.kill_all_managed_processes().await;
             }
             _ = restart_waiter.wait_for_restart() => {
                 info!("Portal restarting after a controlled tool request");
+                warmup.shutdown().await;
                 tool_shutdown.kill_all_managed_processes().await;
             }
             _ = relay_client::connect_and_serve(loom, &tool_host, &relay_portal_name) => {}
@@ -365,6 +373,7 @@ async fn main() -> Result<()> {
                     Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 }
+                warmup.shutdown().await;
                 shutdown_cleanup.kill_all_managed_processes().await;
                 break;
             }

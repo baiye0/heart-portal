@@ -12,7 +12,7 @@ jobs:
   rust:
     strategy:
       matrix:
-        os: [macos-latest, windows-latest]
+        os: [macos-latest, macos-15-intel, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -25,12 +25,25 @@ jobs:
           if (-not (Test-Path $git)) { throw 'Git for Windows is required for the PATH regression test.' }
       - name: Rust tests (includes native Windows exec regressions)
         run: cargo test --locked
+      - name: macOS lifecycle, recovery and upgrade regressions
+        if: runner.os == 'macOS'
+        env:
+          PORTAL_TEST_BINARY: ${{ github.workspace }}/target/debug/heart-portal
+        run: |
+          set -euo pipefail
+          cargo build --locked
+          python3 scripts/tests/macos-package.tests.py
+          python3 scripts/tests/macos-upgrade.tests.py
+          python3 scripts/tests/macos-recovery.tests.py
+          python3 scripts/tests/macos-supervisor.tests.py
+          python3 scripts/tests/macos-lifecycle.tests.py
       - name: Windows supervisor lifecycle
         if: runner.os == 'Windows'
         shell: powershell
         run: |
           .\scripts\tests\windows-lifecycle.tests.ps1
           .\scripts\tests\windows-start-fallback.tests.ps1
+          .\scripts\tests\windows-private-state.tests.ps1
       - name: Windows single-exe first launch and upgrade
         if: runner.os == 'Windows'
         shell: powershell

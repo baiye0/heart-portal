@@ -145,6 +145,26 @@ async fn fetch_latest_release(client: &reqwest::Client) -> Result<serde_json::Va
     Ok(body)
 }
 
+fn verify_release_digest(release: &serde_json::Value, platform: &Platform, bytes: &[u8]) -> Result<()> {
+    let digest = release["assets"]
+        .as_array()
+        .and_then(|assets| assets.iter().find(|asset| asset["name"].as_str() == Some(asset_name(platform).as_str())))
+        .and_then(|asset| asset["digest"].as_str());
+    // Windows releases have no Authenticode signature. Require the checksum
+    // supplied independently by GitHub's HTTPS API before staging or executing
+    // downloaded code; the worker's own hash only protects the local handoff.
+    anyhow::ensure!(digest.is_some() || !platform.slug.starts_with("windows-"),
+        "Windows release is missing its GitHub SHA-256 digest; the installed Portal was left unchanged");
+    if let Some(digest) = digest {
+        use sha2::{Digest, Sha256};
+        anyhow::ensure!(
+            digest.eq_ignore_ascii_case(&format!("sha256:{:x}", Sha256::digest(bytes))),
+            "Release asset checksum mismatch; the installed Portal was left unchanged"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(not(any(windows, target_os = "macos")))]
 fn backup_stamp() -> String {
     SystemTime::now()
@@ -257,22 +277,7 @@ pub async fn run_upgrade() -> Result<()> {
         .await
         .context("Failed to read downloaded binary")?;
 
-    // Verify GitHub's asset digest when supplied, before touching a runtime.
-    if let Some(digest) = release["assets"]
-        .as_array()
-        .and_then(|assets| {
-            assets
-                .iter()
-                .find(|asset| asset["name"].as_str() == Some(asset_name(&platform).as_str()))
-        })
-        .and_then(|asset| asset["digest"].as_str())
-    {
-        use sha2::{Digest, Sha256};
-        anyhow::ensure!(
-            digest == format!("sha256:{:x}", Sha256::digest(&bytes)),
-            "Release asset checksum mismatch"
-        );
-    }
+    verify_release_digest(&release, &platform, &bytes)?;
 
     #[cfg(windows)]
     return crate::windows_upgrade::handoff(&bytes, latest_version).await;
@@ -338,6 +343,32 @@ pub async fn run_upgrade() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_release_requires_matching_asset_digest() {
+        use serde_json::json;
+        use sha2::{Digest, Sha256};
+        let platform = Platform { slug: "windows-x86_64".into() };
+        let name = asset_name(&platform);
+        let bytes = b"release executable";
+        let digest = format!("sha256:{:x}", Sha256::digest(bytes));
+        let valid = json!({"assets": [{"name": name, "digest": digest}]});
+        verify_release_digest(&valid, &platform, bytes).unwrap();
+        assert!(verify_release_digest(&valid, &platform, b"tampered executable").is_err());
+        for invalid in [
+            json!({}), json!({"assets": []}),
+            json!({"assets": [{"name": name}]}),
+            json!({"assets": [{"name": name, "digest": null}]}),
+            json!({"assets": [{"name": name, "digest": ""}]}),
+            json!({"assets": [{"name": name, "digest": "md5:1234"}]}),
+            json!({"assets": [{"name": "another-platform", "digest": digest}]}),
+        ] {
+            assert!(verify_release_digest(&invalid, &platform, bytes).is_err(), "{invalid}");
+        }
+        // Preserve older macOS metadata compatibility; its worker independently
+        // enforces the Developer ID requirement before replacement.
+        verify_release_digest(&json!({}), &Platform { slug: "macos-arm64".into() }, bytes).unwrap();
+    }
 
     #[test]
     fn compare_versions_orders_semver() {

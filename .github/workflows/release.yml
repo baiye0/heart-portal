@@ -18,7 +18,7 @@ jobs:
             os: macos-latest
             name: heart-portal-macos-arm64
           - target: x86_64-apple-darwin
-            os: macos-latest
+            os: macos-15-intel
             name: heart-portal-macos-x86_64
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
@@ -58,6 +58,7 @@ jobs:
         run: |
           .\scripts\tests\windows-lifecycle.tests.ps1
           .\scripts\tests\windows-start-fallback.tests.ps1
+          .\scripts\tests\windows-private-state.tests.ps1
           .\scripts\tests\windows-console.tests.ps1
           .\scripts\tests\windows-connection-guidance.tests.ps1 -Binary '${{ matrix.name }}'
           .\scripts\tests\windows-package.tests.ps1 -Binary '${{ matrix.name }}'
@@ -104,14 +105,18 @@ jobs:
         run: |
           set -euo pipefail
           KEYCHAIN_PATH="$RUNNER_TEMP/portal-signing.keychain-db"
-          codesign --force \
-            --sign 'Developer ID Application: D5 Inc. (7N8XHQWCNN)' \
-            --identifier 'com.aspect.heart-portal' \
-            --options runtime \
-            --keychain "$KEYCHAIN_PATH" \
-            ${{ matrix.name }}
-          codesign --verify --deep --strict ${{ matrix.name }}
-          codesign -dv --verbose=2 ${{ matrix.name }}
+          python3 scripts/package-portal-macos.py \
+            --binary '${{ matrix.name }}' --target '${{ matrix.target }}' \
+            --keychain "$KEYCHAIN_PATH" --output "$RUNNER_TEMP/portal-signed"
+          cp "$RUNNER_TEMP/portal-signed/${{ matrix.name }}" '${{ matrix.name }}'
+          python3 scripts/package-portal-macos.py --verify-only '${{ matrix.name }}'
+
+      - name: Verify signed macOS upgrade and recovery
+        if: runner.os == 'macOS' && ((runner.arch == 'ARM64' && matrix.target == 'aarch64-apple-darwin') || (runner.arch == 'X64' && matrix.target == 'x86_64-apple-darwin'))
+        run: |
+          set -euo pipefail
+          python3 scripts/tests/macos-signed-upgrade.tests.py \
+            --binary '${{ matrix.name }}' --keychain "$RUNNER_TEMP/portal-signing.keychain-db"
 
       - name: Clean up signing keychain
         if: runner.os == 'macOS' && always()

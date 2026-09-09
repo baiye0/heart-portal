@@ -58,7 +58,7 @@ if (Test-Path -LiteralPath (Join-Path $Root '.portal-upgrade.json')) {
     Restore-PortalUpgrade $Root (Read-PortalJson (Join-Path $Root '.portal-upgrade.json'))
 }
 if (-not [string]::IsNullOrWhiteSpace($ConnectLink)) {
-    Set-Content -LiteralPath (Join-Path $Root '.portal-connection.url') -Value $ConnectLink.Trim() -NoNewline
+    Write-PortalPrivateText (Join-Path $Root '.portal-connection.url') $ConnectLink.Trim()
 }
 Set-Content -LiteralPath (Join-Path $Root '.portal-name') -Value $PortalName -NoNewline
 Set-Content -LiteralPath (Join-Path $Root '.portal-task-name') -Value $TaskName -NoNewline

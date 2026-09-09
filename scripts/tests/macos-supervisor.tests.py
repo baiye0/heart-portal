@@ -104,5 +104,46 @@ class SupervisorTests(unittest.TestCase):
         self.assertFalse(manager.checkout_pids(self.root))
 
 
+@unittest.skipUnless(sys.platform == 'darwin', 'requires macOS')
+class SlowKitTests(unittest.TestCase):
+    def test_slow_eager_kits_do_not_delay_upgrade_readiness(self):
+        with tempfile.TemporaryDirectory(prefix='portal slow kits ') as temporary:
+            root = Path(temporary).resolve()
+            target = root / 'heart-portal'
+            shutil.copy2(BINARY, target)
+            kits = root / 'kits'
+            for n in range(4):
+                kit = kits / f'slow{n}'
+                kit.mkdir(parents=True)
+                script = kit / 'server.py'
+                script.write_text('import os, pathlib, time\npathlib.Path(__file__).with_suffix(".started").write_text(str(os.getpid()))\ntime.sleep(60)\n')
+                (kit / 'manifest.json').write_text(json.dumps({
+                    'name': f'slow{n}', 'version': '1.0.0', 'eager': True,
+                    'command': [sys.executable, str(script)],
+                    'tools': [{'name': 'test', 'description': 'slow fixture', 'params': {'type': 'object'}}]}))
+            config = root / 'portal.toml'
+            config.write_text('workspace = "./workspace"\nbind = "127.0.0.1:0"\n'
+                              f'kits_dir = {json.dumps(str(kits))}\n')
+            with open(root / 'runtime.log', 'wb') as log:
+                process = subprocess.Popen([str(target), '--config', str(config)], cwd=root, stdout=log, stderr=log)
+                try:
+                    # Exercise the actual upgrade readiness predicate while
+                    # four non-fatal 10-second kit timeouts are still pending.
+                    nonce = e2e.wait_for(lambda: manager.saved(root, '.portal-launch-nonce'), timeout=8)
+                    version = subprocess.check_output([str(target), '--version'], text=True).strip().split()[1]
+                    e2e.worker.wait_ready(root, version, nonce, timeout=8)
+                    self.assertEqual(process.poll(), None)
+                    e2e.wait_for(lambda: len(list(kits.glob('*/server.started'))) == 4, timeout=40)
+                    self.assertIsNone(process.poll())
+                    self.assertEqual(manager.checkout_pids(root), [process.pid])
+                finally:
+                    manager.stop_supervisor(root)
+                    manager.stop_checkout(root)
+                    process.wait(timeout=15)
+                    for marker in kits.glob('*/server.started'):
+                        pid = int(marker.read_text())
+                        e2e.wait_for(lambda: manager.executable_path(pid) is None, timeout=5)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

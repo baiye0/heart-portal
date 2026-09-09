@@ -37,20 +37,61 @@ function Open-PortalLock([string]$Root, [string]$Name, [int]$TimeoutSeconds = 0)
     } while ($true)
 }
 
-function Write-PortalJson([string]$Path, $Value) {
+function New-PortalFileSecurity {
+    $security = [Security.AccessControl.FileSecurity]::new()
+    $security.SetAccessRuleProtection($true, $false)
+    foreach ($sid in @([Security.Principal.WindowsIdentity]::GetCurrent().User,
+                       [Security.Principal.SecurityIdentifier]::new('S-1-5-18'))) {
+        $security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+            $sid, [Security.AccessControl.FileSystemRights]::FullControl,
+            [Security.AccessControl.AccessControlType]::Allow))
+    }
+    return $security
+}
+
+function Protect-PortalFile([string]$Path) {
+    if (Test-Path -LiteralPath $Path) {
+        $item = Get-Item -LiteralPath $Path -Force
+        if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw 'Managed Portal credentials must be regular files.'
+        }
+        [IO.File]::SetAccessControl($Path, (New-PortalFileSecurity))
+    }
+}
+
+function Write-PortalPrivateText([string]$Path, [string]$Value) {
     $temp = "$Path.$([guid]::NewGuid().ToString('N')).tmp"
     try {
-        $bytes = [Text.Encoding]::UTF8.GetBytes(($Value | ConvertTo-Json -Depth 8 -Compress))
-        $stream = [IO.File]::Open($temp, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
-        try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
-        if (Test-Path -LiteralPath $Path) { [IO.File]::Replace($temp, $Path, [NullString]::Value) }
+        $bytes = [Text.Encoding]::UTF8.GetBytes($Value)
+        $security = New-PortalFileSecurity
+        # Apply a protected DACL at creation, before any secret reaches disk.
+        $stream = [IO.FileStream]::new($temp, [IO.FileMode]::CreateNew,
+            [Security.AccessControl.FileSystemRights]::FullControl, [IO.FileShare]::None,
+            4096, [IO.FileOptions]::None, $security)
+        try {
+            $stream.SetAccessControl($security) # Fail closed if the volume cannot enforce ACLs.
+            $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true)
+        } finally { $stream.Dispose() }
+        if (Test-Path -LiteralPath $Path) {
+            # File.Replace retains the destination DACL; repair legacy broad
+            # permissions first, otherwise a private temp file is insufficient.
+            Protect-PortalFile $Path
+            [IO.File]::Replace($temp, $Path, [NullString]::Value)
+        }
         else { [IO.File]::Move($temp, $Path) }
     } finally {
         if (Test-Path -LiteralPath $temp) { [IO.File]::Delete($temp) }
     }
 }
 
+function Write-PortalJson([string]$Path, $Value) {
+    Write-PortalPrivateText $Path ($Value | ConvertTo-Json -Depth 8 -Compress)
+}
+
 function Read-PortalJson([string]$Path) {
+    if ([IO.Path]::GetFileName($Path) -in @('.portal-launch.json', '.portal-direct.json', '.portal-upgrade.json', 'request.json')) {
+        Protect-PortalFile $Path
+    }
     # Readers keep a snapshot of the old file while a writer atomically swaps
     # in the next one. ReadAllText's default sharing prevents that replacement.
     for ($attempt = 0; $attempt -lt 20; $attempt++) {

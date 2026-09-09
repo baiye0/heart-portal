@@ -12,6 +12,7 @@ $exe = Get-PortalExecutable $Root
 $supervisorHash = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
 $config = Join-Path $Root 'portal.toml'
 $linkFile = Join-Path $Root '.portal-connection.url'
+Protect-PortalFile $linkFile
 $nameFile = Join-Path $Root '.portal-name'
 $stdoutLog = Join-Path $Root 'portal-runtime.log'
 $stderrLog = Join-Path $Root 'portal-runtime.err.log'

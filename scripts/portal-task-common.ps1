@@ -2,6 +2,7 @@
 . (Join-Path $PSScriptRoot 'portal-lifecycle.ps1')
 function Get-PortalSavedValue([string]$Root, [string]$FileName) {
     $path = Join-Path $Root $FileName
+    if ($FileName -eq '.portal-connection.url') { Protect-PortalFile $path }
     if (Test-Path -LiteralPath $path) { return (Get-Content -LiteralPath $path -Raw).Trim() }
     return ''
 }
