@@ -134,7 +134,7 @@ int main(int argc, char **argv) {
         stage = self.root / '.portal-upgrades' / name
         stage.mkdir(parents=True)
         self.build(stage / 'candidate', '0.8.1', broken)
-        for filename in ('portal-macos.py', 'portal-macos-upgrade.py'):
+        for filename in ('portal-macos.py', 'portal-macos-upgrade.py', 'portal-macos-supervisor.py'):
             shutil.copy2(REPO / 'scripts' / filename, stage)
         # Integration isolates lifecycle from Apple credentials/network. The
         # production worker has no bypass flag; only this fixture loader mocks
@@ -238,7 +238,7 @@ spec.loader.exec_module(worker)
         self.assertEqual(len(manager.checkout_pids(self.root)), 1)
         self.assertFalse((self.root / '.portal-upgrade.json').exists())
 
-    def test_unmanaged_upgrade_does_not_require_or_install_supervisor(self):
+    def test_offline_upgrade_does_not_invent_a_running_session(self):
         manager.launchctl('bootout', self.service)
         manager.stop_checkout(self.root)
         self.plist.unlink()
@@ -251,6 +251,84 @@ spec.loader.exec_module(worker)
         self.assertFalse(self.plist.exists())
         self.assertFalse((self.root / 'scripts/portal-macos.py').exists())
         self.assertFalse(manager.checkout_pids(self.root))
+
+    def start_legacy(self):
+        manager.launchctl('bootout', self.service)
+        manager.stop_checkout(self.root)
+        self.plist.unlink()
+        # Empty arguments and shell metacharacters must survive without parsing
+        # ps output or evaluating a reconstructed shell command.
+        arguments = ['--config', 'config with spaces.toml', '--name', '中文 $(touch unexpected)', '',
+                     '--connect=http://127.0.0.1:9/fixture/?token=adoption-secret']
+        environment = dict(os.environ, PORTAL_ADOPTION_TEST='original = value\nwith newline')
+        process = subprocess.Popen([str(self.target), *arguments], cwd=self.root, env=environment,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        wait_for(lambda: manager.process_identity(process.pid))
+        return process, arguments, environment
+
+    def test_live_legacy_upgrade_restarts_with_original_settings_and_one_guardian(self):
+        process, arguments, environment = self.start_legacy()
+        try:
+            stage, _ = self.start_upgrade('adopt-legacy')
+            result = wait_for(lambda: read(stage / 'result.json'))
+            self.assertEqual(result['state'], 'succeeded')
+            process.wait(timeout=10)
+            pids = manager.checkout_pids(self.root)
+            self.assertEqual(len(pids), 1)
+            self.assertNotEqual(pids[0], process.pid)
+            state = manager.supervisor_state(self.root)
+            self.assertEqual(state['runtime']['pid'], pids[0])
+            launch = manager.launch_snapshot(manager.process_identity(pids[0]))
+            self.assertEqual(launch['arguments'], arguments)
+            self.assertEqual(launch['cwd'], str(self.root))
+            self.assertEqual(launch['environment']['PORTAL_ADOPTION_TEST'], environment['PORTAL_ADOPTION_TEST'])
+            self.assertEqual(upgrade.version(self.target), '0.8.1')
+            self.assertFalse(self.plist.exists())
+            self.assertFalse((self.root / 'start.sh').exists())
+            self.assertFalse((self.root / 'unexpected').exists())
+            for path in [stage / 'request.json', stage / 'accepted.json', stage / 'worker.log',
+                         self.root / '.portal-supervisor.json', self.root / 'portal-supervisor.log']:
+                self.assertNotIn(b'adoption-secret', path.read_bytes())
+            owner_argv = subprocess.check_output(['/bin/ps', '-p', str(state['owner']['pid']), '-o', 'command='])
+            self.assertNotIn(b'adoption-secret', owner_argv)
+        finally:
+            manager.stop_supervisor(self.root)
+            manager.stop_checkout(self.root)
+            process.wait(timeout=10)
+
+    def test_live_legacy_failed_candidate_rolls_back_and_restarts_automatically(self):
+        process, _, _ = self.start_legacy()
+        previous = self.target.read_bytes()
+        try:
+            stage, _ = self.start_upgrade('adopt-rollback', broken=True)
+            result = wait_for(lambda: read(stage / 'result.json'), timeout=60)
+            self.assertEqual(result['state'], 'rolled_back')
+            self.assertFalse(result['restart_required'])
+            self.assertEqual(self.target.read_bytes(), previous)
+            self.assertEqual(len(manager.checkout_pids(self.root)), 1)
+            self.assertTrue(manager.supervisor_state(self.root))
+            self.assertFalse((self.root / '.portal-upgrade.json').exists())
+        finally:
+            manager.stop_supervisor(self.root)
+            manager.stop_checkout(self.root)
+            process.wait(timeout=10)
+
+    def test_snapshot_preserves_cwd_boundaries_and_rejects_reused_identity(self):
+        directory = self.root / 'cwd with spaces 中文\nand newline'
+        directory.mkdir()
+        arguments = ['argument with spaces', '', 'quotes " and \' and $()']
+        with subprocess.Popen([str(self.target), *arguments], cwd=directory,
+                              env=dict(os.environ, PORTAL_ADOPTION_TEST='kept')) as process:
+            identity = wait_for(lambda: manager.process_identity(process.pid))
+            try:
+                snapshot = manager.launch_snapshot(identity)
+                self.assertEqual(snapshot['arguments'], arguments)
+                self.assertEqual(snapshot['cwd'], str(directory))
+                self.assertEqual(snapshot['environment']['PORTAL_ADOPTION_TEST'], 'kept')
+                with self.assertRaisesRegex(RuntimeError, 'exited'):
+                    manager.launch_snapshot(dict(identity, started='different process'))
+            finally:
+                process.terminate()
 
     def test_legacy_start_script_is_preserved_and_restarts_without_supervisor(self):
         manager.launchctl('bootout', self.service)

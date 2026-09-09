@@ -195,6 +195,10 @@ async fn handoff_to(bytes: &[u8], version: Option<&str>, target: &Path) -> Resul
         include_str!("../../scripts/portal-macos-upgrade.py"),
     )?;
     std::fs::write(
+        stage.join("portal-macos-supervisor.py"),
+        include_str!("../../scripts/portal-macos-supervisor.py"),
+    )?;
+    std::fs::write(
         stage.join("request.json"),
         serde_json::to_vec(&serde_json::json!({
             "root": root, "target": target,

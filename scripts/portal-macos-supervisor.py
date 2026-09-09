@@ -65,7 +65,8 @@ def watch(request):
         except BlockingIOError:
             raise RuntimeError('A Portal supervisor already owns this installation.')
         runtime = manager.process_identity(request['runtime_pid'])
-        if not runtime or runtime['executable'] != str(target):
+        if (not runtime or runtime['executable'] != str(target)
+                or request.get('runtime', runtime) != runtime):
             raise RuntimeError('Original Portal exited before supervision was ready.')
         state = {'protocol': 1, 'owner': manager.process_identity(os.getpid()),
                  'token': request['token'], 'runtime': runtime, 'kind': 'inherited-session'}
@@ -75,7 +76,9 @@ def watch(request):
         child, gate, handled, recovery = None, None, None, None
         recovery_retry = 0
         startup_deadline, retry_at = 0, 0
-        armed = False
+        # A live pre-supervisor release cannot publish our readiness marker.
+        # Its upgrade worker has explicitly adopted it before stopping it.
+        armed = bool(request.get('adopted'))
         try:
             while not stopping and manager.saved(root, '.portal-supervisor-stop') != request['token']:
                 if child:

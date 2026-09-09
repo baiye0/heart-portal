@@ -58,10 +58,18 @@ An existing LaunchAgent is paused and restarted from the same plist; an
 independent worker survives its bootout. Fresh PID/version/nonce readiness and
 one stable runtime are checked independently of network/relay availability.
 
-Without a guardian, the old start.sh restarts Portal, or the user starts it
-manually as before. The new binary attaches supervision after the transaction
-commits. The upgrade CLI returns acceptance through portal_exec before stopping
-Portal; acceptance is not completion, so inspect upgrade --status.
+Without a guardian, an existing start.sh remains the restart entry. When a live
+legacy Portal has neither, the worker first attaches the same session guardian
+to that process, capturing its exact argv, working directory and environment
+in memory. It then uses the ordinary supervised replacement/readiness/rollback
+flow. The new version starts automatically with the same connection and name;
+no installer wrapper or LaunchAgent is added. Invoke the first migration through
+the running Portal's portal_exec, or from its original Terminal/app, to preserve
+the launch origin used by TCC. An offline installation with no live process and
+no start.sh/LaunchAgent has no session to resume and remains stopped.
+
+The upgrade CLI returns acceptance through portal_exec before stopping Portal;
+acceptance is not completion, so inspect upgrade --status after reconnecting.
 
 Startup failure restores previous bytes atomically. If a worker is killed,
 the existing session supervisor detects the interrupted journal after the
@@ -116,6 +124,12 @@ updater cannot re-sign the new release. No identity-change opt-in is required:
   --target /installed/heart-portal
 ```
 
+Keep the old Portal running while invoking this command. Even without an
+existing guardian or start.sh, the updater adopts it before interruption and
+automatically starts the new version. Do not manually launch another copy while
+the worker is replacing or verifying it. If launch-setting capture or guardian
+attachment fails, the updater reports failure before replacing the old binary.
+
 Status records signature_identity_preserved=false and a permission notice.
 The candidate must still have the expected publisher and a valid signature.
 **Direct grants tied to the old ad-hoc identity may need one authorization.**
@@ -143,8 +157,8 @@ when the API is rate limited; the downloaded asset digest is still verified.
 --fresh requires a nonexistent root. The E2E installs the unchanged GitHub
 binary, creates config/workspace, starts a loopback relay with no real Being,
 observes the old binary's self-re-signing and absence of supervision, migrates
-to 0.8.1 without an identity override, starts the same original
-command and verifies automatic supervision. It tests crash/controlled restart,
+to 0.8.1 without an identity override, and verifies that it reconnects and gains
+supervision without a second launch command. It tests crash/controlled restart,
 then a normal supervised upgrade to 0.8.2. Config, path, exact signed bytes,
 version, single runtime and guardian are checked. Add --legacy-start-script to
 exercise a pre-existing start.sh. All test processes are stopped on completion.

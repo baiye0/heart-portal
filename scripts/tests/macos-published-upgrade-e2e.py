@@ -86,11 +86,16 @@ def main():
               'legacy_start_script': args.legacy_start_script}
     relay = e2e.Relay()
     processes = []
+    launch_cwd = root if args.legacy_start_script else root / 'launch cwd 中文'
+    launch_cwd.mkdir(exist_ok=True)
+    launch_env = dict(os.environ, PORTAL_MIGRATION_TEST='original environment = preserved')
+    launch_arguments = ['--config', 'portal.toml' if args.legacy_start_script else '../portal.toml',
+                        '--name', 'github-old-user']
 
     def start():
         with open(root / 'foreground.log', 'ab') as log:
-            process = subprocess.Popen([str(target), '--config', str(root / 'portal.toml'), '--connect', link, '--name', 'github-old-user'],
-                                       cwd=root, stdout=log, stderr=log)
+            process = subprocess.Popen([str(target), *launch_arguments, '--connect', link],
+                                       cwd=launch_cwd, env=launch_env, stdout=log, stderr=log)
         processes.append(process)
         return process
 
@@ -104,6 +109,7 @@ def main():
         config = root / 'portal.toml'
         config.write_text('workspace = "./workspace"\nbind = "127.0.0.1:0"\nkits_enabled = false\n[cowork]\nenabled = false\n')
         (root / 'workspace').mkdir(exist_ok=True)
+        (launch_cwd / 'workspace').mkdir(exist_ok=True)
         config_bytes = config.read_bytes()
         link = f'http://127.0.0.1:{relay.port}/published/?token=local-fixture-only'
         if args.legacy_start_script:
@@ -132,16 +138,21 @@ def main():
         process.wait(timeout=20)
         require(target.read_bytes() == new.read_bytes(), 'First migration altered the signed candidate.')
         require(worker.verify_signatures(new, target), 'Installed signature differs from the new artifact.')
-        if not args.legacy_start_script:
-            require(not manager.checkout_pids(root), 'Manual installation should retain its original restart entry.')
-            start()
+        require(len(manager.checkout_pids(root)) == 1, 'First migration did not automatically restart Portal.')
         require(relay.connect() == hello, 'First migration changed relay identity.')
         after = relay.tool('portal_permissions')['status']
         require(manager.supervisor_state(root), 'The new release did not automatically attach supervision.')
+        if not args.legacy_start_script:
+            launch = manager.launch_snapshot(manager.process_identity(after['pid']))
+            require(launch['arguments'] == [*launch_arguments, '--connect', link], 'First migration changed argument boundaries or relative config.')
+            require(launch['cwd'] == str(launch_cwd), 'First migration changed working directory.')
+            require(launch['environment'].get('PORTAL_MIGRATION_TEST') == launch_env['PORTAL_MIGRATION_TEST'],
+                    'First migration lost the runtime environment.')
+            report['checks']['original_argv_cwd_environment_preserved'] = True
         require(config.read_bytes() == config_bytes, 'First migration changed configuration.')
         report['first_upgrade'] = {'status': migrated, 'permissions': after,
                                    'screen_capture_succeeded': screenshot_probe(relay, root),
-                                   'supervisor_attached_automatically': True}
+                                   'supervisor_attached_automatically': True, 'restarted_without_manual_launch': True}
         # The legacy signature changes, so inherited-grant observations must
         # never be described as a compatible-signature or clean-machine proof.
         inherited = [key for key, granted in report['before']['permissions'].items() if granted]

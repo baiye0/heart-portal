@@ -97,6 +97,35 @@ def stop(root, service):
     manager.stop_checkout(root)
 
 
+def adopt_legacy(root, target, stage, exclude=()):
+    """Reuse the session guardian before replacing a running unsupervised release."""
+    pids = manager.checkout_pids(root, exclude=exclude)
+    if not pids:
+        return False  # An offline installation has no running session to resume.
+    if len(pids) != 1:
+        raise RuntimeError('Multiple Portal processes use this installation; cannot select launch settings.')
+    runtime = manager.process_identity(pids[0])
+    launch = manager.launch_snapshot(runtime)
+    support = root / '.portal-supervisor'
+    support.mkdir(mode=0o700, exist_ok=True)
+    support.chmod(0o700)
+    for name in ('portal-macos.py', 'portal-macos-supervisor.py'):
+        manager.private_write(support / name, (stage / name).read_bytes())
+    token = uuid.uuid4().hex
+    request = {'root': str(root), 'target': str(target), 'token': token,
+               'runtime_pid': pids[0], 'runtime': runtime, 'adopted': True,
+               'arguments': launch['arguments'], 'cwd': launch['cwd']}
+    # Start from the updater's inherited Terminal/app origin. Runtime credentials
+    # travel only through stdin/environment, never into transaction/support files.
+    result = subprocess.run([sys.executable, str(support / 'portal-macos-supervisor.py'), 'start'],
+                            input=json.dumps(request).encode(), env=launch['environment'],
+                            capture_output=True, timeout=45)
+    state = manager.supervisor_state(root)
+    if result.returncode or not state or state['token'] != token:
+        raise RuntimeError('Could not adopt the running Portal; inspect portal-supervisor.log. Binary was not replaced.')
+    return True
+
+
 def restart(root, domain, plist, mode, expected=None, nonce=None):
     if mode == 'launchagent':
         manager.launchctl('bootstrap', domain, str(plist))
@@ -222,6 +251,8 @@ def run(stage):
             shutil.copy2(target, stage / 'previous')
             with open(stage / 'previous', 'rb') as backup:
                 os.fsync(backup.fileno())
+            if mode == 'manual' and adopt_legacy(root, target, stage, exclude=(request['parent_pid'],)):
+                mode = 'supervisor'
         except Exception as error:
             status('failed', str(error))
             raise
