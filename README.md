@@ -70,14 +70,29 @@ errors. On Windows, omitting the workspace uses
 ./heart-portal --config portal.toml --connect "https://echo.beings.town/<being>/?token=<token>" --name "<machine-name>"
 ```
 
+The macOS release remains a directly runnable binary with the same command
+above. `python3 scripts/package-portal-macos.py` builds/signs that artifact locally.
+Notarization is postponed.
+See [macOS signing and upgrade validation](docs/macos-upgrade.md).
+
 ### macOS background recovery
 
-Build from the checkout with `cargo build --release --locked`, then install a
-per-user LaunchAgent (Python 3.9+ is required only for installation/management):
+Normal macOS startup automatically attaches a background supervisor while
+keeping the original foreground Portal and its Terminal/app permission origin.
+This also applies when an old `start.sh` starts the new binary after upgrading.
+Python 3.9+ is required. Crashes and `portal_restart` are recovered; Ctrl+C or
+`./heart-portal stop` stops supervision. `./heart-portal status` shows both PIDs.
+This covers the current login session. Login startup uses the existing entry:
 
 ```bash
 python3 scripts/portal-macos.py install --name "<original-machine-name>"
 ```
+
+For an already downloaded executable, the same management command supports
+`--root /path/to/installed-folder`; keep `portal.toml` there and name the binary
+`heart-portal` or retain its published filename. This preserves its path and
+signature. Direct foreground execution remains available and does not install
+a LaunchAgent automatically.
 
 The installer reuses `.portal-connection.url` if present, otherwise prompts for
 the Loom connection URL without echoing it. `PORTAL_CONNECT_LINK` is also
@@ -104,9 +119,9 @@ same user/relay/Being, including across checkouts and token rotations.
 ```bash
 python3 scripts/portal-macos.py status
 python3 scripts/portal-macos.py uninstall
-# To update the binary, uninstall first, then build and install again:
-cargo build --release --locked
-python3 scripts/portal-macos.py install
+# Upgrade a compatible signed installation through the coordinated worker:
+target/release/heart-portal upgrade
+target/release/heart-portal upgrade --status
 ```
 
 Uninstall stops this checkout's service and preserves its config, credentials,
@@ -179,6 +194,19 @@ Kits remain under the current user's `~/.heart-portal/kits` or configured
 `kits_dir`. Use `heart-portal --config portal.toml kit status` for
 pre-flight checks and the runtime logs for startup errors. `portal_kit_usage`
 counts successful calls since its last read; `{}` is not a kit inventory.
+
+For macOS, keep using the installed binary's `--upgrade` or `upgrade`; a
+pre-downloaded signed update can use `upgrade --file /path/to/new-portal`.
+Inspect `upgrade --status`. Active LaunchAgents are coordinated during replacement;
+The automatic session supervisor also pauses during replacement and restarts
+through the same permission origin. Existing `start.sh` and manual entries remain
+usable; starting the new version attaches supervision automatically. Normal
+upgrades validate the new release’s Developer ID signature and report whether
+the old identity is compatible, without blocking an identity change. Published v0.8.0
+rewrites itself to ad-hoc on startup, so its first migration must use the new
+binary's `upgrade --target /installed/heart-portal`;
+that identity change may require one-time authorization. Notarization is a separate release check, postponed during local
+validation. See [macOS upgrade details](docs/macos-upgrade.md).
 
 To upgrade a running Windows Portal to the latest GitHub release:
 

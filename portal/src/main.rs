@@ -14,6 +14,10 @@ mod protocol;
 mod relay_client;
 mod single_instance;
 mod upgrade;
+#[cfg(target_os = "macos")]
+mod macos_upgrade;
+#[cfg(target_os = "macos")]
+mod macos_supervisor;
 #[cfg(windows)]
 mod windows_upgrade;
 #[cfg(windows)]
@@ -66,18 +70,21 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Stop this Windows Portal and its supervisors until the next manual start
+    /// Stop this Windows/macOS Portal and its supervision
     Stop,
-    /// Show the running Windows Portal and supervisor status
+    /// Show the running Windows/macOS Portal and supervisor status
     Status,
     /// Check GitHub releases and upgrade to the latest version
     Upgrade {
-        /// Apply a pre-downloaded newer Windows exe through the same updater
+        /// Apply a pre-downloaded newer Windows/macOS binary through the same updater
         #[arg(long, conflicts_with = "status")]
         file: Option<PathBuf>,
-        /// Show the last Windows upgrade transaction without downloading
+        /// Show the last Windows/macOS upgrade transaction without downloading
         #[arg(long)]
         status: bool,
+        /// Migrate an existing macOS installation using this downloaded new executable
+        #[arg(long, conflicts_with_all = ["file", "status"])]
+        target: Option<PathBuf>,
     },
     /// Manage installed Portal kits
     Kit {
@@ -108,14 +115,27 @@ async fn main() -> Result<()> {
     if matches!(&command, Some(Commands::Upgrade { status: true, .. })) {
         #[cfg(windows)]
         return windows_upgrade::show_status();
-        #[cfg(not(windows))]
-        anyhow::bail!("Upgrade status is currently supported only on Windows");
+        #[cfg(target_os = "macos")]
+        return macos_upgrade::show_status();
+        #[cfg(not(any(windows, target_os = "macos")))]
+        anyhow::bail!("Upgrade status is supported on Windows and macOS");
     }
     if let Some(Commands::Upgrade { file: Some(path), .. }) = &command {
         #[cfg(windows)]
         return windows_upgrade::upgrade_file(path).await;
-        #[cfg(not(windows))]
-        anyhow::bail!("Local executable upgrades are currently supported only on Windows");
+        #[cfg(target_os = "macos")]
+        return macos_upgrade::handoff(&tokio::fs::read(path).await?, None).await;
+        #[cfg(not(any(windows, target_os = "macos")))]
+        anyhow::bail!("Local executable upgrades are supported on Windows and macOS");
+    }
+    if let Some(Commands::Upgrade { target: Some(path), .. }) = &command {
+        #[cfg(target_os = "macos")]
+        return macos_upgrade::migrate(path).await;
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = path;
+            anyhow::bail!("Installation migration is supported on macOS");
+        }
     }
     if cli.legacy_upgrade || matches!(&command, Some(Commands::Upgrade { .. })) {
         return upgrade::run_upgrade().await;
@@ -123,7 +143,9 @@ async fn main() -> Result<()> {
     if matches!(&command, Some(Commands::Stop | Commands::Status)) {
         #[cfg(windows)]
         return windows_start::run(if matches!(&command, Some(Commands::Stop)) { "stop" } else { "status" }, None, None, None).await;
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
+        return macos_supervisor::action(if matches!(&command, Some(Commands::Stop)) { "stop" } else { "status" }).await;
+        #[cfg(not(any(windows, target_os = "macos")))]
         anyhow::bail!("Use your OS service manager for start/stop/status on this platform");
     }
     #[cfg(windows)]
@@ -186,6 +208,8 @@ async fn main() -> Result<()> {
     if windows_upgrade::recover_interrupted()? { return Ok(()); }
     #[cfg(windows)]
     let startup_guard = windows_upgrade::startup_guard()?;
+    #[cfg(target_os = "macos")]
+    let startup_guard = macos_upgrade::startup_guard()?;
     let instance_identity = match connect_link.as_deref() {
         Some(link) => {
             let (host, being_id, _) = relay_client::parse_loom_link(link)?;
@@ -198,6 +222,9 @@ async fn main() -> Result<()> {
 
     config.prepare_workspace()?;
     info!("Workspace ready: {}", config.security.workspace_root.display());
+
+    #[cfg(target_os = "macos")]
+    macos_supervisor::start(&config_path, connect_link.as_deref(), cli_portal_name.as_deref()).await?;
 
     if config.portal_mcp_token.is_none() {
         warn!("PORTAL_MCP_TOKEN is not set — MCP TCP connections are unauthenticated (set token for public deployments)");
@@ -261,7 +288,7 @@ async fn main() -> Result<()> {
         }
 
         publish_supervisor_ready()?;
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         drop(startup_guard);
         let tool_shutdown = tool_host.clone();
         let restart_waiter = tool_host.clone();
@@ -270,6 +297,8 @@ async fn main() -> Result<()> {
                 let _ = tokio::signal::ctrl_c().await;
             } => {
                 info!("Portal shutting down (Ctrl+C)");
+                #[cfg(target_os = "macos")]
+                macos_supervisor::stop_on_interrupt();
                 tool_shutdown.kill_all_managed_processes().await;
             }
             _ = wait_sigterm() => {
@@ -293,7 +322,7 @@ async fn main() -> Result<()> {
     let listener = TcpListener::bind(&addr).await?;
     info!("Portal MCP listening on {}", addr);
     publish_supervisor_ready()?;
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     drop(startup_guard);
 
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
@@ -306,6 +335,8 @@ async fn main() -> Result<()> {
             tokio::select! {
                 r = tokio::signal::ctrl_c() => {
                     let _ = r;
+                    #[cfg(target_os = "macos")]
+                    macos_supervisor::stop_on_interrupt();
                 }
                 _ = wait_sigterm() => {}
                 _ = restart_waiter.wait_for_restart() => {
@@ -362,6 +393,8 @@ async fn main() -> Result<()> {
 fn publish_supervisor_ready() -> Result<()> {
     #[cfg(windows)]
     windows_upgrade::publish_ready()?;
+    #[cfg(target_os = "macos")]
+    macos_upgrade::publish_ready()?;
     Ok(())
 }
 

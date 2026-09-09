@@ -1,17 +1,17 @@
 //! Self-upgrade: check GitHub releases, download, backup, replace, restart.
 
 use std::cmp::Ordering;
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 use std::path::Path;
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 use std::path::PathBuf;
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 use std::process::Stdio;
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 use tracing::info;
 
 pub const PORTAL_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -78,7 +78,7 @@ pub fn compare_versions(a: &str, b: &str) -> Ordering {
     Ordering::Equal
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 fn install_dir() -> Result<PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
@@ -95,14 +95,14 @@ fn install_dir() -> Result<PathBuf> {
     bail!("Could not determine install directory (~/.heart-portal)")
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 fn dirs_home() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 fn binary_path(install_dir: &Path) -> PathBuf {
     install_dir.join("heart-portal")
 }
@@ -145,7 +145,7 @@ async fn fetch_latest_release(client: &reqwest::Client) -> Result<serde_json::Va
     Ok(body)
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 fn backup_stamp() -> String {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -153,7 +153,7 @@ fn backup_stamp() -> String {
         .unwrap_or_else(|_| "unknown".to_string())
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 fn stop_running_portal(install_dir: &Path) {
     #[cfg(unix)]
     {
@@ -179,27 +179,7 @@ fn stop_running_portal(install_dir: &Path) {
     }
 }
 
-#[cfg(target_os = "macos")]
-pub fn unlock_gatekeeper(path: &Path) {
-    // Remove ALL extended attributes — including com.apple.provenance
-    // which macOS adds to files transferred via scp/AirDrop/download.
-    // Without this, macOS sends SIGKILL (-9) on exec.
-    let _ = std::process::Command::new("xattr")
-        .args(["-cr", &path.to_string_lossy()])
-        .status();
-
-    // Ad-hoc re-sign: the linker signature from the build machine may be
-    // invalidated by transfer.  A fresh ad-hoc signature lets Gatekeeper
-    // and the hardened-runtime check pass without a Developer ID.
-    let _ = std::process::Command::new("codesign")
-        .args(["-s", "-", "--force", "--deep", &path.to_string_lossy()])
-        .status();
-}
-
-#[cfg(not(any(target_os = "macos", windows)))]
-pub fn unlock_gatekeeper(_path: &Path) {}
-
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 fn restart_portal(install_dir: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -233,6 +213,8 @@ pub async fn run_upgrade() -> Result<()> {
     let platform = detect_platform()?;
     #[cfg(windows)]
     crate::windows_upgrade::installation_root(&std::env::current_exe()?)?;
+    #[cfg(target_os = "macos")]
+    crate::macos_upgrade::installation_root(&std::env::current_exe()?)?;
     let current_version = PORTAL_VERSION.to_string();
 
     let client = reqwest::Client::builder()
@@ -294,8 +276,10 @@ pub async fn run_upgrade() -> Result<()> {
 
     #[cfg(windows)]
     return crate::windows_upgrade::handoff(&bytes, latest_version).await;
+    #[cfg(target_os = "macos")]
+    return crate::macos_upgrade::handoff(&bytes, Some(latest_version)).await;
 
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let install_dir = install_dir()?;
         std::fs::create_dir_all(&install_dir)
@@ -346,7 +330,6 @@ pub async fn run_upgrade() -> Result<()> {
             }
         })?;
 
-        unlock_gatekeeper(&target);
         eprintln!("Done — upgraded to {}", latest_version);
         restart_portal(&install_dir)
     }

@@ -6,6 +6,8 @@ mod file;
 mod oauth;
 mod process;
 mod screenshot;
+#[cfg(target_os = "macos")]
+mod permissions;
 mod search;
 mod web;
 mod web_search;
@@ -72,7 +74,12 @@ impl ToolHost {
             restart_notify: Arc::new(tokio::sync::Notify::new()),
             restart_supported: std::env::var("HEART_PORTAL_SUPERVISED")
                 .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-                .unwrap_or(false),
+                .unwrap_or(false) || {
+                    #[cfg(target_os = "macos")]
+                    { crate::macos_supervisor::attached() }
+                    #[cfg(not(target_os = "macos"))]
+                    { false }
+                },
         }
     }
 
@@ -426,6 +433,13 @@ impl ToolHost {
             }),
         });
 
+        #[cfg(target_os = "macos")]
+        tools.push(ToolInfo {
+            name: "portal_permissions".to_string(),
+            description: "Check this running Portal process's macOS screen recording, accessibility and input monitoring permissions without prompting or changing grants. Use before and after an upgrade; kit permissions are separate.".to_string(),
+            input_schema: serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false}),
+        });
+
         // Always include tools_reload
         tools.push(ToolInfo {
             name: "portal_tools_reload".to_string(),
@@ -508,6 +522,8 @@ impl ToolHost {
             "portal_oauth_authorize" => oauth::authorize(arguments).await,
             "portal_tools_reload" => self.handle_tools_reload().await,
             "portal_restart" => self.handle_restart().await,
+            #[cfg(target_os = "macos")]
+            "portal_permissions" => Ok(permissions::status()),
             "portal_kit_usage" => {
                 let counts = self.kits.drain_usage_counts().await;
                 let text = serde_json::to_string(&counts)?;

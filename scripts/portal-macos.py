@@ -2,8 +2,11 @@
 """Install/manage the current user's Portal LaunchAgent (Python 3.9+, no packages)."""
 import argparse
 import ctypes
+import fcntl
+from contextlib import contextmanager
 import getpass
 import hashlib
+import json
 import os
 from pathlib import Path
 import plistlib
@@ -14,6 +17,43 @@ import sys
 import tempfile
 import time
 from urllib.parse import parse_qs, urlsplit
+
+LIFECYCLE_PROTOCOL = 2
+
+
+def binary_path(root):
+    record = root / '.portal-executable'
+    if record.is_file():
+        path = Path(record.read_text().strip()).resolve()
+        allowed = [root / 'target/release/heart-portal'] + [root / name for name in
+                   ('heart-portal', 'heart-portal-macos-arm64', 'heart-portal-macos-x86_64')]
+        if path not in allowed:
+            raise RuntimeError('Saved Portal executable is outside this installation.')
+        return path
+    checkout = root / 'target/release/heart-portal'
+    if checkout.is_file():
+        return checkout
+    binaries = [root / name for name in ('heart-portal', 'heart-portal-macos-arm64', 'heart-portal-macos-x86_64')
+                if (root / name).is_file()]
+    if len(binaries) > 1:
+        raise RuntimeError('Keep only one Portal release executable in this installation directory.')
+    return binaries[0] if binaries else checkout
+
+
+@contextmanager
+def maintenance_lock(root, timeout=0):
+    # Kernel-owned lock: automatically released if management/updater crashes.
+    with open(root / '.portal-upgrade.lock', 'a+b') as lock:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline or (root / '.portal-upgrade.json').exists():
+                    raise RuntimeError('Portal maintenance/upgrade is in progress; retry after it completes.')
+                time.sleep(.05)
+        yield
 
 
 def saved(root, name):
@@ -27,6 +67,8 @@ def private_write(path, content):
     try:
         with os.fdopen(fd, 'wb') as stream:
             stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
         os.replace(temporary, path)
     finally:
         if os.path.exists(temporary):
@@ -99,18 +141,52 @@ def executable_path(pid):
     return None
 
 
-def checkout_pids(root):
+def process_identity(pid):
+    executable = executable_path(pid)
+    if not executable:
+        return None
+    started = subprocess.run(['/bin/ps', '-p', str(pid), '-o', 'lstart='],
+                             env=dict(os.environ, TZ='UTC', LC_ALL='C'),
+                             capture_output=True, text=True).stdout.strip()
+    return {'pid': pid, 'executable': str(executable), 'started': started} if started else None
+
+
+def identity_alive(identity):
+    return bool(identity and process_identity(identity['pid']) == identity)
+
+
+def supervisor_state(root):
+    try:
+        state = json.loads((root / '.portal-supervisor.json').read_text())
+        return state if state.get('protocol') == 1 and identity_alive(state.get('owner')) else None
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def stop_supervisor(root):
+    state = supervisor_state(root)
+    if not state:
+        return
+    private_write(root / '.portal-supervisor-stop', state['token'].encode())
+    deadline = time.monotonic() + 10
+    while identity_alive(state['owner']):
+        if time.monotonic() >= deadline:
+            raise RuntimeError('Portal supervisor did not stop; refusing to race it.')
+        time.sleep(.1)
+
+
+def checkout_pids(root, exclude=()):
     # Never match substrings of command lines or kill another checkout's Portal.
-    binary = (root / 'target/release/heart-portal').resolve()
+    binary = binary_path(root).resolve()
     rows = subprocess.check_output(['/bin/ps', '-axo', 'pid=,uid='], text=True)
     return [int(pid) for pid, uid in (row.split() for row in rows.splitlines())
-            if int(uid) == os.getuid() and int(pid) != os.getpid()
+            if int(uid) == os.getuid() and int(pid) != os.getpid() and int(pid) not in exclude
             and executable_path(int(pid)) == binary]
 
 
-def stop_checkout(root):
-    binary = (root / 'target/release/heart-portal').resolve()
-    pids = checkout_pids(root)
+def stop_checkout(root, exclude=()):
+    binary = binary_path(root).resolve()
+    pids = checkout_pids(root, exclude)
     for pid in pids:
         try:
             if executable_path(pid) == binary:
@@ -129,7 +205,7 @@ def stop_checkout(root):
         except ProcessLookupError:
             pass
     deadline = time.monotonic() + 5
-    while checkout_pids(root):
+    while checkout_pids(root, exclude):
         if time.monotonic() >= deadline:
             raise RuntimeError('Previous Portal did not stop; refusing to start a duplicate.')
         time.sleep(0.1)
@@ -143,21 +219,30 @@ def restore_manual(root):
     link = saved(root, '.portal-connection.url')
     if link:
         env['PORTAL_CONNECT_LINK'] = link
-    command = [str(root / 'target/release/heart-portal'), '--config', str(root / 'portal.toml')]
+    command = [str(binary_path(root)), '--config', str(root / 'portal.toml')]
     name = saved(root, '.portal-name')
     if name:
         command += ['--name', name]
     with open(root / 'portal-runtime.log', 'ab') as out, open(root / 'portal-runtime.err.log', 'ab') as err:
-        subprocess.Popen(command, cwd=root, env=env, stdin=subprocess.DEVNULL,
+        # Installation still owns the maintenance lock while unwinding a failed
+        # bootstrap. Wait outside the manager before exec, otherwise the restored
+        # direct Portal can race that lock and reject its own recovery launch.
+        waiter = ("import fcntl, os, sys; "
+                  "gate = open(sys.argv[1], 'a+b'); "
+                  "fcntl.flock(gate, fcntl.LOCK_SH); gate.close(); "
+                  "os.execv(sys.argv[2], sys.argv[2:])")
+        return subprocess.Popen([sys.executable, '-c', waiter, str(root / '.portal-upgrade.lock'), *command],
+                         cwd=root, env=env, stdin=subprocess.DEVNULL,
                          stdout=out, stderr=err, start_new_session=True)
 
 
 def install(args, root, path, label, domain, service):
-    binary = root / 'target/release/heart-portal'
+    binary = binary_path(root)
     if not binary.is_file() or not os.access(binary, os.X_OK):
         raise RuntimeError('Build first: cargo build --release --locked')
-    if not (root / 'scripts/portal-launchagent.sh').is_file():
-        raise RuntimeError('Missing scripts/portal-launchagent.sh')
+    support = Path(__file__).resolve().parent
+    if not (support / 'portal-launchagent.sh').is_file():
+        raise RuntimeError('Missing scripts/portal-launchagent.sh next to the management script')
     link = args.connect_link or os.environ.get('PORTAL_CONNECT_LINK') or saved(root, '.portal-connection.url')
     if not link and sys.stdin.isatty():
         link = getpass.getpass('Loom connection URL (hidden): ')
@@ -184,6 +269,8 @@ def install(args, root, path, label, domain, service):
         root / '.portal-connection.url': (link.strip() + '\n').encode(),
         root / '.portal-name': (name + '\n').encode(),
         root / '.portal-launchagent-label': (label + '\n').encode(),
+        root / '.portal-python': os.fsencode(Path(sys.executable).resolve()),
+        root / '.portal-executable': os.fsencode(binary.resolve()),
         path: plistlib.dumps(definition(root, label)),
     }
     backups = {file: file.read_bytes() if file.exists() else None for file in updates}
@@ -193,7 +280,16 @@ def install(args, root, path, label, domain, service):
         launchctl('bootout', service)
     bootstrapped = False
     try:
+        stop_supervisor(root)
         stop_checkout(root)
+        # The existing management entry also supports a downloaded raw binary.
+        # Extract no installer: persist only the same lifecycle helper/launcher.
+        (root / 'scripts').mkdir(exist_ok=True)
+        for name in ('portal-macos.py', 'portal-launchagent.sh'):
+            source = support / name
+            destination = root / 'scripts' / name
+            if source.resolve() != destination.resolve():
+                private_write(destination, source.read_bytes())
         for file, data in updates.items():
             private_write(file, data)
         launchctl('enable', service)
@@ -237,6 +333,15 @@ def main():
     domain = f'gui/{os.getuid()}'
     service = f'{domain}/{label}'
     assert_owned(path, root, label)
+    if args.action == 'status':
+        return manage(args, root, path, label, domain, service)
+    with maintenance_lock(root):
+        if (root / '.portal-upgrade.json').exists():
+            raise RuntimeError('An interrupted upgrade needs worker recovery before maintenance.')
+        return manage(args, root, path, label, domain, service)
+
+
+def manage(args, root, path, label, domain, service):
     if args.action == 'install':
         install(args, root, path, label, domain, service)
     elif args.action == 'uninstall':
@@ -245,6 +350,7 @@ def main():
             raise RuntimeError('Loaded service has no owned plist; refusing to remove it.')
         if loaded:
             launchctl('bootout', service)
+        stop_supervisor(root)
         stop_checkout(root)
         path.unlink(missing_ok=True)
         print(f'Removed {label}; local config, credentials and name are preserved.')

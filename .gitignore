@@ -28,3 +28,12 @@ portal-runtime.err.log.previous
 portal-launchagent.log
 portal-launchagent.err.log
 /workspace/
+
+.portal-launch-nonce
+.portal-ready.*.tmp
+
+.portal-python
+.portal-supervisor/
+.portal-supervisor*.json
+.portal-supervisor-stop
+portal-supervisor.log
