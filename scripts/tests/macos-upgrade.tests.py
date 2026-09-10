@@ -157,6 +157,7 @@ spec.loader.exec_module(worker)
             **({'parent_executable': str(manager.executable_path(parent.pid))} if parent else {})})
         manager.private_write(plist, plistlib.dumps({'Label': label,
             'ProgramArguments': [sys.executable, str(wrapper)], 'RunAtLoad': True,
+            'EnvironmentVariables': {'HOME': str(Path.home())},
             'KeepAlive': {'SuccessfulExit': False}, 'ThrottleInterval': 2,
             'AbandonProcessGroup': True,
             'StandardOutPath': str(stage / 'worker.log'), 'StandardErrorPath': str(stage / 'worker.log')}))

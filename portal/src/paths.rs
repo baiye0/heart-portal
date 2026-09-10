@@ -106,7 +106,7 @@ pub fn legacy_dirs() -> Result<Vec<PathBuf>> {
     let exe = std::env::current_exe()?;
     #[cfg(any(windows, target_os = "macos"))]
     if crate::user_installation::is_managed(&exe)? {
-        return Ok(vec![exe.parent().context("Executable has no parent")?.to_path_buf()]);
+        return Ok(vec![crate::user_installation::legacy_root(&exe)?]);
     }
     #[cfg(any(windows, target_os = "macos"))]
     if crate::user_installation::migrated_source(&exe)? {

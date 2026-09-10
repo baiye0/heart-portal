@@ -257,9 +257,12 @@ if plist.exists():
 
 pub fn delegate(target: &Path, cli: &crate::Cli) -> Result<()> {
     let mut command = std::process::Command::new(target);
-    // Resolve user paths before switching to the durable working directory.
-    // Removing the original download folder must not break guardian restarts.
-    if let Some(config) = cli.config.as_deref().or(cli.config_positional.as_deref()) {
+    let explicit_config = cli.config.as_deref().or(cli.config_positional.as_deref());
+    // Explicit configs retain their caller's working directory: legacy relative
+    // kit paths are resolved there, and these configs are not migrated/frozen.
+    // Default configs have frozen paths after migration, so their restarts can
+    // use the durable runtime even after the download directory is removed.
+    if let Some(config) = explicit_config {
         command
             .arg("--config")
             .arg(std::path::absolute(crate::paths::expand_home(Path::new(
@@ -302,7 +305,9 @@ pub fn delegate(target: &Path, cli: &crate::Cli) -> Result<()> {
         None => {}
         _ => anyhow::bail!("Only lifecycle commands delegate to the installed Portal"),
     }
-    command.current_dir(root()?);
+    if explicit_config.is_none() {
+        command.current_dir(root()?);
+    }
     #[cfg(target_os = "macos")]
     {
         use std::os::unix::process::CommandExt;

@@ -180,7 +180,7 @@ async fn main() -> Result<()> {
         let explicit_config = cli.config.as_deref().or(cli.config_positional.as_deref());
         if cli.install_user_runtime {
             let target = user_installation::prepare(&source, explicit_config)?;
-            println!("{}", serde_json::json!({"root": target.parent(), "executable": target}));
+            println!("{}", serde_json::json!({"root": user_installation::legacy_root(&target)?, "executable": target}));
             return Ok(());
         }
         let lifecycle = cli.command.is_none() || cli.legacy_upgrade || matches!(

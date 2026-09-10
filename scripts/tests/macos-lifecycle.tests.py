@@ -41,7 +41,7 @@ class LifecycleTests(unittest.TestCase):
     def setUp(self):
         profile = tempfile.TemporaryDirectory(prefix='portal lifecycle home ')
         self.addCleanup(profile.cleanup)
-        home_patch = patch.dict(os.environ, HOME=profile.name)
+        home_patch = patch.dict(os.environ, HOME=str(Path(profile.name).resolve()))
         home_patch.start()
         self.addCleanup(home_patch.stop)
 
@@ -89,6 +89,9 @@ class LifecycleTests(unittest.TestCase):
             (root / 'target/release').mkdir(parents=True)
             shutil.copy2(REPO / 'scripts/portal-launchagent.sh', root / 'scripts')
             shutil.copy2(binary, root / 'target/release/heart-portal')
+            installed = json.loads(subprocess.check_output(
+                [str(root / 'target/release/heart-portal'), '--install-user-runtime'], text=True))
+            self.assertEqual(Path(installed['root']), root)
             # Existing configs remain usable, but must not start the retired
             # HTTP server alongside the relay/MCP connection.
             with socket.socket() as unused_http:
@@ -97,6 +100,9 @@ class LifecycleTests(unittest.TestCase):
             (root / 'portal.toml').write_text(
                 'name = "fixture"\nworkspace = "./workspace"\nbind = "127.0.0.1:0"\n'
                 f'kits_enabled = false\n[cowork]\nenabled = true\nhttp_port = {retired_http_port}\n')
+            location = json.loads(subprocess.check_output(
+                [str(root / 'target/release/heart-portal'), 'config', 'path'], text=True))
+            self.assertEqual(Path(location['config']['path']), root / 'portal.toml')
             relay.bind(('127.0.0.1', 0))
             relay.listen()
             relay.settimeout(25)
@@ -163,6 +169,10 @@ class LifecycleTests(unittest.TestCase):
                     with self.assertRaises(ConnectionRefusedError):
                         socket.create_connection(('127.0.0.1', retired_http_port), timeout=2)
                     pid = manager.checkout_pids(root)[0]
+                    status = json.loads(subprocess.check_output(
+                        [str(root / 'target/release/heart-portal'), 'status'], text=True))
+                    self.assertTrue(status['launchagent_loaded'])
+                    self.assertEqual(status['portal_pids'], [pid])
                     # A rotated token cannot create a competing process for this identity.
                     env = dict(os.environ, PORTAL_CONNECT_LINK=link.replace('fake-token', 'rotated-token'))
                     duplicate = subprocess.run([str(root / 'target/release/heart-portal'), '--config', str(root / 'portal.toml')], env=env, capture_output=True, timeout=10)
@@ -184,13 +194,72 @@ class LifecycleTests(unittest.TestCase):
                     self.assertEqual(receive(stream), first_handshake, 'restart preserves relay identity')
                     send(stream, {'ok': True})
                     self.assertNotEqual(manager.checkout_pids(root)[0], pid)
-                    subprocess.run(installer + ['uninstall', '--root', str(root)], check=True, capture_output=True)
+                    subprocess.run([str(root / 'target/release/heart-portal'), 'stop'],
+                                   check=True, capture_output=True, timeout=25)
                 self.assertIn('termination signal', (root / 'portal-runtime.log').read_text())
                 self.assertFalse(manager.checkout_pids(root))
+                time.sleep(6)  # Beyond launchd's throttle: stop must prevent respawn.
+                status = json.loads(subprocess.check_output(
+                    [str(root / 'target/release/heart-portal'), 'status'], text=True))
+                self.assertFalse(status['launchagent_loaded'])
+                self.assertEqual(status['portal_pids'], [])
             finally:
                 manager.launchctl('bootout', service, check=False)
                 manager.stop_checkout(root)
                 plist.unlink(missing_ok=True)
+
+    def test_explicit_relative_kits_survive_delegation_and_guardian_restart(self):
+        for positional in (False, True):
+            with self.subTest(positional=positional), tempfile.TemporaryDirectory() as temporary:
+                folder = Path(temporary).resolve()
+                download, config_dir = folder / 'download', folder / 'config'
+                download.mkdir()
+                config_dir.mkdir()
+                kit = download / 'kits/sample'
+                kit.mkdir(parents=True)
+                (kit / 'manifest.json').write_text(json.dumps({
+                    'name': 'sample', 'version': '1', 'command': ['/usr/bin/true'],
+                    'tools': [{'name': 'ping', 'description': 'fixture', 'params': {'type': 'object'}}]}))
+                binary = download / 'heart-portal'
+                shutil.copy2(BINARY, binary)
+                with socket.socket() as listener:
+                    listener.bind(('127.0.0.1', 0))
+                    port = listener.getsockname()[1]
+                config = config_dir / 'portal.toml'
+                config_text = f'name="relative-fixture"\nbind="127.0.0.1:{port}"\nworkspace="./workspace"\nkits_dir="./kits"\n'
+                config.write_text(config_text)
+                env = {k: v for k, v in os.environ.items()
+                       if not k.startswith(('HEART_PORTAL_', 'PORTAL_'))}
+                arguments = [str(config)] if positional else ['--config', str(config)]
+                root = Path.home() / '.heart-portal/runtime'
+
+                def status():
+                    try:
+                        with socket.create_connection(('127.0.0.1', port), timeout=2) as client, client.makefile('rb') as stream:
+                            client.sendall((json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+                                'params': {'name': 'portal_status', 'arguments': {}}}) + '\n').encode())
+                            return json.loads(json.loads(stream.readline())['result']['content'][0]['text'])
+                    except (OSError, ValueError):
+                        return None
+
+                with (folder / 'test.log').open('w') as log:
+                    process = subprocess.Popen([str(binary)] + arguments, env=env, cwd=download,
+                                               stdout=log, stderr=log)
+                    try:
+                        before = wait_for(status, 'delegated Portal')
+                        self.assertEqual(before['kits']['loaded'], 1)
+                        self.assertEqual(Path(before['config']['kits_directory']), download / 'kits')
+                        wait_for(lambda: manager.supervisor_state(root), 'session guardian')
+                        process.kill()
+                        process.wait(timeout=10)
+                        after = wait_for(status, 'guardian restart')
+                        self.assertEqual(after['kits']['loaded'], 1)
+                        self.assertEqual(after['config']['kits_directory'], before['config']['kits_directory'])
+                        self.assertEqual(config.read_text(), config_text)
+                    finally:
+                        subprocess.run([str(root / 'heart-portal'), 'stop'], env=env,
+                                       capture_output=True, timeout=25)
+                        process.wait(timeout=15)
 
     def test_validation_and_ownership(self):
         for link in ('', 'https://relay.invalid/being/', 'file:///being/?token=x',

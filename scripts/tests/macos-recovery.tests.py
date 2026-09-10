@@ -36,8 +36,8 @@ class SessionRecoveryTests(unittest.TestCase):
         self.target = self.root / 'heart-portal'
         shutil.copy2(BINARY, self.target)
         version = subprocess.check_output([str(BINARY), '--version'], text=True).strip().split()[1]
-        major, minor, patch = map(int, version.split('.'))
-        self.candidate_version = f'{major}.{minor}.{patch + 1}'
+        major, minor, patch_version = map(int, version.split('.'))
+        self.candidate_version = f'{major}.{minor}.{patch_version + 1}'
         self.config = self.root / 'custom.toml'
         with socket.socket() as listener:
             listener.bind(('127.0.0.1', 0))
