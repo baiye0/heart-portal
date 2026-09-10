@@ -172,7 +172,7 @@ pub fn recover_interrupted() -> Result<bool> {
         Err(error) if matches!(error.raw_os_error(), Some(32 | 33)) => return Ok(false),
         Err(error) => return Err(error).context("Checking interrupted upgrade"),
     };
-    let journal: serde_json::Value = serde_json::from_slice(&std::fs::read(&journal_path)?)?;
+    let journal: serde_json::Value = serde_json::from_slice(&crate::bounded_file::metadata_bytes(&journal_path)?)?;
     let worker = PathBuf::from(
         journal["recovery_script"]
             .as_str()
@@ -309,7 +309,7 @@ pub fn show_status() -> Result<()> {
         println!("No upgrade has been recorded for {}", root.display());
         return Ok(());
     }
-    let status: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+    let status: serde_json::Value = serde_json::from_slice(&crate::bounded_file::metadata_bytes(&path)?)?;
     println!("{}", serde_json::to_string_pretty(&status)?);
     if matches!(
         status["state"].as_str(),
@@ -380,7 +380,7 @@ pub async fn handoff(bytes: &[u8], version: &str) -> Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
         if error.exists() {
-            let body: serde_json::Value = serde_json::from_slice(&std::fs::read(&error)?)?;
+            let body: serde_json::Value = serde_json::from_slice(&crate::bounded_file::metadata_bytes(&error)?)?;
             bail!(
                 "Upgrade rejected: {}",
                 body["message"].as_str().unwrap_or("unknown error")

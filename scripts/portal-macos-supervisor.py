@@ -20,7 +20,7 @@ spec.loader.exec_module(manager)
 
 def read(path):
     try:
-        return json.loads(path.read_text())
+        return json.loads(manager.metadata_text(path))
     except (OSError, ValueError):
         return {}
 
@@ -154,7 +154,10 @@ def watch(request):
 
 
 def main():
-    request = json.load(sys.stdin)
+    payload = sys.stdin.buffer.read(manager.METADATA_LIMIT + 1)
+    if len(payload) > manager.METADATA_LIMIT:
+        raise ValueError('Supervisor request exceeds 1 MiB.')
+    request = json.loads(payload)
     root = Path(request['root'])
     action = sys.argv[1]
     if action == 'watch':
@@ -192,6 +195,10 @@ def main():
             plist = Path.home() / 'Library/LaunchAgents' / (label + '.plist')
             manager.assert_owned(plist, root, label)
             service = f'gui/{os.getuid()}/{label}'
+            if plist.exists() and not root.is_relative_to((Path.home() / '.heart-portal').resolve()):
+                # A stopped legacy registration must not revive next login
+                # after the new user installation takes over.
+                manager.launchctl('disable', service)
             if manager.launchctl('print', service, check=False).returncode == 0:
                 if not plist.exists():
                     raise RuntimeError('Loaded service has no owned plist; refusing to stop it.')

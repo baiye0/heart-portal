@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 sys.dont_write_bytecode = True
 REPO = Path(__file__).resolve().parents[2]
@@ -25,7 +26,12 @@ BINARY = Path(os.environ.get('PORTAL_TEST_BINARY', REPO / 'target/debug/heart-po
 class SupervisorTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='portal auto guardian 中文 ')
-        self.root = Path(self.temp.name).resolve()
+        profile = Path(self.temp.name).resolve()
+        self.home_patch = patch.dict(os.environ, HOME=str(profile))
+        self.home_patch.start()
+        self.addCleanup(self.home_patch.stop)
+        self.root = profile / '.heart-portal/runtime'
+        self.root.mkdir(parents=True)
         self.target = self.root / 'heart-portal'
         shutil.copy2(BINARY, self.target)
         self.config = self.root / 'custom-config.toml'
@@ -121,24 +127,30 @@ class SlowKitTests(unittest.TestCase):
                     'name': f'slow{n}', 'version': '1.0.0', 'eager': True,
                     'command': [sys.executable, str(script)],
                     'tools': [{'name': 'test', 'description': 'slow fixture', 'params': {'type': 'object'}}]}))
-            config = root / 'portal.toml'
+            profile = root / 'profile'
+            config = profile / '.heart-portal/portal.toml'
+            config.parent.mkdir(parents=True)
             config.write_text('workspace = "./workspace"\nbind = "127.0.0.1:0"\n'
                               f'kits_dir = {json.dumps(str(kits))}\n')
             with open(root / 'runtime.log', 'wb') as log:
-                process = subprocess.Popen([str(target), '--config', str(config)], cwd=root, stdout=log, stderr=log)
+                process = subprocess.Popen([str(target)], cwd=root, stdout=log, stderr=log,
+                                           env=dict(os.environ, HOME=str(profile)))
+                runtime = profile / '.heart-portal/runtime'
                 try:
                     # Exercise the actual upgrade readiness predicate while
                     # four non-fatal 10-second kit timeouts are still pending.
-                    nonce = e2e.wait_for(lambda: manager.saved(root, '.portal-launch-nonce'), timeout=8)
+                    nonce = e2e.wait_for(lambda: manager.saved(runtime, '.portal-launch-nonce'), timeout=8)
                     version = subprocess.check_output([str(target), '--version'], text=True).strip().split()[1]
-                    e2e.worker.wait_ready(root, version, nonce, timeout=8)
+                    e2e.worker.wait_ready(runtime, version, nonce, timeout=8)
                     self.assertEqual(process.poll(), None)
+                    self.assertFalse((root / 'portal.toml').exists(), 'config must stay in the user directory')
                     e2e.wait_for(lambda: len(list(kits.glob('*/server.started'))) == 4, timeout=40)
                     self.assertIsNone(process.poll())
-                    self.assertEqual(manager.checkout_pids(root), [process.pid])
+                    self.assertEqual(manager.checkout_pids(runtime), [process.pid])
+                    self.assertFalse(list(root.glob('.portal-*')), 'download directory must stay clean')
                 finally:
-                    manager.stop_supervisor(root)
-                    manager.stop_checkout(root)
+                    manager.stop_supervisor(runtime)
+                    manager.stop_checkout(runtime)
                     process.wait(timeout=15)
                     for marker in kits.glob('*/server.started'):
                         pid = int(marker.read_text())

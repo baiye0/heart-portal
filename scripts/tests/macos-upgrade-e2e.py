@@ -152,6 +152,9 @@ def main():
     require(not root.exists() or (root / '.portal-e2e-owned').is_file(), 'Refusing to modify a directory not owned by this E2E test.')
     root.mkdir(parents=True, exist_ok=True)
     (root / '.portal-e2e-owned').touch()
+    os.environ['HOME'] = str(root)
+    root = root / '.heart-portal/runtime'
+    root.mkdir(parents=True, exist_ok=True)
     label = manager.label_for(root)
     service = f'gui/{os.getuid()}/{label}'
     plist = Path.home() / 'Library/LaunchAgents' / f'{label}.plist'

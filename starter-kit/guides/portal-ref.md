@@ -2,6 +2,7 @@
 
 | Tool | Parameters | Returns | Example |
 |------|------------|---------|---------|
+| `portal_status` | (none) | Running version/build ID, effective configuration, live connection state and loaded kit summary; no credential values | `{}` |
 | `portal_exec` | `command`, optional `shell`, `workdir`, `timeout_secs`, `background` | Shell output or background session info | `{"command": "uname -a"}` |
 | `portal_process` | `action` (`list` \| `poll` \| `log` \| `write` \| `kill`), optional `session_id`, `timeout_ms`, `offset`, `limit`, `data` | Session/output bytes | `{"action": "list"}` |
 | `portal_file_read` | `path` | File text | `{"path": "notes.txt"}` |
@@ -11,8 +12,41 @@
 | `portal_search` | `pattern`, optional `path`, `max_matches` | Ripgrep-style matches | `{"pattern": "TODO"}` |
 | `portal_web_fetch` | `url`, optional `max_chars` | Fetched body (truncated) | `{"url": "https://example.com"}` |
 | `portal_web_search` | `query`, optional `count` (default 5, max 10) | JSON array of `{title, url, snippet}` | `{"query": "rust async book", "count": 5}` |
-| `portal_tools_reload` | (none) | Reload status for custom tools | `{}` |
+| `portal_tools_reload` | (none) | Reload custom tools | `{}` |
+| `portal_kits_status` | (none; kits enabled) | Kit status, credential variable names and configured flags; no values | `{}` |
+| `portal_kits_setup` | `kit` | Runtime, dependencies, setup instructions and auth alternatives; no local credential values | `{"kit":"jira"}` |
+| `portal_kits_reload` | optional `kit` | Reload kit code, manifests and credentials; return configuration status | `{"kit":"jira"}` |
 | `portal_restart` | (none; supervised Portal only) | Restart acknowledgement, then supervisor relaunches Portal | `{}` |
+
+## Inspect this running Portal
+
+Call `portal_status` with `{}` first when diagnosing versions, configuration paths
+or kit installation. It is always available and does not run commands, reload
+configuration or start kits. The JSON result is in `content[0].text`.
+
+`portal.version` is the package version; `portal.build_id` is the executable's
+SHA-256 captured at startup, so two local builds named `0.8.1` can be distinguished.
+`config` describes the configuration already loaded by this process, including
+the selected path, resolved workspace/kits paths and the need to restart after
+changing `portal.toml`. `connection.state` comes from the running transport.
+
+Check `capabilities` for this build's reload behavior and `config.warnings` for
+ignored settings. `portal_tools_reload` affects only custom tools;
+`portal_kits_reload` reports added, reloaded, removed and retained-invalid kits.
+
+After reload, `not-started` is expected until the next call, even for an eager
+kit. Check kit `process_id`, `diagnostics.generation` and `last_call.outcome`.
+A `tool-error` with a healthy process means MCP delivered an error result;
+inspect that result to distinguish arguments, authentication and service errors.
+Portal does not infer that a server is broken or a token corrupt from HTTP 500
+or from token encoding. Never kill Portal to apply kit changes: that interrupts
+the Being's connection. Controlled restart is for Portal updates/config changes.
+
+`kits` summarizes loaded manifests without refreshing them. For missing kit
+credentials, use `portal_kits_setup`; after installation or credential changes,
+use `portal_kits_reload` or wait for the five-second scan. Configured credentials
+do not prove Jira or another service has granted access. Tokens, Loom links,
+environment values and credential file contents are omitted.
 
 ## Shell commands on Windows
 
@@ -66,6 +100,14 @@ For binary files, use `encoding: "base64"`; `unescape` does not affect base64.
 
 ## Environment and service troubleshooting
 
+New installations use `~/.heart-portal/portal.toml`. Existing explicit configs,
+saved launch paths and portable `portal.toml` files remain supported. Inspect
+`heart-portal config path` before editing; do not assume the working directory
+or exe directory contains the active config. `config migrate --from <path>`
+previews a copy into the user directory; `--profile <name>` separates multiple
+Portals, and `--apply` writes the copy without restarting or changing the source.
+Activate the returned path with `--config` at the next controlled restart.
+
 Windows defaults to `%USERPROFILE%\.heart-portal\workspace` when no workspace
 is configured (or `./workspace` if the profile is unavailable). Set the intended
 directory explicitly in `portal.toml`, using a TOML literal string for backslashes:
@@ -98,6 +140,26 @@ with `portal_process` rather than launching the same command again.
 - WSL needs a working local installation/distribution; Portal does not install it.
 - `heart-portal --config portal.toml kit status` inspects installed kits. An empty
   kits directory is a deployment state; `portal_kit_usage` is not an inventory.
-- Under supervision, use `portal_restart` after kit updates. Start only one
-  Portal per relay/Being on a machine; Windows/macOS instance guards prevent
-  competing connections.
+- After installing or updating a kit, call `portal_kits_reload` to apply it
+  immediately, then inspect `portal_kits_status`. Portal also scans installations,
+  removals, manifests and `.env` every five seconds. Code-only changes require
+  explicit reload or a manifest version change. Portal stays running.
+- Store kit credentials in that kit's `.env`. Portal checks required
+  `provision.env` entries and reports `needs-configuration` for missing values.
+  Installing a kit does not grant access to Jira or another service: the user
+  supplies authorized credentials, and the kit/service checks their permissions.
+- Start only one Portal per relay/Being on a machine; Windows/macOS instance
+  guards prevent competing connections.
+
+### Adjust a kit without managing the Portal host
+
+Use `portal_kits_reload {"kit":"<name>"}` after editing that kit. It changes
+only the selected kit and starts its new code on the next call. Status/setup
+queries are read-only. Do not restart or kill Portal to install or adjust kits.
+An MCP failure, capacity error or service authorization error should be handled
+within that kit; use `portal_status` to inspect the host separately.
+
+The `portal_` namespace belongs to the host. Kits run as the same OS user and
+are not sandboxed; enabling `portal_exec` gives the Being host command access.
+Neither kit authorship nor the manifest defines a per-Being access boundary.
+See [kit reliability and trust](../../docs/kit-configuration.md#portal-reliability-and-trust-boundary).

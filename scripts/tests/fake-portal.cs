@@ -8,9 +8,33 @@ public class FakePortal
 {
     public static int Main(string[] args)
     {
+        // Match the real Rust CLI, including under a hidden OEM-codepage host.
+        Console.OutputEncoding = new System.Text.UTF8Encoding(false);
+        if (args.Length > 0 && args[0] == "--install-user-runtime")
+        {
+            // Lifecycle fixtures already own an isolated installation.
+            string binary = Process.GetCurrentProcess().MainModule.FileName;
+            string installRoot = Path.GetDirectoryName(binary);
+            if (Path.GetFileName(installRoot) == "release" && Path.GetFileName(Path.GetDirectoryName(installRoot)) == "target")
+                installRoot = Path.GetDirectoryName(Path.GetDirectoryName(installRoot));
+            Console.WriteLine("{\"root\":\"" + installRoot.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"}");
+            return 0;
+        }
         if (args.Length > 0 && args[0] == "--version")
         {
             Console.WriteLine("heart-portal 0.8.0");
+            return 0;
+        }
+        if (args.Length > 1 && args[0] == "config")
+        {
+            // Explicit fixture path only: never touch the developer's real config.
+            string config = Environment.GetEnvironmentVariable("HEART_PORTAL_FIXTURE_CONFIG");
+            if (String.IsNullOrEmpty(config)) return 88;
+            if (args[1] == "init" && !File.Exists(config)) {
+                Directory.CreateDirectory(Path.GetDirectoryName(config));
+                File.WriteAllText(config, "# isolated supervisor fixture\n");
+            }
+            Console.WriteLine("{\"config\":{\"path\":\"" + config.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"}}");
             return 0;
         }
         if (args.Length > 1 && args[0] == "--export-windows-runtime")

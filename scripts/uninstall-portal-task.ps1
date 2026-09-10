@@ -6,6 +6,8 @@ param(
 $ErrorActionPreference = 'Stop'
 $Root = (Resolve-Path -LiteralPath $Root).Path
 . (Join-Path $PSScriptRoot 'portal-task-common.ps1')
+$managed = Join-Path $env:USERPROFILE '.heart-portal\runtime'
+if ((Get-PortalSavedValue $managed '.portal-origin') -eq $Root) { $Root = $managed }
 $maintenance = Enter-PortalMaintenance $Root
 try {
 $nameFile = Join-Path $Root '.portal-name'

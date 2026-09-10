@@ -3,7 +3,7 @@
 function Get-PortalSavedValue([string]$Root, [string]$FileName) {
     $path = Join-Path $Root $FileName
     if ($FileName -eq '.portal-connection.url') { Protect-PortalFile $path }
-    if (Test-Path -LiteralPath $path) { return (Get-Content -LiteralPath $path -Raw).Trim() }
+    if (Test-Path -LiteralPath $path) { return (Read-PortalText $path).Trim() }
     return ''
 }
 

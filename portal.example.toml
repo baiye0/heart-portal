@@ -1,6 +1,10 @@
-# Copy this file to portal.toml and adjust only machine-local settings.
-# portal.toml is intentionally Git-ignored.
+# New installations keep this file at ~/.heart-portal/portal.toml.
+# Existing explicit/saved configs are preserved. Use `heart-portal config path`
+# to see the effective path and `config migrate --from ...` to preview migration.
+# This file can contain credentials; keep it private and out of source control.
 name = "portal"
+# Optional persistent Being link. --connect and PORTAL_CONNECT_LINK override it.
+# connect = "https://your-hearth/your-being/?token=YOUR_TOKEN"
 # Relative to this config file, not the shell's current directory.
 # Windows absolute path example: workspace = 'C:\Users\you\Portal Workspace'
 workspace = "./workspace"

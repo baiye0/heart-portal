@@ -81,9 +81,19 @@ pub fn parse_loom_link(s: &str) -> Result<(String, String, String)> {
 /// `echo.beings.town` → `wss://echo.beings.town/_relay`
 /// `localhost:3100` (http) → `ws://localhost:3100/_relay`  (for local testing)
 fn derive_relay_url(_loom_link: &str, host: &str) -> String {
-    let is_localhost = host.starts_with("localhost") || host.starts_with("127.");
-    let scheme = if is_localhost { "ws" } else { "wss" };
+    let scheme = if is_loopback_host(host) { "ws" } else { "wss" };
     format!("{scheme}://{host}/_relay")
+}
+
+pub(crate) fn is_loopback_host(host: &str) -> bool {
+    // Deliberately conservative: localhost. and IPv4-mapped IPv6 addresses
+    // retain TLS. Only exact localhost and native loopback IPs permit plaintext.
+    url::Url::parse(&format!("http://{host}")).is_ok_and(|url| match url.host() {
+        Some(url::Host::Domain("localhost")) => true,
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        _ => false,
+    })
 }
 
 /// Run connect mode with automatic reconnect (exponential backoff, 2s..30s + jitter).
@@ -95,6 +105,7 @@ pub async fn connect_and_serve(
     let (host, being_id, token) = match parse_loom_link(loom_link) {
         Ok(x) => x,
         Err(e) => {
+            tool_host.set_connection_state(crate::tools::status::ConnectionState::Invalid);
             #[cfg(windows)]
             crate::connection_status::publish("invalid");
             warn!("invalid Loom link: {e:#}");
@@ -109,6 +120,7 @@ pub async fn connect_and_serve(
 
     let mut backoff = Duration::from_secs(BACKOFF_MIN_SECS);
     loop {
+        tool_host.set_connection_state(crate::tools::status::ConnectionState::Connecting);
         #[cfg(windows)]
         crate::connection_status::publish("connecting");
         let session_start = Instant::now();
@@ -138,6 +150,7 @@ pub async fn connect_and_serve(
                 }
             }
         }
+        tool_host.set_connection_state(crate::tools::status::ConnectionState::Retrying);
         #[cfg(windows)]
         crate::connection_status::publish("retrying");
         tokio::time::sleep(Duration::from_millis(backoff_sleep_ms(backoff, jitter_ratio())))
@@ -219,7 +232,12 @@ async fn run_one_session(
         let _ = sock_ref.set_nodelay(true);
         let (ws, _) = tokio::time::timeout(
             Duration::from_secs(15),
-            tokio_tungstenite::client_async_tls(relay_url, tcp),
+            tokio_tungstenite::client_async_tls_with_config(relay_url, tcp, Some(
+                tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+                    max_message_size: Some(16 * 1024 * 1024),
+                    max_frame_size: Some(16 * 1024 * 1024),
+                    ..Default::default()
+                }), None),
         )
             .await
             .with_context(|| format!("TLS/WS handshake to relay {relay_url} timed out (15s)"))?
@@ -228,7 +246,8 @@ async fn run_one_session(
     };
 
     let handshake = relay_handshake_json(being_id, token, portal_name);
-    ws.send(Message::Text(handshake.to_string())).await?;
+    tokio::time::timeout(Duration::from_secs(10), ws.send(Message::Text(handshake.to_string())))
+        .await.context("relay handshake send timed out")??;
 
     // Read handshake response
     let resp = match tokio::time::timeout(Duration::from_secs(10), ws.next()).await {
@@ -242,12 +261,14 @@ async fn run_one_session(
     let handshake_resp: HandshakeResponse =
         serde_json::from_str(resp.as_str()).context("relay handshake JSON")?;
     if !handshake_resp.ok {
-        anyhow::bail!("relay rejected handshake: {}", resp.as_str());
+        // A server response can echo the authentication token.
+        anyhow::bail!("relay rejected handshake");
     }
     let supports_text_keepalive =
         handshake_resp.relay_keepalive.as_deref() == Some("text-v1");
 
     info!("Portal relay handshake OK — starting MCP server on WebSocket bridge");
+    tool_host.set_connection_state(crate::tools::status::ConnectionState::Connected);
     #[cfg(windows)]
     crate::connection_status::publish("connected");
 
@@ -262,7 +283,7 @@ async fn run_one_session(
 
     let ws_write_inbound = std::sync::Arc::clone(&ws_write);
     let last_seen_inbound = std::sync::Arc::clone(&last_seen);
-    let ws_to_bridge = tokio::spawn(async move {
+    let ws_to_bridge = async move {
         while let Some(msg) = ws_read.next().await {
             *last_seen_inbound.lock().await = Instant::now();
             match msg {
@@ -277,11 +298,11 @@ async fn run_one_session(
                         break;
                     }
                 }
-                Ok(Message::Ping(_)) => {
+                Ok(Message::Ping(payload)) => {
                     // tokio-tungstenite may auto-reply when using unsplit stream; we split,
                     // so reply explicitly (D-077).
                     let mut w = ws_write_inbound.lock().await;
-                    if w.send(Message::Pong(vec![])).await.is_err() {
+                    if w.send(Message::Pong(payload)).await.is_err() {
                         break;
                     }
                 }
@@ -291,17 +312,18 @@ async fn run_one_session(
                 Err(_) => break,
             }
         }
-    });
+    };
 
     let ws_write_out = std::sync::Arc::clone(&ws_write);
-    let bridge_to_ws = tokio::spawn(async move {
-        let mut line = String::new();
+    let bridge_to_ws = async move {
+        let mut line = Vec::new();
         loop {
             line.clear();
-            match tokio::io::AsyncBufReadExt::read_line(&mut bridge_reader, &mut line).await {
+            match crate::mcp::limits::read_line(&mut bridge_reader, &mut line, 16 * 1024 * 1024).await {
                 Ok(0) => break,
                 Ok(_) => {
-                    let trimmed = line.trim();
+                    let Ok(text) = std::str::from_utf8(&line) else { break; };
+                    let trimmed = text.trim();
                     if !trimmed.is_empty()
                         && ws_write_out.lock().await.send(Message::Text(trimmed.to_string())).await.is_err() {
                             break;
@@ -310,11 +332,11 @@ async fn run_one_session(
                 Err(_) => break,
             }
         }
-    });
+    };
 
     let ws_write_hb = std::sync::Arc::clone(&ws_write);
     let last_seen_hb = std::sync::Arc::clone(&last_seen);
-    let mut heartbeat = tokio::spawn(async move {
+    let heartbeat = async move {
         let mut interval =
             tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -325,59 +347,35 @@ async fn run_one_session(
                 if Instant::now().saturating_duration_since(last_seen)
                     > Duration::from_secs(HEARTBEAT_TIMEOUT_SECS)
                 {
-                    let _ = ws_write_hb.lock().await.close().await;
+                    // Closing can itself block behind a congested writer. The
+                    // session owner drops the socket when this future returns.
                     anyhow::bail!(
                         "no relay heartbeat response within {}s (D-077)",
                         HEARTBEAT_TIMEOUT_SECS
                     );
                 }
             }
-            let mut w = ws_write_hb.lock().await;
             let heartbeat_message = if supports_text_keepalive {
                 Message::Text("{\"type\":\"keepalive\"}".into())
             } else {
                 Message::Ping(b"hp".to_vec())
             };
-            if let Err(e) = w.send(heartbeat_message).await {
-                anyhow::bail!("failed to send relay heartbeat (D-077): {e}");
-            }
-        }
-    });
-
-    let th = tool_host.clone();
-    let pn = portal_name.to_string();
-    let mut hc_task = tokio::spawn(async move {
-        crate::handle_connection(portal_stream, &th, &pn, None).await
-    });
-
-    let (exit_reason, result) = tokio::select! {
-        r = &mut hc_task => {
-            heartbeat.abort();
-            ws_to_bridge.abort();
-            bridge_to_ws.abort();
-            let exit_reason = format!("mcp_handler: {:?}", r);
-            let result = match r {
-                Ok(inner) => inner,
-                Err(e) => Err(anyhow::anyhow!("mcp handler join error: {e}")),
-            };
-            (exit_reason, result)
-        }
-        hb = &mut heartbeat => {
-            hc_task.abort();
-            ws_to_bridge.abort();
-            bridge_to_ws.abort();
-            let exit_reason = format!("heartbeat: {:?}", hb);
-            let result = match hb {
-                Ok(Ok(())) => Err(anyhow::anyhow!("heartbeat task exited unexpectedly")),
-                Ok(Err(e)) => Err(e),
-                Err(e) => Err(anyhow::anyhow!("heartbeat join error: {e}")),
-            };
-            (exit_reason, result)
+            // Include lock acquisition: a stuck response writer must not
+            // prevent the liveness task from returning control to reconnect.
+            tokio::time::timeout(Duration::from_secs(10), async {
+                ws_write_hb.lock().await.send(heartbeat_message).await
+            }).await.context("relay heartbeat write timed out")??;
         }
     };
-
-    warn!("relay session ended: {}", exit_reason);
-    result
+    // Keep bridge and handler futures owned by this session. Any disconnect
+    // cancels all four together, including pending MCP calls; no detached
+    // bridge can retain the socket or deliver an old response after reconnect.
+    tokio::select! {
+        result = crate::handle_connection(portal_stream, tool_host, portal_name, None) => result,
+        result = heartbeat => result,
+        _ = ws_to_bridge => anyhow::bail!("relay receive bridge closed"),
+        _ = bridge_to_ws => anyhow::bail!("relay send bridge closed"),
+    }
 }
 
 #[cfg(test)]
@@ -444,6 +442,15 @@ mod tests {
     fn derive_relay_url_localhost() {
         let url = derive_relay_url("http://localhost:3100/alice/?token=t", "localhost:3100");
         assert_eq!(url, "ws://localhost:3100/_relay");
+    }
+
+    #[test]
+    fn localhost_prefix_does_not_disable_tls_for_remote_hosts() {
+        for host in ["localhost.example.com:443", "127.example.com", "127.0.0.1.example.com"] {
+            assert_eq!(derive_relay_url("", host), format!("wss://{host}/_relay"));
+        }
+        assert!(is_loopback_host("127.0.0.1:3100"));
+        assert!(is_loopback_host("[::1]:3100"));
     }
 
     #[test]

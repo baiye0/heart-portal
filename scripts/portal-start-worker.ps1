@@ -80,8 +80,11 @@ try {
     if (-not $launch -or $launch.protocol -ne 1) { throw 'Portal launch configuration is missing.' }
     $config = [string]$launch.arguments[1]
     if (-not (Test-Path -LiteralPath $config)) {
-        if (-not $request.default_config) { throw "Config not found: $config" }
-        Write-PortalPrivateText $config $request.default_config
+        if (-not $request.initialize_config) { throw "Config not found: $config" }
+        & $request.target config init | Out-Null
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $config -PathType Leaf)) {
+            throw 'Cannot initialize the user Portal configuration.'
+        }
     }
     $scripts = Join-Path $root 'scripts'
     [IO.Directory]::CreateDirectory($scripts) | Out-Null

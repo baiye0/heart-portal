@@ -17,7 +17,7 @@ use windows_sys::Win32::{
     },
     Storage::FileSystem::{
         CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
+        FILE_SHARE_WRITE, FILE_FLAG_BACKUP_SEMANTICS, OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
     },
     System::Threading::{GetCurrentProcess, OpenProcessToken},
 };
@@ -31,7 +31,7 @@ impl Drop for LocalMemory {
     }
 }
 
-fn descriptor() -> Result<LocalMemory> {
+fn descriptor(directory: bool) -> Result<LocalMemory> {
     unsafe {
         let mut token = std::ptr::null_mut();
         if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
@@ -72,7 +72,8 @@ fn descriptor() -> Result<LocalMemory> {
         let sid = String::from_utf16(std::slice::from_raw_parts(sid, len))?;
         // Tasks run as this same user. SYSTEM is the only additional principal;
         // do not inherit broad Users/Everyone access from a portable install.
-        let sddl: Vec<u16> = format!("D:P(A;;FA;;;{sid})(A;;FA;;;SY)")
+        let inherit = if directory { "OICI" } else { "" };
+        let sddl: Vec<u16> = format!("D:P(A;{inherit};FA;;;{sid})(A;{inherit};FA;;;SY)")
             .encode_utf16()
             .chain(Some(0))
             .collect();
@@ -91,7 +92,11 @@ fn descriptor() -> Result<LocalMemory> {
 }
 
 fn open_private(path: &Path, create: bool) -> Result<File> {
-    let sd = descriptor()?;
+    open_private_entry(path, create, false)
+}
+
+fn open_private_entry(path: &Path, create: bool, directory: bool) -> Result<File> {
+    let sd = descriptor(directory)?;
     let name: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
     let attributes = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
@@ -105,7 +110,7 @@ fn open_private(path: &Path, create: bool) -> Result<File> {
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             &attributes,
             if create { CREATE_NEW } else { OPEN_EXISTING },
-            FILE_ATTRIBUTE_NORMAL,
+            if directory { FILE_FLAG_BACKUP_SEMANTICS } else { FILE_ATTRIBUTE_NORMAL },
             std::ptr::null_mut(),
         );
         if handle == INVALID_HANDLE_VALUE {
@@ -143,6 +148,15 @@ pub fn create(path: &Path) -> Result<File> {
     open_private(path, true).context(
         "Creating private Portal state; use an ACL-capable folder owned by your Windows user",
     )
+}
+
+pub fn protect_directory(path: &Path) -> Result<()> {
+    use std::os::windows::fs::MetadataExt;
+    let metadata = std::fs::symlink_metadata(path)?;
+    anyhow::ensure!(metadata.is_dir() && metadata.file_attributes() & 0x400 == 0,
+        "Portal runtime directory must be a regular directory, not a reparse point");
+    drop(open_private_entry(path, false, true)?);
+    Ok(())
 }
 
 pub fn protect_existing(path: &Path) -> Result<()> {
@@ -270,6 +284,24 @@ $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($everyone,
             assert_eq!(value["token"], "new credential");
         }
         assert_private(&root);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn runtime_directory_keeps_inherited_logs_private() {
+        let root = std::env::temp_dir().join(format!("portal-runtime-acl-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        protect_directory(&root).unwrap();
+        std::fs::create_dir(root.join("logs")).unwrap();
+        std::fs::write(root.join("logs/runtime.log"), b"private output").unwrap();
+        powershell(&root, r#"
+$ErrorActionPreference = 'Stop'
+$sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$acl = [IO.File]::GetAccessControl((Join-Path $env:PORTAL_ACL_TEST_ROOT 'logs\runtime.log'))
+foreach ($rule in $acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])) {
+    if ($rule.IdentityReference.Value -notin @($sid,'S-1-5-18')) { throw 'Unrelated principal inherited log access' }
+}
+"#);
         std::fs::remove_dir_all(root).unwrap();
     }
 

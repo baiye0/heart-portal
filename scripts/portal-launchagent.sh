@@ -4,6 +4,8 @@ set -eu
 umask 077
 root=$1
 label=$2
+# Old registrations have no third argument and retain their original config.
+config=${3:-"$root/portal.toml"}
 if [ "${XPC_SERVICE_NAME:-}" != "$label" ]; then
     echo 'Start this service with portal-macos.py install, not this launcher directly.' >&2
     exit 1
@@ -23,5 +25,5 @@ for log in portal-runtime.log portal-runtime.err.log; do
 done
 portal_executable="$root/target/release/heart-portal"
 if [ -f .portal-executable ]; then portal_executable=$(cat .portal-executable); fi
-exec "$portal_executable" --config "$root/portal.toml" --name "$portal_name" \
+exec "$portal_executable" --config "$config" --name "$portal_name" \
     >portal-runtime.log 2>portal-runtime.err.log

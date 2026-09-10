@@ -17,6 +17,8 @@ pub struct Guard {
     handle: *mut c_void,
     #[cfg(target_os = "macos")]
     _file: std::fs::File,
+    #[cfg(target_os = "macos")]
+    _legacy_file: Option<std::fs::File>,
 }
 
 // The mutex handle is process-local and is only closed when the guard drops.
@@ -55,7 +57,10 @@ pub fn acquire(identity: Option<&str>) -> Result<Guard, String> {
         // launchd/terminal environments. Never unlink a lock: another process
         // may already have the same inode open while waiting to acquire it.
         let uid = unsafe { libc::geteuid() };
-        let dir = std::path::PathBuf::from(format!("/tmp/heart-portal-{uid}"));
+        let data = crate::paths::data_dir().map_err(|e| e.to_string())?;
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&data)
+            .map_err(|e| e.to_string())?;
+        let dir = data.join("locks");
         match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -65,10 +70,25 @@ pub fn acquire(identity: Option<&str>) -> Result<Guard, String> {
         if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
             return Err("instance lock directory must be private and owned by this user".into());
         }
-        let path = dir.join(format!(
+        let name = format!(
             "{:016x}.lock",
             stable_identity_hash(identity.unwrap_or("standalone"))
-        ));
+        );
+        // Cooperate with old releases if their lock already exists, without
+        // creating any new runtime files outside the user data directory.
+        let legacy_path = std::path::PathBuf::from(format!("/tmp/heart-portal-{uid}")).join(&name);
+        let legacy_file = match std::fs::OpenOptions::new().read(true).write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(legacy_path) {
+            Ok(file) => {
+                if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                    return Err("another legacy Portal instance is already running for this relay/Being".into());
+                }
+                Some(file)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(format!("could not check legacy instance lock: {e}")),
+        };
+        let path = dir.join(name);
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -87,7 +107,7 @@ pub fn acquire(identity: Option<&str>) -> Result<Guard, String> {
             }
             return Err(format!("could not acquire instance lock: {error}"));
         }
-        Ok(Guard { _file: file })
+        Ok(Guard { _file: file, _legacy_file: legacy_file })
     }
 
     #[cfg(windows)]

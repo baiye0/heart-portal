@@ -21,11 +21,17 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::PathBuf;
 
+#[path = "config_diagnostics.rs"]
+mod diagnostics;
+pub use diagnostics::ConfigWarning;
+
 /// Raw config as parsed from TOML (supports both flat and nested fields)
 #[derive(Debug, Deserialize)]
 struct RawConfig {
     #[serde(default)]
     name: Option<String>,
+    /// Persistent Loom link; CLI/environment still take precedence.
+    connect: Option<String>,
 
     /// Flat bind string: "host:port" or just "port"
     #[serde(default)]
@@ -60,22 +66,29 @@ struct RawConfig {
     /// Enable kit discovery and tool proxying.
     #[serde(default)]
     kits_enabled: Option<bool>,
+    #[serde(flatten)]
+    ignored_fields: std::collections::BTreeMap<String, serde::de::IgnoredAny>,
 }
 
 #[derive(Debug, Deserialize)]
 struct RawSecurityConfig {
+    #[serde(default)]
+    expose_host_details: bool,
     #[serde(default)]
     exec_allowlist: Option<Vec<String>>,
     #[serde(default)]
     workspace_root: Option<PathBuf>,
     #[serde(default)]
     max_file_size: Option<usize>,
+    #[serde(flatten)]
+    ignored_fields: std::collections::BTreeMap<String, serde::de::IgnoredAny>,
 }
 
 /// Resolved portal configuration
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PortalConfig {
     pub name: String,
+    pub connect_link: Option<String>,
     pub bind_host: String,
     pub bind_port: u16,
     pub tools: ToolsConfig,
@@ -84,6 +97,18 @@ pub struct PortalConfig {
     pub portal_mcp_token: Option<String>,
     pub kits_dir: Option<String>,
     pub kits_enabled: bool,
+    /// Startup diagnostics contain field names and fixed guidance, never values.
+    pub warnings: Vec<ConfigWarning>,
+}
+
+impl std::fmt::Debug for PortalConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PortalConfig")
+            .field("name", &self.name)
+            .field("connect_link", &"<redacted>")
+            .field("portal_mcp_token", &"<redacted>")
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -102,10 +127,14 @@ pub struct ToolsConfig {
     /// When false, workspace/tools/mcp.toml is ignored (custom MCP tools disabled).
     #[serde(default = "default_true")]
     pub custom_tools_enabled: bool,
+    #[serde(flatten)]
+    ignored_fields: std::collections::BTreeMap<String, serde::de::IgnoredAny>,
 }
 
 #[derive(Debug, Clone)]
 pub struct SecurityConfig {
+    /// Local administrator opt-in for host paths/PID in portal_status.
+    pub expose_host_details: bool,
     pub exec_allowlist: Vec<String>,
     pub workspace_root: PathBuf,
     pub max_file_size: usize,
@@ -115,6 +144,7 @@ impl Default for PortalConfig {
     fn default() -> Self {
         Self {
             name: "portal".to_string(),
+            connect_link: None,
             bind_host: "0.0.0.0".to_string(),
             bind_port: 9100,
             tools: ToolsConfig::default(),
@@ -122,6 +152,7 @@ impl Default for PortalConfig {
             portal_mcp_token: None,
             kits_dir: Some(default_kits_dir()),
             kits_enabled: true,
+            warnings: Vec::new(),
         }
     }
 }
@@ -135,6 +166,7 @@ impl Default for ToolsConfig {
             web_fetch: true,
             search: true,
             custom_tools_enabled: true,
+            ignored_fields: Default::default(),
         }
     }
 }
@@ -142,6 +174,7 @@ impl Default for ToolsConfig {
 impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
+            expose_host_details: false,
             exec_allowlist: vec![],
             workspace_root: default_workspace_root(),
             max_file_size: 10 * 1024 * 1024,
@@ -151,8 +184,10 @@ impl Default for SecurityConfig {
 
 impl PortalConfig {
     pub fn load(path: &str) -> Result<Self> {
-        let content = std::fs::read_to_string(path)?;
-        let raw: RawConfig = toml::from_str(&content)?;
+        let content = crate::bounded_file::text(std::path::Path::new(path), crate::bounded_file::CONFIG_LIMIT)?;
+        let raw: RawConfig = toml::from_str(content.trim_start_matches('\u{feff}'))
+            .map_err(|_| anyhow::anyhow!("Invalid TOML configuration in {}", path))?;
+        let mut warnings = diagnostics::collect(&raw);
 
         // Resolve bind address: flat `bind` takes precedence
         let (host, port) = if let Some(bind) = &raw.bind {
@@ -175,17 +210,10 @@ impl PortalConfig {
         );
         // Configuration-relative paths are stable under a service manager or
         // when --config is invoked from another directory.
-        let workspace = if workspace.is_absolute() {
-            workspace
-        } else {
-            let config_path = std::path::absolute(path)?;
-            config_path
-                .parent()
-                .context("config has no parent directory")?
-                .join(workspace)
-        };
+        let workspace = crate::paths::resolve_relative(&workspace, std::path::Path::new(path))?;
 
         let security = SecurityConfig {
+            expose_host_details: raw.security.as_ref().is_some_and(|s| s.expose_host_details),
             exec_allowlist: raw
                 .security
                 .as_ref()
@@ -200,19 +228,40 @@ impl PortalConfig {
         };
 
         let name = raw.name.unwrap_or_else(|| "portal".to_string());
+        let connect_link = raw.connect.filter(|s| !s.trim().is_empty());
+        if let Some(link) = &connect_link {
+            crate::relay_client::parse_loom_link(link)
+                .context("Invalid configured Portal connection")?;
+        }
+        let kits_dir = raw
+            .kits_dir
+            .filter(|s| !s.trim().is_empty())
+            .map(|kits| {
+                let (path, legacy) = crate::paths::resolve_kits_compatible(
+                    std::path::Path::new(&kits),
+                    std::path::Path::new(path),
+                    &std::env::current_dir()?,
+                )?;
+                if legacy {
+                    warnings.push(ConfigWarning { code: "legacy-kits-directory", field: "kits_dir".into(),
+                        message: "Preserved an existing kit directory relative to the launch working directory. Set kits_dir to the effective absolute path shown by portal_status before relocating configuration." });
+                }
+                Ok::<_, anyhow::Error>(path.to_string_lossy().into_owned())
+            })
+            .transpose()?
+            .or_else(|| Some(default_kits_dir()));
 
         Ok(PortalConfig {
             name,
+            connect_link,
             bind_host: host,
             bind_port: port,
             tools: raw.tools.unwrap_or_default(),
             security,
             portal_mcp_token: raw.portal_mcp_token.clone().filter(|s| !s.is_empty()),
-            kits_dir: raw
-                .kits_dir
-                .filter(|s| !s.trim().is_empty())
-                .or_else(|| Some(default_kits_dir())),
+            kits_dir,
             kits_enabled: raw.kits_enabled.unwrap_or(true),
+            warnings,
         })
     }
 
@@ -385,8 +434,11 @@ kits_enabled = false
             std::env::temp_dir().join(format!("heart-portal-kits-{}.toml", uuid::Uuid::new_v4()));
         std::fs::write(&path, toml).unwrap();
         let config = PortalConfig::load(path.to_str().unwrap()).unwrap();
-        std::fs::remove_file(path).unwrap();
-        assert_eq!(config.kits_dir.as_deref(), Some("/tmp/portal-kits"));
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            PathBuf::from(config.kits_dir.unwrap()),
+            path.parent().unwrap().join("/tmp/portal-kits")
+        );
         assert!(!config.kits_enabled);
     }
 

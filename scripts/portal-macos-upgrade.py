@@ -25,6 +25,14 @@ RELEASE_REQUIREMENT = ('anchor apple generic and identifier "com.aspect.heart-po
                        'and certificate leaf[field.1.2.840.113635.100.6.1.13] exists')
 
 
+def file_digest(path):
+    with open(path, 'rb') as stream:
+        digest = hashlib.sha256()
+        for block in iter(lambda: stream.read(64 * 1024), b''):
+            digest.update(block)
+        return digest.digest()
+
+
 def write_json(path, value):
     manager.private_write(path, json.dumps(value).encode())
 
@@ -75,7 +83,7 @@ def wait_ready(root, expected, nonce=None, timeout=35):
         valid = len(pids) == 1
         if nonce and valid:
             try:
-                ready = json.loads((root / '.portal-ready.json').read_text())
+                ready = json.loads(manager.metadata_text(root / '.portal-ready.json'))
                 valid = (ready.get('pid') == pids[0] and ready.get('nonce') == nonce
                          and ready.get('version') == expected)
             except (OSError, ValueError):
@@ -110,7 +118,7 @@ def adopt_legacy(root, target, stage, exclude=()):
     support.mkdir(mode=0o700, exist_ok=True)
     support.chmod(0o700)
     for name in ('portal-macos.py', 'portal-macos-supervisor.py'):
-        manager.private_write(support / name, (stage / name).read_bytes())
+        manager.private_write(support / name, manager.metadata_bytes(stage / name))
     token = uuid.uuid4().hex
     request = {'root': str(root), 'target': str(target), 'token': token,
                'runtime_pid': pids[0], 'runtime': runtime, 'adopted': True,
@@ -134,7 +142,7 @@ def restart(root, domain, plist, mode, expected=None, nonce=None):
         state = manager.supervisor_state(root)
         if not state:
             raise RuntimeError('The original supervisor exited; restart from the original Terminal/app to preserve TCC attribution.')
-        journal = json.loads((root / '.portal-upgrade.json').read_text())
+        journal = json.loads(manager.metadata_text(root / '.portal-upgrade.json'))
         write_json(root / '.portal-supervisor-restart.json', {
             'transaction': Path(journal['stage']).name, 'id': uuid.uuid4().hex, 'owner': state['token']})
         wait_ready(root, expected, nonce)
@@ -178,7 +186,7 @@ def restore(root, target, stage, service, domain, plist, mode):
 
 
 def run(stage):
-    request = json.loads((stage / 'request.json').read_text())
+    request = json.loads(manager.metadata_text(stage / 'request.json'))
     root = Path(request['root']).resolve(strict=True)
     target = manager.binary_path(root)
     if request.get('target') and Path(request['target']).resolve() != target.resolve():
@@ -211,7 +219,7 @@ def run(stage):
 
         manager.assert_owned(plist, root, label)
         if journal.exists():
-            previous = json.loads(journal.read_text())
+            previous = json.loads(manager.metadata_text(journal))
             if previous.get('stage') != str(stage):
                 raise RuntimeError('Another interrupted upgrade needs recovery first.')
             mode = previous.get('restart_mode', 'launchagent')
@@ -228,7 +236,7 @@ def run(stage):
             candidate = stage / 'candidate'
             # All rejection checks precede stopping the service or mutating its binary.
             request['signature_identity_preserved'] = verify_signatures(target, candidate)
-            verified_hash = hashlib.sha256(candidate.read_bytes()).digest()
+            verified_hash = file_digest(candidate)
             old_version, new_version = version(target), version(candidate)
             if version_tuple(new_version) <= version_tuple(old_version):
                 raise RuntimeError('Candidate must be newer than the installed Portal.')
@@ -242,10 +250,10 @@ def run(stage):
             mode = ('launchagent' if supervised else 'supervisor' if manager.supervisor_state(root)
                     else 'start_script' if (root / 'start.sh').is_file() else 'manual')
             helper = root / 'scripts/portal-macos.py'
-            if supervised and (not helper.is_file() or 'LIFECYCLE_PROTOCOL = 2' not in helper.read_text()):
+            if supervised and (not helper.is_file() or 'LIFECYCLE_PROTOCOL = 2' not in manager.metadata_text(helper)):
                 # Existing installations gain the shared lock in place; users
                 # do not need a new installer or reinstall before upgrading.
-                manager.private_write(helper, Path(__file__).with_name('portal-macos.py').read_bytes())
+                manager.private_write(helper, manager.metadata_bytes(Path(__file__).with_name('portal-macos.py')))
             request['version'] = new_version
             write_json(stage / 'request.json', request)
             shutil.copy2(target, stage / 'previous')
@@ -274,7 +282,7 @@ def run(stage):
             status('replacing', 'Stopping this installation and replacing its executable.')
             stop(root, service)
             # Recheck immediately before replacement; never re-sign or strip xattrs.
-            if hashlib.sha256(candidate.read_bytes()).digest() != verified_hash:
+            if file_digest(candidate) != verified_hash:
                 raise RuntimeError('Candidate changed after signature verification.')
             manager.private_write(root / '.portal-launch-nonce', stage.name.encode())
             (root / '.portal-ready.json').unlink(missing_ok=True)
@@ -295,7 +303,7 @@ def run(stage):
 
 
 def dispatch(stage):
-    request = json.loads((stage / 'request.json').read_text())
+    request = json.loads(manager.metadata_text(stage / 'request.json'))
     root = Path(request['root'])
     domain = f'gui/{os.getuid()}'
     supervised = manager.launchctl('print', domain + '/' + manager.label_for(root), check=False).returncode == 0
@@ -328,13 +336,13 @@ def main():
     if '--dispatch' in sys.argv:
         dispatch(stage)
         return 0
-    request = json.loads((stage / 'request.json').read_text())
+    request = json.loads(manager.metadata_text(stage / 'request.json'))
     try:
         run(stage)
     except Exception as error:
         print(f'Upgrade: {error}', file=sys.stderr, flush=True)
         journal = Path(request['root']) / '.portal-upgrade.json'
-        owns_journal = journal.exists() and json.loads(journal.read_text()).get('stage') == str(stage)
+        owns_journal = journal.exists() and json.loads(manager.metadata_text(journal)).get('stage') == str(stage)
         if not (stage / 'accepted.json').exists() and not owns_journal:
             write_json(stage / 'error.json', {'message': str(error)})
             # Rejected requests should not be retried automatically.
@@ -345,7 +353,7 @@ def main():
             return 1
     if (stage / 'result.json').exists():
         journal = Path(request['root']) / '.portal-upgrade.json'
-        if journal.exists() and json.loads(journal.read_text()).get('stage') == str(stage):
+        if journal.exists() and json.loads(manager.metadata_text(journal)).get('stage') == str(stage):
             journal.unlink()
         # Remove login registration only after a durable result. The completed
         # job stays loaded but dormant (SuccessfulExit=false); it owns no process.
