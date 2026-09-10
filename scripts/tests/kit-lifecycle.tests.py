@@ -71,6 +71,7 @@ class KitLifecycleTests(unittest.TestCase):
         self.connection = self.reader = None
         self.sequence = itertools.count(1)
         self.notifications = []
+        self.started_at = time.monotonic()
         self.process = subprocess.Popen([str(self.binary), '--config', str(config)], cwd=self.root,
             env=env, stdout=self.log, stderr=self.log,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)

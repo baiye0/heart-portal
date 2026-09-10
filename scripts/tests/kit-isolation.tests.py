@@ -32,9 +32,10 @@ class IsolationTests(fixture.KitLifecycleTests):
     def test_stuck_custom_startup_cannot_delay_portal_readiness(self):
         self.stop(); self.doCleanups()
         self.initial_custom_script='import time\ntime.sleep(60)\n'
-        started=time.monotonic()
         self.setUp()
-        self.assertLess(time.monotonic()-started,3)
+        # Exclude copying the debug binary and preparing the isolated profile.
+        # Still fail well before a blocking MCP initialize would time out (30s).
+        self.assertLess(time.monotonic()-self.started_at,10)
         self.assertEqual(self.value('portal_status')['portal']['pid'],self.process.pid)
         self.install()
         self.value('portal_kits_reload',{'kit':'sample'})

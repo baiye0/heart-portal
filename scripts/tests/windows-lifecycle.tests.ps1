@@ -156,7 +156,9 @@ if ((Get-FileHash -LiteralPath $PSCommandPath).Hash.Length -ne 64) { throw 'SHA2
     Assert (Test-PortalScriptCommand ('-File "{0}"' -f $scriptPath) $scriptPath) 'quoted exact script matches'
     Assert (-not (Test-PortalScriptCommand ('-File "{0}.backup"' -f $scriptPath) $scriptPath)) 'similar script does not match'
     $supervisorProcess = Launch-Supervisor
-    Wait-Until { @(Get-Launches).Count -ge 1 } 'first Portal start'
+    # A fresh runner also cold-starts PowerShell and compiles the native launcher.
+    # Use the same startup budget as the real readiness check.
+    Wait-Until { @(Get-Launches).Count -ge 1 } 'first Portal start' 60
     $duplicate = Launch-Supervisor
     try {
         Assert ($duplicate.WaitForExit(10000)) 'duplicate supervisor exits'

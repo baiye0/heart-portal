@@ -11,6 +11,7 @@ permissions:
 jobs:
   rust:
     strategy:
+      fail-fast: false
       matrix:
         os: [macos-latest, macos-15-intel, windows-latest]
     runs-on: ${{ matrix.os }}

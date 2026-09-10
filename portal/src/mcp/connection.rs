@@ -912,43 +912,39 @@ mod tests {
             &script,
             concat!(
                 "@echo off\r\n",
-                "powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File \"%~dp0server.ps1\" %*\r\n",
+                "set \"PORTAL_TEST_KIT_TOKEN=%~1\"\r\n",
+                "\"%PORTAL_TEST_KIT_BINARY%\" --exact kits::tests::mcp_fixture --nocapture --quiet\r\n",
             ),
         )
         .unwrap();
-        // A real line reader: consecutive `set /p` in cmd can consume multiple
-        // pipe lines at once, making a batch-only MCP fixture nondeterministic.
-        std::fs::write(
-            dir.join("server.ps1"),
-            r#"
-$ErrorActionPreference = 'Stop'
-while ($null -ne ($line = [Console]::ReadLine())) {
-    $request = ConvertFrom-Json -InputObject $line
-    if ($null -ne $request.id) {
-        $result = @{ argument = $args[0] }
-        $response = @{ jsonrpc = '2.0'; id = $request.id; result = $result }
-        [Console]::WriteLine((ConvertTo-Json -InputObject $response -Compress -Depth 5))
-    }
-}
-"#,
-        )
-        .unwrap();
+        // Reuse the native MCP fixture so this argument-quoting regression does
+        // not depend on PowerShell's cold startup or module discovery on CI.
         let mut connection = McpConnection::spawn(McpServerConfig {
             name: "cmd-test".into(),
             command: vec![
                 script.to_string_lossy().into_owned(),
                 "space & value".into(),
             ],
-            env: HashMap::new(),
+            env: HashMap::from([
+                ("PORTAL_TEST_KIT_FIXTURE".into(), "1".into()),
+                (
+                    "PORTAL_TEST_KIT_BINARY".into(),
+                    std::env::current_exe().unwrap().to_string_lossy().into_owned(),
+                ),
+            ]),
             cwd: Some(dir.clone()),
         })
         .await
         .unwrap();
         let result = connection
-            .request_with_timeout("ping", serde_json::json!({}), Duration::from_secs(5))
+            .request_with_timeout(
+                "tools/call",
+                serde_json::json!({"name": "ping", "arguments": {}}),
+                Duration::from_secs(5),
+            )
             .await;
         connection.shutdown().await.unwrap();
-        assert_eq!(result.unwrap()["argument"], "space & value");
+        assert_eq!(result.unwrap()["token"], "space & value");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
