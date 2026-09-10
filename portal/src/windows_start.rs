@@ -30,8 +30,8 @@ pub async fn run(
     crate::windows_private::protect_installation(&root)?;
     let explicit = config.is_some() || connect.is_some() || name.is_some();
     let saved = root.join(".portal-launch.json");
-    let (launch, default_config) = if action != "start" || (!explicit && saved.is_file()) {
-        (Value::Null, Value::Null)
+    let (launch, initialize_config) = if action != "start" || (!explicit && saved.is_file()) {
+        (Value::Null, false)
     } else {
         make_launch(&root, config, connect, name)?
     };
@@ -66,7 +66,7 @@ pub async fn run(
     )?;
     let request = json!({
         "action": action, "root": root, "target": exe, "launch": launch,
-        "default_config": default_config, "explicit": explicit,
+        "initialize_config": initialize_config, "explicit": explicit,
         "parent_pid": std::process::id(), "version": crate::upgrade::PORTAL_VERSION,
     });
     crate::windows_upgrade::write_json(&stage.join("request.json"), &request)?;
@@ -271,19 +271,18 @@ fn make_launch(
     config: Option<&str>,
     connect: Option<&str>,
     name: Option<&str>,
-) -> Result<(Value, Value)> {
-    let config_path = match config {
-        Some(path) => std::path::absolute(path)?,
-        None => root.join("portal.toml"),
-    };
-    let (resolved, default_config) = if config_path.is_file() {
+) -> Result<(Value, bool)> {
+    // Changing only --name/--connect must retain the saved explicit config.
+    let config_path =
+        crate::paths::locate_config(config.map(Path::new), &[root.to_path_buf()])?.path;
+    let (resolved, initialize_config) = if config_path.try_exists()? {
         (
             crate::config::PortalConfig::load(
                 config_path
                     .to_str()
                     .context("Config path must be Unicode")?,
             )?,
-            Value::Null,
+            false,
         )
     } else {
         anyhow::ensure!(
@@ -293,10 +292,7 @@ fn make_launch(
         );
         let mut defaults = crate::config::PortalConfig::default();
         defaults.bind_host = "127.0.0.1".into();
-        (
-            defaults,
-            Value::String(include_str!("../../portal.example.toml").to_string()),
-        )
+        (defaults, true)
     };
     let connection = connect
         .map(str::to_owned)
@@ -305,6 +301,7 @@ fn make_launch(
                 .ok()
                 .filter(|value| !value.trim().is_empty())
         })
+        .or_else(|| resolved.connect_link.clone())
         .or_else(|| {
             std::fs::read_to_string(root.join(".portal-connection.url"))
                 .ok()
@@ -346,6 +343,6 @@ fn make_launch(
             "arguments": ["--config", config_path, "--name", portal_name],
             "working_directory": std::env::current_dir()?, "environment": environment,
         }),
-        default_config,
+        initialize_config,
     ))
 }

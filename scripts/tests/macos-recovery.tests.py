@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 sys.dont_write_bytecode = True
 REPO = Path(__file__).resolve().parents[2]
@@ -26,7 +27,12 @@ BINARY = Path(os.environ.get('PORTAL_TEST_BINARY', REPO / 'target/debug/heart-po
 class SessionRecoveryTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="portal recovery 中文 ' ")
-        self.root = Path(self.temp.name).resolve()
+        profile = Path(self.temp.name).resolve()
+        home_patch = patch.dict(os.environ, HOME=str(profile))
+        home_patch.start()
+        self.addCleanup(home_patch.stop)
+        self.root = profile / '.heart-portal/runtime'
+        self.root.mkdir(parents=True)
         self.target = self.root / 'heart-portal'
         shutil.copy2(BINARY, self.target)
         version = subprocess.check_output([str(BINARY), '--version'], text=True).strip().split()[1]

@@ -79,7 +79,11 @@ class UnitTests(unittest.TestCase):
 class LaunchdTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='portal upgrade 中文 ')
-        self.root = Path(self.temp.name).resolve()
+        profile = Path(self.temp.name).resolve()
+        home_patch = patch.dict(os.environ, HOME=str(profile))
+        home_patch.start()
+        self.addCleanup(home_patch.stop)
+        self.root = profile / '.heart-portal/runtime'
         self.target = self.root / 'target/release/heart-portal'
         self.target.parent.mkdir(parents=True)
         (self.root / 'scripts').mkdir()

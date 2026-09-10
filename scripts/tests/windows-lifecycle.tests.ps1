@@ -5,6 +5,9 @@ $tempBase = [IO.Path]::GetTempPath()
 $testRoot = Join-Path $tempBase ("portal Windows test " + [char]0x6D4B + '-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path (Join-Path $testRoot 'target\release') -Force | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $testRoot 'scripts') | Out-Null
+$fixtureConfig = Join-Path $testRoot 'profile\.heart-portal\portal.toml'
+$previousFixtureConfig = $env:HEART_PORTAL_FIXTURE_CONFIG
+$env:HEART_PORTAL_FIXTURE_CONFIG = $fixtureConfig
 $supervisorDiagnostics = [Collections.Generic.List[object]]::new()
 Copy-Item -LiteralPath (Join-Path $repo 'portal.example.toml') -Destination $testRoot
 foreach ($script in @('portal-lifecycle.ps1', 'portal-supervisor.ps1', 'portal-supervisor-bootstrap.ps1', 'portal-supervisor-hidden.vbs', 'portal-task-common.ps1', 'install-portal-task.ps1', 'install-portal-windows.ps1', 'uninstall-portal-task.ps1')) {
@@ -43,6 +46,32 @@ function Get-Launches {
 }
 
 try {
+    # Emulate a PowerShell 7 module path inherited by a native Windows PS child.
+    $foreignModules = Join-Path $testRoot 'foreign-modules'
+    $foreignUtility = Join-Path $foreignModules 'Microsoft.PowerShell.Utility'
+    [void][IO.Directory]::CreateDirectory($foreignUtility)
+    [IO.File]::WriteAllText((Join-Path $foreignUtility 'Microsoft.PowerShell.Utility.psd1'), "@{ RootModule='Utility.psm1'; ModuleVersion='7.0.0'; PowerShellVersion='7.0'; FunctionsToExport=@('Get-FileHash') }")
+    [IO.File]::WriteAllText((Join-Path $foreignUtility 'Utility.psm1'), 'function Get-FileHash { throw "Wrong PowerShell host module" }')
+    $probe = Join-Path $testRoot 'module-probe.ps1'
+    [IO.File]::WriteAllText($probe, @'
+$ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'scripts\portal-lifecycle.ps1')
+if ((Get-FileHash -LiteralPath $PSCommandPath).Hash.Length -ne 64) { throw 'SHA256 unavailable' }
+'@)
+    $info = [Diagnostics.ProcessStartInfo]::new()
+    $info.FileName = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $info.Arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $probe + '"'
+    $info.UseShellExecute = $false; $info.CreateNoWindow = $true
+    $info.EnvironmentVariables['PSModulePath'] = $foreignModules + ';' + $env:PSModulePath
+    $probeProcess = [Diagnostics.Process]::Start($info)
+    try {
+        Assert ($probeProcess.WaitForExit(15000)) 'module compatibility probe completes'
+        Assert ($probeProcess.ExitCode -eq 0) 'inherited foreign module path cannot break lifecycle hashing'
+    } finally {
+        if (-not $probeProcess.HasExited) { $probeProcess.Kill(); [void]$probeProcess.WaitForExit(5000) }
+        $probeProcess.Dispose()
+    }
+
     $fixture = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'fake-portal.cs') -Raw
     Add-Type -TypeDefinition $fixture -OutputAssembly (Join-Path $testRoot 'target\release\heart-portal.exe') -OutputType ConsoleApplication
 
@@ -84,13 +113,13 @@ try {
         $global:PortalTestFailRegistration = $false
         & $installer -Root $testRoot -ConnectLink $link -PortalName 'first-name' -TaskName 'CustomPortalTask'
         Assert ((Get-Content (Join-Path $testRoot '.portal-name') -Raw) -eq 'first-name') 'explicit first name'
-        Assert (Test-Path -LiteralPath (Join-Path $testRoot 'workspace')) 'first install creates workspace'
-        $config = Get-Content -LiteralPath (Join-Path $testRoot 'portal.toml') -Raw
+        Assert (-not (Test-Path -LiteralPath (Join-Path $testRoot 'workspace'))) 'installer does not create workspace beside exe'
+        $config = Get-Content -LiteralPath $fixtureConfig -Raw
         & $installer -Root $testRoot -ConnectLink ($link.Replace('fake-test-token', 'rotated-test-token'))
         & $taskInstaller -Root $testRoot
         Assert ((Get-Content (Join-Path $testRoot '.portal-name') -Raw) -eq 'first-name') 'reinstall preserves name'
         Assert ($global:PortalTestTasks.Count -eq 1 -and $global:PortalTestTasks.ContainsKey('CustomPortalTask')) 'reinstall preserves custom task'
-        Assert ((Get-Content (Join-Path $testRoot 'portal.toml') -Raw) -eq $config) 'reinstall preserves config'
+        Assert ((Get-Content $fixtureConfig -Raw) -eq $config) 'reinstall preserves config'
         Assert ($global:PortalTestTasks['CustomPortalTask'].Actions[0].Execute -like '*\wscript.exe') 'task is windowless'
         Assert ($global:PortalTestTasks['CustomPortalTask'].Settings.MultipleInstances -eq 'IgnoreNew') 'scheduler prevents duplicates'
         Assert ($global:PortalTestTasks['CustomPortalTask'].Principal.LogonType -eq 'Interactive') 'task uses installing user'
@@ -146,7 +175,13 @@ try {
         $stale.pid = $PID; $stale.started = $unrelated.StartTime.ToUniversalTime().Ticks
         Assert ($null -eq (Get-PortalRecordedProcess $testRoot $stale)) 'matching PID/time with another executable is not a runtime'
     } finally { $unrelated.Dispose() }
-    foreach ($attempt in 1..2) {
+    # Retain a handle without owning the lock. After each forced core exit the
+    # next core must acquire the abandoned mutex even though its object exists.
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { $mutexHash = [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($original.identity))).Replace('-', '') }
+    finally { $sha.Dispose() }
+    $retainedMutex = [Threading.Mutex]::OpenExisting("Local\heart-portal-supervisor-$mutexHash")
+    try { foreach ($attempt in 1..2) {
         $before = Read-PortalJson (Join-Path $testRoot '.portal-runtime.json')
         $oldCore = Get-Process -Id $before.supervisor_pid
         try { $oldCore.Kill(); Assert ($oldCore.WaitForExit(5000)) 'core really exits' }
@@ -164,7 +199,8 @@ try {
             Wait-Until { (Get-Item -LiteralPath $log).Length -gt $length } 'runtime writes logs after its original parent exits'
         }
     }
-    Write-Output 'PASS: repeated core failures adopt the same PID/nonce; stdout/stderr and readiness remain live'
+    } finally { $retainedMutex.Dispose() }
+    Write-Output 'PASS: repeated core failures recover an abandoned mutex and adopt the same PID/nonce; logs and readiness remain live'
 
     $launches = @(Get-Launches)
     $portalPid = [int]$launches[0].Split('|')[0]
@@ -286,6 +322,7 @@ try {
 } finally {
     . (Join-Path $testRoot 'scripts\portal-task-common.ps1')
     Stop-PortalCheckoutProcesses $testRoot
+    $env:HEART_PORTAL_FIXTURE_CONFIG = $previousFixtureConfig
     $resolvedTestRoot = (Resolve-Path -LiteralPath $testRoot).Path
     foreach ($diagnostic in $supervisorDiagnostics) {
         if ($diagnostic.Output.Wait(2000)) { Write-Output $diagnostic.Output.Result }

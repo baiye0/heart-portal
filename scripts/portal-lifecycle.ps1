@@ -1,5 +1,9 @@
 # Windows lifecycle protocol v1. Lock files are never deleted: the open handle,
 # not the presence of the file, owns the lock (including across logon sessions).
+# Native child processes can inherit PowerShell 7's incompatible module path.
+# Resolve utility commands (notably Get-FileHash) from this host's own module.
+Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1') -ErrorAction Stop
+
 function Get-PortalExecutable([string]$Root) {
     $saved = Join-Path $Root '.portal-executable'
     if (Test-Path -LiteralPath $saved) {

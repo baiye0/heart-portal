@@ -101,10 +101,10 @@ def launchctl(*args, check=True):
     return result
 
 
-def definition(root, label):
+def definition(root, label, config=None):
     return {
         'Label': label,
-        'ProgramArguments': ['/bin/sh', str(root / 'scripts/portal-launchagent.sh'), str(root), label],
+        'ProgramArguments': ['/bin/sh', str(root / 'scripts/portal-launchagent.sh'), str(root), label] + ([str(config)] if config else []),
         'WorkingDirectory': str(root),
         'RunAtLoad': True,
         'KeepAlive': True,  # Includes successful exits from portal_restart.
@@ -114,6 +114,7 @@ def definition(root, label):
         'Umask': 0o077,
         'EnvironmentVariables': {
             # launchd does not load interactive shell profiles. Preserve kit runtimes.
+            'HOME': str(Path.home()),
             'PATH': os.environ.get('PATH', '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'),
         },
         'StandardOutPath': str(root / 'portal-launchagent.log'),
@@ -125,8 +126,11 @@ def assert_owned(path, root, label):
     if path.exists():
         value = plistlib.loads(path.read_bytes())
         expected = definition(root, label)
+        arguments = value.get('ProgramArguments', [])
         if (value.get('Label') != label
-                or value.get('ProgramArguments') != expected['ProgramArguments']
+                or arguments[:4] != expected['ProgramArguments']
+                or len(arguments) not in (4, 5)
+                or (len(arguments) == 5 and not Path(arguments[4]).is_absolute())
                 or value.get('WorkingDirectory') != str(root)):
             raise RuntimeError('Existing LaunchAgent belongs to another checkout; refusing to replace it.')
 
@@ -263,7 +267,7 @@ def stop_checkout(root, exclude=()):
         time.sleep(0.1)
 
 
-def restore_manual(root):
+def restore_manual(root, snapshot=None):
     """Recover the previous unsupervised service if LaunchAgent startup fails."""
     env = os.environ.copy()
     env.pop('HEART_PORTAL_SUPERVISED', None)
@@ -275,6 +279,14 @@ def restore_manual(root):
     name = saved(root, '.portal-name')
     if name:
         command += ['--name', name]
+    directory = root
+    if snapshot is not None:
+        command = [str(binary_path(root)), *snapshot['arguments']]
+        env = snapshot['environment'].copy()
+        directory = snapshot['cwd']
+    for key in ('HEART_PORTAL_SUPERVISED', 'HEART_PORTAL_MACOS_SUPERVISOR',
+                'HEART_PORTAL_READY_FILE', 'HEART_PORTAL_READY_NONCE', 'HEART_PORTAL_UPGRADE_START'):
+        env.pop(key, None)
     with open(root / 'portal-runtime.log', 'ab') as out, open(root / 'portal-runtime.err.log', 'ab') as err:
         # Installation still owns the maintenance lock while unwinding a failed
         # bootstrap. Wait outside the manager before exec, otherwise the restored
@@ -284,7 +296,7 @@ def restore_manual(root):
                   "fcntl.flock(gate, fcntl.LOCK_SH); gate.close(); "
                   "os.execv(sys.argv[2], sys.argv[2:])")
         return subprocess.Popen([sys.executable, '-c', waiter, str(root / '.portal-upgrade.lock'), *command],
-                         cwd=root, env=env, stdin=subprocess.DEVNULL,
+                         cwd=directory, env=env, stdin=subprocess.DEVNULL,
                          stdout=out, stderr=err, start_new_session=True)
 
 
@@ -305,29 +317,39 @@ def install(args, root, path, label, domain, service):
         name = re.sub(r'[^A-Za-z0-9_-]', '-', f'{being}-{host}').strip('-_')
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]*', name):
         raise ValueError('Portal name must use letters, digits, hyphens or underscores.')
-    config = root / 'portal.toml'
-    config_data = config.read_bytes() if config.exists() else (root / 'portal.example.toml').read_bytes()
-    # Parse the actual config before interrupting a working service.
-    validation = subprocess.run([str(binary), '--config', str(config if config.exists() else root / 'portal.example.toml'), 'kit', 'status'], capture_output=True)
-    if validation.returncode:
-        raise RuntimeError('Portal config validation failed; run heart-portal --config portal.toml kit status.')
+    # Preserve a saved profile on reinstall; new services share the CLI's user config.
+    config_arg = getattr(args, 'config', None)
+    if config_arg is None and path.exists():
+        assert_owned(path, root, label)
+        arguments = plistlib.loads(path.read_bytes())['ProgramArguments']
+        if len(arguments) == 5:
+            config_arg = arguments[4]
+    command = [str(binary)]
+    if config_arg is not None:
+        command += ['--config', str(Path(config_arg).expanduser().resolve())]
+    initialized = subprocess.run(command + ['config', 'init'], cwd=root,
+                                 capture_output=True, text=True, timeout=15)
+    if initialized.returncode:
+        raise RuntimeError('Portal config initialization failed; inspect heart-portal config path or supply --config.')
+    config = Path(json.loads(initialized.stdout)['config']['path'])
     launchctl('print', domain)  # Requires this user's logged-in GUI session.
     assert_owned(path, root, label)
     running = launchctl('print', service, check=False).returncode == 0
     if running and not path.exists():
         raise RuntimeError('Loaded service has no owned plist; refusing to replace it.')
     updates = {
-        config: config_data,
         root / '.portal-connection.url': (link.strip() + '\n').encode(),
         root / '.portal-name': (name + '\n').encode(),
         root / '.portal-launchagent-label': (label + '\n').encode(),
         root / '.portal-python': os.fsencode(Path(sys.executable).resolve()),
         root / '.portal-executable': os.fsencode(binary.resolve()),
-        path: plistlib.dumps(definition(root, label)),
+        path: plistlib.dumps(definition(root, label, config)),
     }
     backups = {file: file.read_bytes() if file.exists() else None for file in updates}
-    had_manual = not running and bool(checkout_pids(root))
-    (root / 'workspace').mkdir(exist_ok=True)
+    manual_pids = checkout_pids(root) if not running else []
+    # Reuse the existing launch snapshot for rollback, including an external config.
+    # Capture before stopping anything; no duplicate argv or config parser.
+    manual_launch = launch_snapshot(process_identity(manual_pids[0])) if manual_pids else None
     if running:
         launchctl('bootout', service)
     bootstrapped = False
@@ -362,8 +384,8 @@ def install(args, root, path, label, domain, service):
                 private_write(file, data)
         if running:
             launchctl('bootstrap', domain, str(path), check=False)
-        elif had_manual and config.exists():
-            restore_manual(root)
+        elif manual_launch is not None:
+            restore_manual(root, manual_launch)
         raise
     print(f'Installed and started {label} for Portal {name}.')
     print('Starts at user login; launchd restarts Portal after exits. Relay reconnect stays in Portal.')
@@ -374,12 +396,39 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', choices=['install', 'uninstall', 'status'])
     parser.add_argument('--root', type=Path, default=Path(__file__).resolve().parent.parent)
+    parser.add_argument('--config', type=Path, help='Existing config or migrated profile; defaults to the user directory.')
     parser.add_argument('--name', help='Reuse the original Portal name on first installation.')
     parser.add_argument('--connect-link', help='Loom URL; prefer saved file, environment or hidden prompt.')
     args = parser.parse_args()
     if sys.platform != 'darwin' or os.getuid() == 0:
         parser.error('Run as the logged-in macOS user, without sudo.')
     root = args.root.resolve(strict=True)
+    if args.action == 'install':
+        # Complete filesystem preparation before touching any LaunchAgent.
+        # The binary rejects an active old installation or conflicting config.
+        if not args.name:
+            args.name = saved(root, '.portal-name') or None
+        if not args.connect_link:
+            args.connect_link = os.environ.get('PORTAL_CONNECT_LINK') or saved(root, '.portal-connection.url') or None
+        previous_label = label_for(root)
+        previous_plist = Path.home() / 'Library/LaunchAgents' / (previous_label + '.plist')
+        if args.config is None and previous_plist.exists():
+            assert_owned(previous_plist, root, previous_label)
+            arguments = plistlib.loads(previous_plist.read_bytes())['ProgramArguments']
+            if len(arguments) == 5:
+                args.config = Path(arguments[4])
+        command = [str(binary_path(root))]
+        if args.config:
+            command += ['--config', str(args.config.expanduser().resolve())]
+        installed = subprocess.run(command + ['--install-user-runtime'], cwd=root,
+                                   capture_output=True, text=True, timeout=30)
+        if installed.returncode:
+            raise RuntimeError('Cannot prepare the user Portal installation; stop the legacy Portal before migrating, and check config conflicts.')
+        root = Path(json.loads(installed.stdout)['root']).resolve(strict=True)
+    else:
+        managed = Path.home() / '.heart-portal/runtime'
+        if saved(managed, '.portal-origin') == str(root):
+            root = managed.resolve(strict=True)
     label = label_for(root)
     path = Path.home() / 'Library/LaunchAgents' / f'{label}.plist'
     domain = f'gui/{os.getuid()}'

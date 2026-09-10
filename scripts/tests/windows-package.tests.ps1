@@ -1,5 +1,5 @@
 ﻿# Start with ONLY the shipped exe; create/remove this fixture's own logon task.
-param([string]$Binary = (Join-Path $PSScriptRoot '..\..\dist\heart-portal-windows-x86_64.exe'), [string]$Candidate = '', [switch]$LocalOnly, [int]$LocalPort = 9100)
+param([string]$Binary = (Join-Path $PSScriptRoot '..\..\dist\heart-portal-windows-x86_64.exe'), [string]$Candidate = '', [switch]$LocalOnly, [int]$LocalPort = 9100, [string]$ClientModulePath = '')
 $ErrorActionPreference = 'Stop'
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 . (Join-Path $repo 'scripts\portal-task-common.ps1')
@@ -7,6 +7,9 @@ $tempBase = [IO.Path]::GetTempPath()
 $id = [guid]::NewGuid().ToString('N')
 $testRoot = Join-Path $tempBase ("portal single exe test ' " + [char]0x6D4B + '-' + $id)
 [IO.Directory]::CreateDirectory($testRoot) | Out-Null
+$fixtureRoot = $testRoot
+$profileRoot = Join-Path $fixtureRoot 'test-home'
+$runtimeRoot = Join-Path $profileRoot '.heart-portal\runtime'
 $exe = Join-Path $testRoot 'heart-portal-windows-x86_64.exe'
 Copy-Item -LiteralPath $Binary -Destination $exe
 $worker = $null
@@ -30,8 +33,9 @@ function Start-PortalCli([string[]]$Arguments = @(), [string]$Directory = $testR
     $info.CreateNoWindow = $true
     $info.RedirectStandardOutput = $true
     $info.RedirectStandardError = $true
-    $info.EnvironmentVariables['HOME'] = Join-Path $testRoot 'test-home'
-    $info.EnvironmentVariables['USERPROFILE'] = Join-Path $testRoot 'test-home'
+    $info.EnvironmentVariables['HOME'] = $profileRoot
+    $info.EnvironmentVariables['USERPROFILE'] = $profileRoot
+    if ($ClientModulePath) { $info.EnvironmentVariables['PSModulePath'] = $ClientModulePath }
     $info.EnvironmentVariables['PORTAL_CONNECT_LINK'] = if ($LocalOnly) { '' } else { "https://relay.invalid/clean-$id/?token=fixture-token" }
     foreach ($name in @('HEART_PORTAL_SUPERVISED','HEART_PORTAL_READY_FILE','HEART_PORTAL_READY_NONCE')) { $info.EnvironmentVariables.Remove($name) }
     $process = [Diagnostics.Process]::Start($info)
@@ -57,7 +61,8 @@ try {
     Assert (@(Get-ChildItem -Force -LiteralPath $testRoot).Count -eq 1) 'version query never bootstraps'
     # Allow running this fixture beside a user's live default-port Portal.
     if ($LocalOnly -and $LocalPort -ne 9100) {
-        [IO.File]::WriteAllText((Join-Path $testRoot 'portal.toml'), "bind='127.0.0.1:$LocalPort'`nworkspace='./workspace'`nkits_enabled=false`n")
+        [IO.Directory]::CreateDirectory((Join-Path $profileRoot '.heart-portal')) | Out-Null
+        [IO.File]::WriteAllText((Join-Path $profileRoot '.heart-portal\portal.toml'), "bind='127.0.0.1:$LocalPort'`nworkspace='./workspace'`nkits_enabled=false`n")
     }
     $first = Start-PortalCli -StreamLines
     $firstLine = $first.process.StandardOutput.ReadLineAsync()
@@ -67,6 +72,7 @@ try {
     $second = Start-PortalCli
     $result = Complete-PortalCli $first
     $secondResult = Complete-PortalCli $second
+    $testRoot = $runtimeRoot
     Assert ($result.code -eq 0) "first exe launch succeeds: $($result.error)"
     Assert ($secondResult.code -eq 0) "concurrent first launch succeeds: $($secondResult.error)"
     Assert ($result.output.Contains('[启动]') -and ($result.output + $secondResult.output).Contains('[守护]') -and $result.output.Contains('[就绪]')) 'concurrent launches explain progress and readiness'
@@ -79,7 +85,9 @@ try {
     Assert (Test-PortalReady $testRoot $version) 'first run starts a ready Portal'
     $initial = Read-PortalJson (Join-Path $testRoot '.portal-runtime.json')
     Assert ($initial.supervisor_pid -and $initial.bootstrap_pid) 'both supervisor levels start automatically'
-    Assert (Test-Path -LiteralPath (Join-Path $testRoot 'portal.toml')) 'default config is created'
+    $effectiveConfig = [string](Read-PortalJson (Join-Path $testRoot '.portal-launch.json')).arguments[1]
+    $expectedConfig = Join-Path $profileRoot '.heart-portal\portal.toml'
+    Assert ($effectiveConfig -eq $expectedConfig -and (Test-Path -LiteralPath $effectiveConfig)) 'new config is centralized and explicit legacy config is preserved'
     $startStatus = Read-PortalJson (Join-Path $testRoot '.portal-start-status.json')
     Assert $startStatus.autostart "logon recovery registered: $($startStatus.warning)"
     $taskName = Get-PortalSavedValue $testRoot '.portal-task-name'
@@ -92,7 +100,8 @@ try {
         Write-Output 'PASS: no Being connection link needed to start the local Portal'
     }
     $launchBefore = [IO.File]::ReadAllText((Join-Path $testRoot '.portal-launch.json'))
-    $configBefore = [IO.File]::ReadAllText((Join-Path $testRoot 'portal.toml'))
+    Assert ((ConvertFrom-Json $launchBefore).working_directory -eq $runtimeRoot) 'guardian working directory does not depend on the download folder'
+    $configBefore = [IO.File]::ReadAllText($effectiveConfig)
     $result = Run-Portal @() $tempBase
     Assert ($result.code -eq 0) "repeat launch succeeds: $($result.error)"
     Assert ((Read-PortalJson (Join-Path $testRoot '.portal-runtime.json')).pid -eq $initial.pid) 'repeat launch reuses the process'
@@ -104,13 +113,17 @@ try {
     Wait-Until { (Test-PortalReady $testRoot $version) -and (Read-PortalJson (Join-Path $testRoot '.portal-runtime.json')).pid -ne $initial.pid } 'real crash recovery' 30
     Write-Output 'PASS: one exe creates config/scripts/logon task; duplicate launch, status and real crash recovery work'
     $beforeUpgrade = Read-PortalJson (Join-Path $testRoot '.portal-runtime.json')
+    $bootstrap = Get-Process -Id $beforeUpgrade.bootstrap_pid -ErrorAction Stop
+    [void]$bootstrap.Handle
     $failedCore = Get-Process -Id $beforeUpgrade.supervisor_pid
     try { $failedCore.Kill(); Assert ($failedCore.WaitForExit(5000)) 'guardian exits before adoption' }
     finally { $failedCore.Dispose() }
     Wait-Until {
+        if ($bootstrap.HasExited) { throw "bootstrap exited during adoption: $($bootstrap.ExitCode)" }
         $current = Read-PortalJson (Join-Path $testRoot '.portal-runtime.json')
         (Test-SavedSupervisor $current) -and $current.supervisor_pid -ne $beforeUpgrade.supervisor_pid
     } 'guardian adopts the running real EXE' 20
+    $bootstrap.Dispose()
     $adopted = Read-PortalJson (Join-Path $testRoot '.portal-runtime.json')
     Assert ($adopted.pid -eq $beforeUpgrade.pid -and $adopted.nonce -eq $beforeUpgrade.nonce -and (Test-PortalReady $testRoot $version)) 'upgrade begins from the original adopted runtime'
     # Keep the real log reader alive during replacement. It must not hold the
@@ -140,12 +153,14 @@ try {
         $candidatePath = Join-Path $stage 'heart-portal.exe'
         Copy-Item -LiteralPath $Binary -Destination $candidatePath
         foreach ($name in @('portal-lifecycle.ps1','portal-upgrade-worker.ps1')) { Copy-Item -LiteralPath (Join-Path $repo "scripts\$name") -Destination $stage }
-        $request = @{ root=$testRoot; target=$exe; candidate=$candidatePath; version=$version; sha256='invalid'; parent_pid=[int]::MaxValue; ack=(Join-Path $stage 'accepted.json'); error=(Join-Path $stage 'error.json') }
+        $request = @{ root=$testRoot; target=(Get-PortalExecutable $testRoot); candidate=$candidatePath; version=$version; sha256='invalid'; parent_pid=[int]::MaxValue; ack=(Join-Path $stage 'accepted.json'); error=(Join-Path $stage 'error.json') }
         Write-PortalJson (Join-Path $stage 'request.json') $request
         $info = [Diagnostics.ProcessStartInfo]::new()
         $info.FileName = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
         $info.Arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' + (ConvertTo-PortalArgument (Join-Path $stage 'portal-upgrade-worker.ps1'))
         $info.UseShellExecute = $false; $info.CreateNoWindow = $true
+        $info.EnvironmentVariables['HOME'] = $profileRoot
+        $info.EnvironmentVariables['USERPROFILE'] = $profileRoot
         $worker = [Diagnostics.Process]::Start($info)
         Assert ($worker.WaitForExit(10000) -and $worker.ExitCode -ne 0) 'checksum failure rejected'
         $worker.Dispose(); $worker = $null
@@ -160,7 +175,7 @@ try {
     }
     Assert (Test-PortalReady $testRoot $version) 'upgraded process remains supervised and ready'
     Assert ([IO.File]::ReadAllText((Join-Path $testRoot '.portal-launch.json')) -eq $launchBefore) 'upgrade preserves launch settings'
-    Assert ([IO.File]::ReadAllText((Join-Path $testRoot 'portal.toml')) -eq $configBefore) 'upgrade preserves config'
+    Assert ([IO.File]::ReadAllText($effectiveConfig) -eq $configBefore) 'upgrade preserves config'
     Assert ((Read-PortalJson (Join-Path $testRoot '.portal-runtime.json')).pid -ne $beforeUpgrade.pid) 'upgraded runtime has a new PID'
     Assert (-not $consoleReader.HasExited) 'console reader survives an upgrade without owning the EXE'
     $consoleReader.Kill(); [void]$consoleReader.WaitForExit(5000)
@@ -172,6 +187,7 @@ try {
     $result = Run-Portal
     Assert ($result.code -eq 0 -and (Test-PortalReady $testRoot $version)) "exe resumes supervision: $($result.error)"
     Assert ((Get-ScheduledTask -TaskName $taskName).Settings.Enabled) 'restart restores logon recovery'
+    Assert (@(Get-ChildItem -Force -LiteralPath $fixtureRoot | Where-Object { $_.Name -ne 'test-home' -and $_.FullName -ne $exe }).Count -eq 0) 'download directory contains no generated Portal files'
     Write-Output 'PASS: upgraded single exe preserves settings and supports stop/resume with logon recovery'
 } catch {
     $testFailure = $_
@@ -180,6 +196,7 @@ try {
 } finally {
     if ($consoleReader) { if (-not $consoleReader.HasExited) { $consoleReader.Kill(); [void]$consoleReader.WaitForExit(5000) }; $consoleReader.Dispose() }
     if ($worker) { if (-not $worker.HasExited) { $worker.Kill(); $worker.WaitForExit() }; $worker.Dispose() }
+    if (Test-Path -LiteralPath $runtimeRoot) { $testRoot = $runtimeRoot }
     $taskName = Get-PortalSavedValue $testRoot '.portal-task-name'
     if ($taskName) {
         Assert-PortalTaskOwnership $testRoot $taskName
@@ -203,7 +220,7 @@ try {
         }
     }
     Stop-PortalCheckoutProcesses $testRoot
-    $resolved = [IO.Path]::GetFullPath($testRoot)
+    $resolved = [IO.Path]::GetFullPath($fixtureRoot)
     if (-not $resolved.StartsWith([IO.Path]::GetFullPath($tempBase), [StringComparison]::OrdinalIgnoreCase) -or (Split-Path $resolved -Leaf) -notlike 'portal single exe test *') { throw 'Unsafe test cleanup path' }
     if ($testFailure) { Write-Output "Failed fixture retained for diagnosis: $resolved" }
     else { Remove-Item -LiteralPath $resolved -Recurse -Force }

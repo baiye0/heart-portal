@@ -8,6 +8,15 @@ param(
 $ErrorActionPreference = 'Stop'
 $Root = (Resolve-Path -LiteralPath $Root).Path
 . (Join-Path $PSScriptRoot 'portal-task-common.ps1')
+$sourceExe = Get-PortalExecutable $Root
+$installed = & $sourceExe --install-user-runtime
+if ($LASTEXITCODE -ne 0) { throw 'Cannot prepare the user Portal installation; stop the legacy Portal before migrating.' }
+$Root = [string](($installed | ConvertFrom-Json).root)
+$portalExe = Get-PortalExecutable $Root
+if (-not (Test-Path -LiteralPath (Join-Path $Root 'scripts\portal-lifecycle.ps1'))) {
+    & $portalExe --export-windows-runtime (Join-Path $Root 'scripts')
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot prepare Portal supervision.' }
+}
 $maintenance = Enter-PortalMaintenance $Root
 try {
 $supervisor = Join-Path $Root 'scripts\portal-supervisor.ps1'
@@ -22,7 +31,12 @@ if ($PortalName -notmatch '^[A-Za-z0-9][A-Za-z0-9_-]*$') {
 }
 $previousTask = Get-PortalSavedValue $Root '.portal-task-name'
 if ([string]::IsNullOrWhiteSpace($TaskName)) { $TaskName = $previousTask }
-if ([string]::IsNullOrWhiteSpace($TaskName)) { $TaskName = "HeartPortal-$PortalName" }
+if ([string]::IsNullOrWhiteSpace($TaskName)) {
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { $hash = [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($Root.ToLowerInvariant()))).Replace('-', '').Substring(0,16) }
+    finally { $sha.Dispose() }
+    $TaskName = "HeartPortal-$hash"
+}
 if ($TaskName.IndexOfAny([char[]]'\/:*?"<>|') -ge 0) { throw 'TaskName contains invalid characters.' }
 Assert-PortalTaskOwnership $Root $TaskName
 if ($previousTask -and $previousTask -ne $TaskName) { Assert-PortalTaskOwnership $Root $previousTask }
@@ -31,10 +45,13 @@ $portalExe = Get-PortalExecutable $Root
 if (-not (Test-Path -LiteralPath $portalExe)) {
     throw "Portal binary not found: $portalExe. Run 'cargo build --release --locked' first."
 }
-foreach ($required in @('portal.toml', '.portal-connection.url')) {
-    if ($required -eq '.portal-connection.url' -and -not [string]::IsNullOrWhiteSpace($ConnectLink)) { continue }
-    if (-not (Test-Path -LiteralPath (Join-Path $Root $required))) { throw "Missing $required; run install-portal-windows.ps1 first." }
+if ([string]::IsNullOrWhiteSpace($ConnectLink) -and -not (Test-Path -LiteralPath (Join-Path $Root '.portal-connection.url'))) {
+    throw 'Missing .portal-connection.url; run install-portal-windows.ps1 first.'
 }
+
+# Resolve/create configuration through the same user-directory policy as the CLI.
+& $portalExe config init | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'Cannot initialize the user Portal configuration.' }
 
 $wscript = Join-Path $env:SystemRoot 'System32\wscript.exe'
 if (-not (Test-Path -LiteralPath $wscript)) { throw "Windows Script Host not found: $wscript" }

@@ -38,6 +38,13 @@ def wait_for(predicate, description, timeout=25):
 
 @unittest.skipUnless(sys.platform == 'darwin', 'macOS only')
 class LifecycleTests(unittest.TestCase):
+    def setUp(self):
+        profile = tempfile.TemporaryDirectory(prefix='portal lifecycle home ')
+        self.addCleanup(profile.cleanup)
+        home_patch = patch.dict(os.environ, HOME=profile.name)
+        home_patch.start()
+        self.addCleanup(home_patch.stop)
+
     def test_binary_metadata_is_preserved_by_management_commands(self):
         with tempfile.TemporaryDirectory(prefix='portal signature test ') as temporary:
             root = Path(temporary)
@@ -56,6 +63,11 @@ class LifecycleTests(unittest.TestCase):
                                        capture_output=True, text=True)
             self.assertEqual(attribute.returncode, 0, 'config checks must preserve file metadata')
             self.assertEqual(attribute.stdout.strip(), 'preserve')
+            installed = json.loads(subprocess.check_output(
+                [str(binary), '--config', str(config), '--install-user-runtime'], text=True))
+            target = Path(installed['executable'])
+            self.assertEqual(hashlib.sha256(target.read_bytes()).digest(), before)
+            self.assertEqual(subprocess.check_output(['/usr/bin/xattr', '-p', 'com.beings.portal-test', str(target)], text=True).strip(), 'preserve')
 
     def test_missing_explicit_config_does_not_start_with_defaults(self):
         with tempfile.TemporaryDirectory(prefix='portal missing config ') as temporary:
@@ -71,7 +83,8 @@ class LifecycleTests(unittest.TestCase):
         binary = BINARY
         self.assertTrue(binary.exists(), 'Run cargo build --release --locked first')
         with tempfile.TemporaryDirectory(prefix='portal relay test ') as temporary, socket.socket() as relay:
-            root = Path(temporary).resolve()
+            root = Path.home() / '.heart-portal/runtime'
+            root.mkdir(parents=True)
             (root / 'scripts').mkdir()
             (root / 'target/release').mkdir(parents=True)
             shutil.copy2(REPO / 'scripts/portal-launchagent.sh', root / 'scripts')
@@ -205,7 +218,7 @@ class LifecycleTests(unittest.TestCase):
             (root / 'scripts').mkdir()
             (root / 'target/release').mkdir(parents=True)
             shutil.copy2(REPO / 'scripts/portal-launchagent.sh', root / 'scripts')
-            shutil.copy2(REPO / 'portal.example.toml', root)
+            shutil.copy2(REPO / 'portal.example.toml', root / 'portal.toml')
             # A compiled fixture gives proc_pidpath the same ownership semantics
             # as the production binary. It creates a descendant holding logs.
             source = root / 'fixture.c'
@@ -216,7 +229,14 @@ class LifecycleTests(unittest.TestCase):
 #include <unistd.h>
 #include <signal.h>
 int main(int argc, char **argv) {
+    if (argc > 1 && !strcmp(argv[argc-1], "--install-user-runtime")) {
+        char root[4096]; getcwd(root, sizeof(root));
+        printf("{\"root\":\"%s\"}\n", root); return 0;
+    }
     if (argc > 3 && !strcmp(argv[3], "kit")) return 0;
+    if (argc > 3 && !strcmp(argv[3], "config")) {
+        printf("{\"config\":{\"path\":\"%s\"}}\n", argv[2]); return 0;
+    }
     FILE *f = fopen("launches.txt", "a");
     fprintf(f, "%d|%s|%s|%s\n", getpid(), argv[argc-1],
             getenv("HEART_PORTAL_SUPERVISED"), getenv("PORTAL_CONNECT_LINK"));
@@ -239,7 +259,7 @@ int main(int argc, char **argv) {
             installer = [sys.executable, str(REPO / 'scripts/portal-macos.py')]
 
             def run(action, *extra):
-                return subprocess.run(installer + [action, '--root', str(root), *extra],
+                return subprocess.run(installer + [action, '--root', str(root), '--config', str(root / 'portal.toml'), *extra],
                                       check=True, text=True, capture_output=True)
 
             def launches():
