@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Deserialize from a kit's manifest.json.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct KitManifest {
     pub name: String,
     pub version: String,
@@ -16,117 +16,9 @@ pub struct KitManifest {
     pub workspace: Option<bool>,
     /// When true, Portal pre-spawns this kit's MCP process at startup.
     pub eager: Option<bool>,
-    /// Grove setup metadata. Credentials are supplied locally, never by Grove.
-    pub provision: Option<KitProvision>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
-pub struct KitProvision {
-    #[serde(default, deserialize_with = "deserialize_env")]
-    pub env: Vec<KitEnvVar>,
-    pub auth: Option<KitAuth>,
-    pub runtime: Option<KitRuntime>,
-    pub install: Option<String>,
-    #[serde(default)]
-    pub deps: Vec<KitDependency>,
-    #[serde(default)]
-    pub platforms: Vec<String>,
-    pub post_install: Option<String>,
-    pub instructions: Option<String>,
-    /// Preserve future Grove metadata when comparing/reloading manifests.
-    /// Unknown fields are not echoed by the setup/status tools.
-    #[serde(default, flatten)]
-    pub extensions: std::collections::BTreeMap<String, Value>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-pub struct KitRuntime {
-    pub name: String,
-    pub version: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-pub struct KitDependency {
-    pub name: String,
-    #[serde(rename = "type")]
-    pub kind: Option<String>,
-    pub description: Option<String>,
-    pub install_hint: Option<String>,
-    #[serde(default = "default_true")]
-    pub required: bool,
-}
-
-/// Methods are alternatives (OR); requirements within a method are AND.
-/// This is an additive Portal extension to Grove's existing provision metadata.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-pub struct KitAuth {
-    #[serde(default = "auth_version")]
-    pub version: u32,
-    #[serde(default = "default_true")]
-    pub required: bool,
-    pub methods: Vec<KitAuthMethod>,
-}
-
-fn auth_version() -> u32 {
-    1
-}
-fn default_true() -> bool {
-    true
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-pub struct KitAuthMethod {
-    pub id: String,
-    /// Open provider identifier. Unknown providers remain visible as unsupported.
-    pub provider: String,
-    pub label: Option<String>,
-    /// Informational flow, e.g. api_key, basic, oauth, device_code, cli.
-    pub flow: Option<String>,
-    #[serde(default)]
-    pub env: Vec<String>,
-    #[serde(default)]
-    pub files: Vec<String>,
-    pub instructions: Option<String>,
-    pub url: Option<String>,
-    /// Unprefixed manifest tool names used for kit-managed login/status.
-    #[serde(default)]
-    pub tools: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-pub struct KitEnvVar {
-    #[serde(default)]
-    pub name: String,
-    pub description: Option<String>,
-    #[serde(default)]
-    pub required: bool,
-    pub default: Option<String>,
-}
-
-// Published Grove kits use both the current list and the older name-keyed map.
-// Normalize once so validation, inheritance and reload keep the same behavior.
-fn deserialize_env<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Vec<KitEnvVar>, D::Error> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Env {
-        List(Vec<KitEnvVar>),
-        Map(std::collections::BTreeMap<String, KitEnvVar>),
-    }
-    Ok(match Env::deserialize(deserializer)? {
-        Env::List(entries) => entries,
-        Env::Map(entries) => entries
-            .into_iter()
-            .map(|(name, mut entry)| {
-                entry.name = name;
-                entry
-            })
-            .collect(),
-    })
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct KitToolDef {
     pub name: String,
     pub description: String,
@@ -136,22 +28,6 @@ pub struct KitToolDef {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn grove_legacy_env_map_preserves_requirements_and_roundtrips() {
-        let provision: KitProvision = serde_json::from_value(serde_json::json!({
-            "env": { "OPENAI_API_KEY": { "required": true, "description": "API key" } },
-            "runtime": { "name": "bash", "version": "any" }
-        }))
-        .unwrap();
-        assert_eq!(provision.env[0].name, "OPENAI_API_KEY");
-        assert!(provision.env[0].required);
-        assert_eq!(provision.env[0].description.as_deref(), Some("API key"));
-        let reloaded: KitProvision =
-            serde_json::from_value(serde_json::to_value(provision).unwrap()).unwrap();
-        assert_eq!(reloaded.env[0].name, "OPENAI_API_KEY");
-        assert!(reloaded.env[0].required);
-    }
 
     #[test]
     fn parses_manifest_with_optional_fields() {

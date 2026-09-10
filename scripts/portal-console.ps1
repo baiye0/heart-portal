@@ -1,12 +1,11 @@
-# Passed as a Unicode -Command string by the EXE; shares its exported lifecycle reader.
+# Passed as a Unicode -Command string by the EXE; no script installation needed.
 # This process only reads files. It must never own the EXE or lifecycle locks.
 param([string]$Root = $env:HEART_PORTAL_CONSOLE_ROOT)
 $ErrorActionPreference = 'Stop'
-. (Join-Path $Root 'scripts\portal-lifecycle.ps1')
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 
 function Read-ConsoleJson([string]$Name) {
-    try { return ((Read-PortalText (Join-Path $Root $Name)) | ConvertFrom-Json) }
+    try { return ([IO.File]::ReadAllText((Join-Path $Root $Name)) | ConvertFrom-Json) }
     catch { return $null }
 }
 
@@ -28,7 +27,7 @@ function Show-ConnectionStatus([string]$State, $Launch) {
     }
     Write-Host "`n========== Being 连接状态：$label ==========" -ForegroundColor $color
     if ($State -eq 'local' -and $Launch) {
-        $relative = (Read-PortalText (Join-Path $Root '.portal-executable')).Trim()
+        $relative = [IO.File]::ReadAllText((Join-Path $Root '.portal-executable')).Trim()
         $exeCommand = '& ' + (Quote-ConsoleArgument (Join-Path $Root $relative))
         Write-Output '请另开 PowerShell 窗口，依次执行下面三行（此日志窗口不接收命令）：'
         Write-Output '$beingLink = Read-Host ''请粘贴从 Beings 复制的完整连接链接（包含 token=）'''

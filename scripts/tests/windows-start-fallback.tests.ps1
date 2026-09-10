@@ -24,8 +24,7 @@ function Get-ScheduledTask { [CmdletBinding()] param($TaskName); return $null }
 function New-ScheduledTaskAction { param($Execute,$Argument,$WorkingDirectory); throw 'Fixture: scheduler access denied' }
 '@
     $launch = @{ protocol=1; identity=('standalone/fallback-' + [guid]::NewGuid()); name='fallback'; arguments=@('--config',(Join-Path $testRoot 'portal.toml'),'--name','fallback'); working_directory=$testRoot; environment=@{} }
-    [IO.File]::WriteAllText([string]$launch.arguments[1], '# fixture')
-    Write-PortalJson (Join-Path $stage 'request.json') @{ action='start'; root=$testRoot; target=$exe; launch=$launch; initialize_config=$false; explicit=$false; parent_pid=$PID; version='0.8.0' }
+    Write-PortalJson (Join-Path $stage 'request.json') @{ action='start'; root=$testRoot; target=$exe; launch=$launch; default_config='# fixture'; explicit=$false; parent_pid=$PID; version='0.8.0' }
     $info = [Diagnostics.ProcessStartInfo]::new()
     $info.FileName = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $info.Arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' + (ConvertTo-PortalArgument (Join-Path $stage 'portal-start-worker.ps1'))

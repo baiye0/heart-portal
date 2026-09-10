@@ -10,6 +10,7 @@ $Root = (Resolve-Path -LiteralPath $Root).Path
 . (Join-Path $PSScriptRoot 'portal-lifecycle.ps1')
 $exe = Get-PortalExecutable $Root
 $supervisorHash = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
+$config = Join-Path $Root 'portal.toml'
 $linkFile = Join-Path $Root '.portal-connection.url'
 Protect-PortalFile $linkFile
 $nameFile = Join-Path $Root '.portal-name'
@@ -23,26 +24,15 @@ if ($launch) {
     }
     $supervisorIdentity = [string]$launch.identity
 } else {
-# Legacy supervisors retain an existing config; fresh installs use the user directory.
-$config = Join-Path $Root 'portal.toml'
-if (-not (Test-Path -LiteralPath $config)) {
-    $previousEncoding = [Console]::OutputEncoding
-    try {
-        # Rust emits UTF-8 JSON even when a hidden Windows PS host uses OEM text.
-        [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
-        $configInfo = & $exe config path
-        if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve the Portal configuration.' }
-    } finally { [Console]::OutputEncoding = $previousEncoding }
-    $config = [string](($configInfo | ConvertFrom-Json).config.path)
-}
+# Existing manually installed relay supervisors retain their saved layout.
 if (-not (Test-Path -LiteralPath $config)) { throw "Portal config not found: $config" }
 if (-not (Test-Path -LiteralPath $linkFile)) { throw "Connection file not found: $linkFile" }
 
-$loomLink = (Read-PortalText $linkFile).Trim()
+$loomLink = (Get-Content -LiteralPath $linkFile -Raw).Trim()
 if ([string]::IsNullOrWhiteSpace($loomLink)) { throw "Connection file is empty: $linkFile" }
 
 if ([string]::IsNullOrWhiteSpace($PortalName) -and (Test-Path -LiteralPath $nameFile)) {
-    $PortalName = (Read-PortalText $nameFile).Trim()
+    $PortalName = (Get-Content -LiteralPath $nameFile -Raw).Trim()
 }
 if ([string]::IsNullOrWhiteSpace($PortalName)) {
     throw "Portal name is not configured. Run install-portal-windows.ps1 or pass -PortalName explicitly."
@@ -70,14 +60,7 @@ try {
 }
 $createdNew = $false
 $supervisorMutex = [System.Threading.Mutex]::new($true, "Local\heart-portal-supervisor-$identityHash", [ref]$createdNew)
-$ownsMutex = $createdNew
-if (-not $ownsMutex) {
-    # An open handle can outlive the previous owner. Object existence is not
-    # ownership: recover an abandoned mutex instead of telling bootstrap to exit.
-    try { $ownsMutex = $supervisorMutex.WaitOne(0) }
-    catch [System.Threading.AbandonedMutexException] { $ownsMutex = $true }
-}
-if (-not $ownsMutex) {
+if (-not $createdNew) {
     $supervisorMutex.Dispose()
     Write-Output 'Another Portal supervisor is already running for this relay/Being; exiting.'
     exit 73

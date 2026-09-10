@@ -2,7 +2,6 @@
 
 > 2026-06-19 · seam_walker + 泽平
 > Status: design
-> 当前实现不对 kit 强制执行 workspace/文件系统权限隔离。Kit 与 Portal 同用户运行；本文中的权限继承是设计目标，不是已实现的安全保证。实际边界见 [Kit 配置与信任边界](kit-configuration.md#portal-reliability-and-trust-boundary)。
 > First Kit sample: Hand (Alice)
 
 ## 一句话

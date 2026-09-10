@@ -11,7 +11,6 @@ permissions:
 jobs:
   rust:
     strategy:
-      fail-fast: false
       matrix:
         os: [macos-latest, macos-15-intel, windows-latest]
     runs-on: ${{ matrix.os }}
@@ -26,31 +25,17 @@ jobs:
           if (-not (Test-Path $git)) { throw 'Git for Windows is required for the PATH regression test.' }
       - name: Rust tests (includes native Windows exec regressions)
         run: cargo test --locked
-      - name: Build Portal
-        run: cargo build --locked
-      - name: Runtime status over TCP and relay
-        run: python scripts/tests/portal-status.tests.py
-      - name: Runtime security regressions
-        run: |
-          python scripts/tests/runtime-security.tests.py
-          python scripts/tests/kit-isolation.tests.py test_host_secrets_are_not_inherited_and_dotenv_values_remain_literal test_metadata_limits_reject_bad_files_without_losing_a_working_kit
-      - name: Configuration path compatibility and migration
-        run: python scripts/tests/config-layout.tests.py
-      # Offline fixtures only; full kit suites remain available for local checks.
-      - name: Kit reload smoke test
-        run: python scripts/tests/kit-lifecycle.tests.py KitLifecycleTests.test_targeted_reload_preserves_other_process_and_invalid_manifest
-      - name: Kit startup and cleanup smoke tests
-        run: python scripts/tests/kit-isolation.tests.py test_slow_startup_does_not_block_portal_or_other_kits_and_reload_cancels_it test_retired_process_tree_is_killed_on_restart_while_an_outsider_survives
       - name: macOS lifecycle, recovery and upgrade regressions
         if: runner.os == 'macOS'
         env:
           PORTAL_TEST_BINARY: ${{ github.workspace }}/target/debug/heart-portal
         run: |
           set -euo pipefail
+          cargo build --locked
           python3 scripts/tests/macos-package.tests.py
           python3 scripts/tests/macos-upgrade.tests.py
           python3 scripts/tests/macos-recovery.tests.py
-          python3 scripts/tests/macos-supervisor.tests.py SupervisorTests
+          python3 scripts/tests/macos-supervisor.tests.py
           python3 scripts/tests/macos-lifecycle.tests.py
       - name: Windows supervisor lifecycle
         if: runner.os == 'Windows'
@@ -59,11 +44,11 @@ jobs:
           .\scripts\tests\windows-lifecycle.tests.ps1
           .\scripts\tests\windows-start-fallback.tests.ps1
           .\scripts\tests\windows-private-state.tests.ps1
-          .\scripts\tests\windows-console.tests.ps1
       - name: Windows single-exe first launch and upgrade
         if: runner.os == 'Windows'
         shell: powershell
         run: |
+          cargo build --locked
+          if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
           .\scripts\tests\windows-package.tests.ps1 -Binary '.\target\debug\heart-portal.exe'
           .\scripts\tests\windows-package.tests.ps1 -Binary '.\target\debug\heart-portal.exe' -LocalOnly
-          .\scripts\tests\windows-connection-guidance.tests.ps1 -Binary '.\target\debug\heart-portal.exe'

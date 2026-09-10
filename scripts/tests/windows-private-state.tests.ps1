@@ -19,25 +19,6 @@ function Assert-Private([string]$Path) {
 }
 
 try {
-    $metadata = Join-Path $root '.portal-name'
-    [IO.File]::WriteAllText($metadata, ('x' * (1024 * 1024)))
-    if ((Read-PortalText $metadata).Length -ne 1024 * 1024) { throw 'Exact metadata limit rejected' }
-    [IO.File]::AppendAllText($metadata, 'x')
-    $rejected = $false
-    try { Read-PortalText $metadata | Out-Null } catch { $rejected = $true }
-    if (-not $rejected) { throw 'Oversized metadata was accepted' }
-    [IO.File]::WriteAllText($metadata, 'fixture')
-    $link = Join-Path $root 'metadata-link'
-    # Hosted Windows runners allow symlinks. Report unsupported local accounts
-    # explicitly instead of mistaking lack of privilege for a passing assertion.
-    try { New-Item -ItemType SymbolicLink -Path $link -Target $metadata -ErrorAction Stop | Out-Null }
-    catch { Write-Warning 'Skipping symlink fixture: this account cannot create symbolic links.' }
-    if (Test-Path -LiteralPath $link) {
-        $rejected = $false
-        try { Read-PortalText $link | Out-Null } catch { $rejected = $true }
-        if (-not $rejected) { throw 'Reparse metadata was accepted' }
-        [IO.File]::Delete($link)
-    }
     $acl = [IO.Directory]::GetAccessControl($root)
     $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($everyone,
         [Security.AccessControl.FileSystemRights]::ReadAndExecute,

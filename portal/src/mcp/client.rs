@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use futures_util::{stream, StreamExt};
 use serde_json::Value;
 use std::collections::HashMap;
 use tracing::{debug, info, warn};
@@ -17,26 +16,18 @@ impl McpClient {
     pub async fn connect_all(configs: Vec<McpServerConfig>) -> Result<Self> {
         let mut connections = HashMap::new();
 
-        let attempts = stream::iter(configs.into_iter().map(|config| async move {
-            let name = config.name.clone();
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                McpConnection::spawn(config),
-            )
-            .await;
-            (name, result)
-        }))
-        .buffer_unordered(4);
-        tokio::pin!(attempts);
-        while let Some((name, result)) = attempts.next().await {
-            match result {
-                Ok(Ok(connection)) => {
-                    connections.insert(name.clone(), connection);
+        for config in configs {
+            let server_name = config.name.clone();
+            info!("Connecting to MCP server '{}'", server_name);
+
+            match McpConnection::spawn(config).await {
+                Ok(connection) => {
+                    connections.insert(server_name.clone(), connection);
+                    info!("Successfully connected to MCP server '{}'", server_name);
                 }
-                _ => warn!(
-                    "MCP server '{}' failed startup; other servers remain available",
-                    name
-                ),
+                Err(e) => {
+                    warn!("Failed to connect to MCP server '{}': {}", server_name, e);
+                }
             }
         }
 
@@ -47,12 +38,6 @@ impl McpClient {
         }
 
         Ok(Self { connections })
-    }
-
-    pub fn abort(&self) {
-        for connection in self.connections.values() {
-            connection.abort();
-        }
     }
 
     /// Get number of connected servers.
@@ -69,18 +54,14 @@ impl McpClient {
 
             match connection.list_tools().await {
                 Ok(tools) => {
-                    info!(
-                        "MCP server '{}' provides {} tools",
-                        server_name,
-                        tools.len()
-                    );
+                    info!("MCP server '{}' provides {} tools", server_name, tools.len());
                     for tool in tools {
                         debug!("  - {}: {}", tool.name, tool.description);
                         all_tools.push((server_name.clone(), tool));
                     }
                 }
-                Err(_) => {
-                    warn!("Failed to list tools from MCP server '{}'", server_name);
+                Err(e) => {
+                    warn!("Failed to list tools from MCP server '{}': {}", server_name, e);
                 }
             }
         }
@@ -106,8 +87,8 @@ impl McpClient {
             .ok_or_else(|| anyhow::anyhow!("MCP server '{}' not connected", server_name))?;
 
         debug!(
-            "Calling tool '{}' on MCP server '{}'",
-            tool_name, server_name
+            "Calling tool '{}' on MCP server '{}' with args: {}",
+            tool_name, server_name, arguments
         );
 
         connection

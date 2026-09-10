@@ -79,11 +79,7 @@ class UnitTests(unittest.TestCase):
 class LaunchdTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='portal upgrade 中文 ')
-        profile = Path(self.temp.name).resolve()
-        home_patch = patch.dict(os.environ, HOME=str(profile))
-        home_patch.start()
-        self.addCleanup(home_patch.stop)
-        self.root = profile / '.heart-portal/runtime'
+        self.root = Path(self.temp.name).resolve()
         self.target = self.root / 'target/release/heart-portal'
         self.target.parent.mkdir(parents=True)
         (self.root / 'scripts').mkdir()
@@ -157,7 +153,6 @@ spec.loader.exec_module(worker)
             **({'parent_executable': str(manager.executable_path(parent.pid))} if parent else {})})
         manager.private_write(plist, plistlib.dumps({'Label': label,
             'ProgramArguments': [sys.executable, str(wrapper)], 'RunAtLoad': True,
-            'EnvironmentVariables': {'HOME': str(Path.home())},
             'KeepAlive': {'SuccessfulExit': False}, 'ThrottleInterval': 2,
             'AbandonProcessGroup': True,
             'StandardOutPath': str(stage / 'worker.log'), 'StandardErrorPath': str(stage / 'worker.log')}))

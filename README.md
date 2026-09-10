@@ -24,7 +24,6 @@ Portal connects **outbound** to Hearth's relay endpoint — no port forwarding n
 
 | Tool | Parameters | Description |
 |------|------------|-------------|
-| `portal_status` | none | Read running version/build ID, capabilities, effective config and warnings, connection and kit process/call status; no credential values. |
 | `portal_exec` | `command`, `workdir`, `timeout_secs`, `background` | Execute shell commands with allowlist-based security. |
 | `portal_process` | `action`, `session_id`, `data` | Manage background command sessions. |
 | `portal_file_read` | `path`, `offset`, `limit` | Read files from the workspace. |
@@ -34,37 +33,10 @@ Portal connects **outbound** to Hearth's relay endpoint — no port forwarding n
 | `portal_web_search` | `query` | Search the web. |
 | `portal_search` | `query` | Search text across the workspace. |
 | `portal_screenshot` | `path`, `region`, `display` | Capture a screenshot to a workspace file. |
-| `portal_tools_reload` | none | Reload custom tools without restarting Portal. |
-| `portal_kits_status` | none | Inspect kit configuration requirements and status without returning credential values. |
-| `portal_kits_setup` | `kit` | Inspect runtime, installation steps and alternative authentication methods. |
-| `portal_kits_reload` | optional `kit` | Immediately reload kit code, manifests and credentials. |
-| `portal_restart` | none | Restart a supervised Portal. Kit updates use `portal_kits_reload`. |
-
-Kits are discovered from the configured `kits_dir` (default `~/.heart-portal/kits`).
-Portal checks for installations, removals, manifest changes and `.env` changes
-every five seconds and notifies connected clients. See
-[Kit configuration and hot reload](docs/kit-configuration.md) for credentials
-and updates that only change code.
-
-Being can call `portal_status` with `{}` to inspect the running Portal, even
-when exec, file and kit tools are disabled. See [Runtime status](docs/portal-status.md)
-for fields, build identification and the distinction between configuration and
-service authorization.
+| `portal_tools_reload` | none | Reload custom tools from `workspace/tools/mcp.toml`. |
+| `portal_restart` | none | Restart a supervised Portal to load updated kits. |
 
 ## Setup
-
-New Windows installations and direct macOS/Linux launches default to
-`~/.heart-portal/portal.toml` (Windows:
-`%USERPROFILE%\.heart-portal\portal.toml`). Existing explicit configs and saved
-launches keep their paths. Run `heart-portal config path` to see which config
-will be used; see [configuration layout and migration](docs/configuration-layout.md)
-before relocating an existing installation.
-
-On Windows and macOS, the downloaded executable runs the installed copy in
-`~/.heart-portal/runtime`. Logs, guardian scripts/state, locks and upgrade backups
-stay there too. Stop an existing legacy installation before moving it; downloads
-never overwrite an already installed version. OS login registrations use their
-standard locations, and explicit workspace/kit paths are preserved.
 
 ### 1. Download
 
@@ -85,10 +57,8 @@ mv heart-portal-* heart-portal
 
 ### 2. Configure
 
-For a new installation, create `~/.heart-portal/portal.toml` from
-`portal.example.toml` and edit the local settings. Preserve any existing config;
-`heart-portal config path` shows which file this installation uses. See the
-[migration guide](docs/configuration-layout.md) for legacy installations.
+Copy `portal.example.toml` to `portal.toml` and edit the local settings.
+`portal.toml` is Git-ignored: do not commit machine-specific paths or tokens.
 Relative workspace paths are resolved from the config file's directory. Portal
 initializes that root before serving tools and stops on configuration/access
 errors. On Windows, omitting the workspace uses
@@ -97,7 +67,7 @@ errors. On Windows, omitting the workspace uses
 ### 3. Run
 
 ```bash
-./heart-portal --config ~/.heart-portal/portal.toml --connect "https://echo.beings.town/<being>/?token=<token>" --name "<machine-name>"
+./heart-portal --config portal.toml --connect "https://echo.beings.town/<being>/?token=<token>" --name "<machine-name>"
 ```
 
 The macOS release remains a directly runnable binary with the same command
@@ -119,9 +89,7 @@ python3 scripts/portal-macos.py install --name "<original-machine-name>"
 ```
 
 For an already downloaded executable, the same management command supports
-`--root /path/to/installed-folder`. New installations store configuration in
-`~/.heart-portal/portal.toml`; use `--config /absolute/path/portal.toml` for an
-existing or migrated profile. Existing saved configurations remain usable. Name the binary
+`--root /path/to/installed-folder`; keep `portal.toml` there and name the binary
 `heart-portal` or retain its published filename. This preserves its path and
 signature. Direct foreground execution remains available and does not install
 a LaunchAgent automatically.
@@ -183,7 +151,7 @@ python3 scripts/tests/macos-lifecycle.tests.py
 
 Download just `heart-portal-windows-x86_64.exe` into a writable folder and run it.
 The exe embeds its supervisor and updater: on the first normal launch it creates
-`%USERPROFILE%\.heart-portal\portal.toml`, extracts the scripts, registers a current-user logon task, and
+`portal.toml`, extracts the scripts, registers a current-user logon task, and
 starts Portal under supervision. No installer, separate script download, Rust,
 Python, VBScript, or Visual C++ redistributable is needed for Portal itself.
 Windows 10/11's built-in Windows PowerShell 5.1 runs the embedded scripts.
@@ -215,17 +183,15 @@ connection or launch arguments, stop first, then run with the new arguments.
 .\heart-portal-windows-x86_64.exe
 ```
 
-After updating a kit, call `portal_kits_reload` for that kit; Portal and its
-relay connection stay running. Use `portal_restart` only after changing Portal
-configuration or replacing the Portal binary, and never kill Portal or launch
-another supervisor. The restart tool is available only under supervision: it
-returns a response, exits, and the supervisor relaunches Portal after five
+After updating a kit, the Being should call `portal_restart`, not kill
+Portal or launch another supervisor. The tool is available only under supervision:
+it returns a response, exits, and the supervisor relaunches Portal after five
 seconds using the same name. Shutdown cleanup is limited to ten seconds;
 inherited log pipes cannot hold the supervisor's restart loop indefinitely.
 The existing relay reconnect backoff (2–30 seconds with jitter) is unchanged.
 
 Kits remain under the current user's `~/.heart-portal/kits` or configured
-`kits_dir`. Use `heart-portal kit status` for
+`kits_dir`. Use `heart-portal --config portal.toml kit status` for
 pre-flight checks and the runtime logs for startup errors. `portal_kit_usage`
 counts successful calls since its last read; `{}` is not a kit inventory.
 
@@ -311,7 +277,7 @@ the Portal logs or an MCP tool call; `/api/health` is no longer available.
 
 ## Security
 
-- **File tool boundary**: File tools only access files within the configured workspace root. This does not sandbox `portal_exec` or community kit processes; both run as the host OS user.
+- **Workspace sandboxed**: File tools only access files within the configured workspace root
 - **Exec allowlist**: Only explicitly allowed commands can be executed
 - **WSS encrypted**: All relay traffic is TLS-encrypted
 - **No inbound ports**: Portal connects outbound only — no port forwarding or firewall changes needed

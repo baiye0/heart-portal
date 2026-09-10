@@ -28,22 +28,16 @@ pub async fn run(
     let exe = std::env::current_exe()?;
     let root = crate::windows_upgrade::installation_root(&exe)?;
     crate::windows_private::protect_installation(&root)?;
-    // Delegation and callers can supply the link without putting its token in
-    // argv. This is still an explicit override of the saved launch settings.
-    let connect_override = connect.map(str::to_owned).or_else(|| {
-        std::env::var("PORTAL_CONNECT_LINK").ok().filter(|value| !value.trim().is_empty())
-    });
-    let connect = connect_override.as_deref();
     let explicit = config.is_some() || connect.is_some() || name.is_some();
     let saved = root.join(".portal-launch.json");
-    let (launch, initialize_config) = if action != "start" || (!explicit && saved.is_file()) {
-        (Value::Null, false)
+    let (launch, default_config) = if action != "start" || (!explicit && saved.is_file()) {
+        (Value::Null, Value::Null)
     } else {
         make_launch(&root, config, connect, name)?
     };
     if action == "start" {
         let effective = if launch.is_null() {
-            serde_json::from_slice(&crate::bounded_file::metadata_bytes(&saved)?)
+            serde_json::from_slice(&std::fs::read(&saved)?)
                 .context("Invalid saved Portal launch configuration")?
         } else {
             launch.clone()
@@ -72,7 +66,7 @@ pub async fn run(
     )?;
     let request = json!({
         "action": action, "root": root, "target": exe, "launch": launch,
-        "initialize_config": initialize_config, "explicit": explicit,
+        "default_config": default_config, "explicit": explicit,
         "parent_pid": std::process::id(), "version": crate::upgrade::PORTAL_VERSION,
     });
     crate::windows_upgrade::write_json(&stage.join("request.json"), &request)?;
@@ -129,7 +123,7 @@ pub async fn run(
     if action == "start" {
         println!("[就绪] Portal 和守护已在后台运行。");
         // Repeat the actionable summary after progress, so it isn't buried.
-        if let Ok(bytes) = crate::bounded_file::metadata_bytes(&saved) {
+        if let Ok(bytes) = std::fs::read(&saved) {
             if let Ok(effective) = serde_json::from_slice::<Value>(&bytes) {
                 print_launch_summary(&effective, &exe);
             }
@@ -277,18 +271,19 @@ fn make_launch(
     config: Option<&str>,
     connect: Option<&str>,
     name: Option<&str>,
-) -> Result<(Value, bool)> {
-    // Changing only --name/--connect must retain the saved explicit config.
-    let config_path =
-        crate::paths::locate_config(config.map(Path::new), &[root.to_path_buf()])?.path;
-    let (resolved, initialize_config) = if config_path.try_exists()? {
+) -> Result<(Value, Value)> {
+    let config_path = match config {
+        Some(path) => std::path::absolute(path)?,
+        None => root.join("portal.toml"),
+    };
+    let (resolved, default_config) = if config_path.is_file() {
         (
             crate::config::PortalConfig::load(
                 config_path
                     .to_str()
                     .context("Config path must be Unicode")?,
             )?,
-            false,
+            Value::Null,
         )
     } else {
         anyhow::ensure!(
@@ -298,7 +293,10 @@ fn make_launch(
         );
         let mut defaults = crate::config::PortalConfig::default();
         defaults.bind_host = "127.0.0.1".into();
-        (defaults, true)
+        (
+            defaults,
+            Value::String(include_str!("../../portal.example.toml").to_string()),
+        )
     };
     let connection = connect
         .map(str::to_owned)
@@ -307,19 +305,19 @@ fn make_launch(
                 .ok()
                 .filter(|value| !value.trim().is_empty())
         })
-        .or_else(|| resolved.connect_link.clone());
-    let connection = match connection {
-        Some(value) => Some(value),
-        None => crate::bounded_file::optional_text(&root.join(".portal-connection.url"))?
-            .map(|value| value.trim().to_owned()).filter(|value| !value.is_empty()),
-    };
+        .or_else(|| {
+            std::fs::read_to_string(root.join(".portal-connection.url"))
+                .ok()
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        });
     let identity = if let Some(link) = &connection {
         let (host, being, _) = crate::relay_client::parse_loom_link(link)?;
         format!("{}/{being}", host.to_ascii_lowercase())
     } else {
         format!("standalone/{}:{}", resolved.bind_host, resolved.bind_port)
     };
-    let saved_name = crate::bounded_file::optional_text(&root.join(".portal-name"))?;
+    let saved_name = std::fs::read_to_string(root.join(".portal-name")).ok();
     let portal_name = crate::relay_portal_name(
         name.map(str::to_owned)
             .or_else(|| saved_name.map(|value| value.trim().to_owned())),
@@ -348,6 +346,6 @@ fn make_launch(
             "arguments": ["--config", config_path, "--name", portal_name],
             "working_directory": std::env::current_dir()?, "environment": environment,
         }),
-        initialize_config,
+        default_config,
     ))
 }
