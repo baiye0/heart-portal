@@ -124,10 +124,13 @@ pub fn publish_ready() -> Result<()> {
     let Ok(root) = installation_root(&std::env::current_exe()?) else {
         return Ok(());
     };
-    let Ok(nonce) = std::fs::read_to_string(root.join(".portal-launch-nonce")) else {
+    let Ok(nonce) = std::env::var("HEART_PORTAL_READY_NONCE")
+        .or_else(|_| std::fs::read_to_string(root.join(".portal-launch-nonce"))) else {
         return Ok(());
     };
-    let path = root.join(format!(".portal-ready.{}.tmp", std::process::id()));
+    let target = std::env::var_os("HEART_PORTAL_READY_FILE").map(PathBuf::from)
+        .unwrap_or_else(|| root.join(".portal-ready.json"));
+    let path = target.with_extension(format!("{}.tmp", std::process::id()));
     use std::io::Write;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
@@ -138,7 +141,7 @@ pub fn publish_ready() -> Result<()> {
         "pid": std::process::id(), "version": crate::upgrade::PORTAL_VERSION, "nonce": nonce
     }))?)?;
     file.sync_all()?;
-    std::fs::rename(path, root.join(".portal-ready.json"))?;
+    std::fs::rename(path, target)?;
     Ok(())
 }
 

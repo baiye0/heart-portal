@@ -228,7 +228,14 @@ fn restart_portal(install_dir: &Path) -> Result<()> {
     }
 }
 
+pub fn ensure_standalone_upgrade() -> Result<()> {
+    anyhow::ensure!(std::env::var("HEART_PORTAL_CLIENT_MANAGED").as_deref() != Ok("1"),
+        "Portal is managed by Town-Client; update it through the client to stop and replace its supervisor safely");
+    Ok(())
+}
+
 pub async fn run_upgrade() -> Result<()> {
+    ensure_standalone_upgrade()?;
     eprintln!("Checking for updates...");
     let platform = detect_platform()?;
     #[cfg(windows)]

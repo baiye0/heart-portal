@@ -6,7 +6,6 @@
 
 mod bounded_file;
 mod config;
-#[cfg(windows)]
 mod connection_status;
 mod exec_policy;
 mod kits;
@@ -188,7 +187,12 @@ async fn main() -> Result<()> {
         // Stop/status still reach an old installation before its controlled move.
         let legacy_management = matches!(&cli.command, Some(Commands::Stop | Commands::Status))
             && user_installation::has_legacy_state(&source)? && !user_installation::migrated_source(&source)?;
-        if !managed && lifecycle && !legacy_management {
+        // Town-Client owns the executable, supervisor and upgrade transaction.
+        // An explicit config keeps the user's existing workspace and kits.
+        let client_managed = std::env::var("HEART_PORTAL_CLIENT_MANAGED").as_deref() == Ok("1")
+            && std::env::var("HEART_PORTAL_SUPERVISED").as_deref() == Ok("1")
+            && explicit_config.is_some();
+        if !managed && lifecycle && !legacy_management && !client_managed {
             anyhow::ensure!(std::env::var("HEART_PORTAL_SUPERVISED").as_deref() != Ok("1"),
                 "Stop the legacy supervisor, then launch Portal directly to migrate into ~/.heart-portal");
             if cli.command.is_none() {
@@ -272,6 +276,9 @@ async fn main() -> Result<()> {
         return macos_upgrade::show_status();
         #[cfg(not(any(windows, target_os = "macos")))]
         anyhow::bail!("Upgrade status is supported on Windows and macOS");
+    }
+    if cli.legacy_upgrade || matches!(&command, Some(Commands::Upgrade { .. })) {
+        upgrade::ensure_standalone_upgrade()?;
     }
     if let Some(Commands::Upgrade {
         file: Some(path), ..
@@ -569,7 +576,6 @@ async fn main() -> Result<()> {
     let listener = TcpListener::bind(&addr).await?;
     info!("Portal MCP listening on {}", addr);
     tool_host.set_connection_state(tools::status::ConnectionState::Listening);
-    #[cfg(windows)]
     connection_status::publish("local");
     publish_supervisor_ready()?;
     #[cfg(any(windows, target_os = "macos"))]
