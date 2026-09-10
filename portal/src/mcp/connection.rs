@@ -907,6 +907,7 @@ mod tests {
     async fn cmd_kit_handles_spaces_and_literal_metacharacters() {
         let dir = std::env::temp_dir().join(format!("portal kit ({})", uuid::Uuid::new_v4()));
         std::fs::create_dir(&dir).unwrap();
+        let _fixture_dir = crate::kits::tests::TestKits(dir.clone());
         let script = dir.join("kit shim.cmd");
         std::fs::write(
             &script,
@@ -945,7 +946,6 @@ mod tests {
             .await;
         connection.shutdown().await.unwrap();
         assert_eq!(result.unwrap()["token"], "space & value");
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

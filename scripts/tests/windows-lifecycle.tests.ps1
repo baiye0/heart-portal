@@ -1,5 +1,7 @@
 # Run in Windows PowerShell 5.1. No Pester, relay, or real scheduled task needed.
 $ErrorActionPreference = 'Stop'
+$previousConsoleEncoding = [Console]::OutputEncoding
+[Console]::OutputEncoding = [Text.Encoding]::GetEncoding(437)
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $tempBase = [IO.Path]::GetTempPath()
 $testRoot = Join-Path $tempBase ("portal Windows test " + [char]0x6D4B + '-' + [guid]::NewGuid().ToString('N'))
@@ -325,6 +327,7 @@ if ((Get-FileHash -LiteralPath $PSCommandPath).Hash.Length -ne 64) { throw 'SHA2
     . (Join-Path $testRoot 'scripts\portal-task-common.ps1')
     Stop-PortalCheckoutProcesses $testRoot
     $env:HEART_PORTAL_FIXTURE_CONFIG = $previousFixtureConfig
+    [Console]::OutputEncoding = $previousConsoleEncoding
     $resolvedTestRoot = (Resolve-Path -LiteralPath $testRoot).Path
     foreach ($diagnostic in $supervisorDiagnostics) {
         if ($diagnostic.Output.Wait(2000)) { Write-Output $diagnostic.Output.Result }

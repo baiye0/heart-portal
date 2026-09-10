@@ -8,6 +8,8 @@ public class FakePortal
 {
     public static int Main(string[] args)
     {
+        // Match the real Rust CLI, including under a hidden OEM-codepage host.
+        Console.OutputEncoding = new System.Text.UTF8Encoding(false);
         if (args.Length > 0 && args[0] == "--install-user-runtime")
         {
             // Lifecycle fixtures already own an isolated installation.

@@ -26,8 +26,13 @@ if ($launch) {
 # Legacy supervisors retain an existing config; fresh installs use the user directory.
 $config = Join-Path $Root 'portal.toml'
 if (-not (Test-Path -LiteralPath $config)) {
-    $configInfo = & $exe config path
-    if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve the Portal configuration.' }
+    $previousEncoding = [Console]::OutputEncoding
+    try {
+        # Rust emits UTF-8 JSON even when a hidden Windows PS host uses OEM text.
+        [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+        $configInfo = & $exe config path
+        if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve the Portal configuration.' }
+    } finally { [Console]::OutputEncoding = $previousEncoding }
     $config = [string](($configInfo | ConvertFrom-Json).config.path)
 }
 if (-not (Test-Path -LiteralPath $config)) { throw "Portal config not found: $config" }

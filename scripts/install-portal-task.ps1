@@ -9,8 +9,12 @@ $ErrorActionPreference = 'Stop'
 $Root = (Resolve-Path -LiteralPath $Root).Path
 . (Join-Path $PSScriptRoot 'portal-task-common.ps1')
 $sourceExe = Get-PortalExecutable $Root
-$installed = & $sourceExe --install-user-runtime
-if ($LASTEXITCODE -ne 0) { throw 'Cannot prepare the user Portal installation; stop the legacy Portal before migrating.' }
+$previousEncoding = [Console]::OutputEncoding
+try {
+    [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+    $installed = & $sourceExe --install-user-runtime
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot prepare the user Portal installation; stop the legacy Portal before migrating.' }
+} finally { [Console]::OutputEncoding = $previousEncoding }
 $Root = [string](($installed | ConvertFrom-Json).root)
 $portalExe = Get-PortalExecutable $Root
 if (-not (Test-Path -LiteralPath (Join-Path $Root 'scripts\portal-lifecycle.ps1'))) {

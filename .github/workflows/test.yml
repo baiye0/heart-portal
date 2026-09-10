@@ -46,7 +46,7 @@ jobs:
           python3 scripts/tests/macos-package.tests.py
           python3 scripts/tests/macos-upgrade.tests.py
           python3 scripts/tests/macos-recovery.tests.py
-          python3 scripts/tests/macos-supervisor.tests.py
+          python3 scripts/tests/macos-supervisor.tests.py SupervisorTests
           python3 scripts/tests/macos-lifecycle.tests.py
       - name: Windows supervisor lifecycle
         if: runner.os == 'Windows'
