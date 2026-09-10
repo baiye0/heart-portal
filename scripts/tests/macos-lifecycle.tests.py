@@ -227,6 +227,7 @@ class LifecycleTests(unittest.TestCase):
                     port = listener.getsockname()[1]
                 config = config_dir / 'portal.toml'
                 config_text = f'name="relative-fixture"\nbind="127.0.0.1:{port}"\nworkspace="./workspace"\nkits_dir="./kits"\n'
+                config_text += "\n[security]\nexpose_host_details=true\n"
                 config.write_text(config_text)
                 env = {k: v for k, v in os.environ.items()
                        if not k.startswith(('HEART_PORTAL_', 'PORTAL_'))}
@@ -260,6 +261,32 @@ class LifecycleTests(unittest.TestCase):
                         subprocess.run([str(root / 'heart-portal'), 'stop'], env=env,
                                        capture_output=True, timeout=25)
                         process.wait(timeout=15)
+
+    def test_delegation_preserves_connect_in_environment_without_token_in_argv(self):
+        with tempfile.TemporaryDirectory(prefix='portal-review-argv-') as tmp:
+            root=Path(tmp).resolve();download=root/'download';download.mkdir();home=root/'home';home.mkdir()
+            binary=download/'heart-portal';shutil.copy2(BINARY,binary)
+            config=root/'portal.toml';config.write_text('workspace="./workspace"\nkits_enabled=false\nbind="127.0.0.1:0"\n')
+            env={k:v for k,v in os.environ.items() if not k.startswith(('PORTAL_','HEART_PORTAL_'))};env['HOME']=str(home)
+            token='synthetic-review-argv-token'
+            installed=home/'.heart-portal/runtime/heart-portal'
+            with (root/'log').open('w') as log:
+                p=subprocess.Popen([str(binary),'--name','fixture','--config',str(config),'--connect','http://127.0.0.1:9/fixture/?token='+token],env=env,cwd=download,stdout=log,stderr=log)
+                try:
+                    deadline=time.monotonic()+45
+                    while time.monotonic()<deadline:
+                        self.assertIsNone(p.poll(), (root/'log').read_text())
+                        argv=subprocess.check_output(['ps','-p',str(p.pid),'-o','command='],text=True)
+                        if str(installed) in argv and (installed.parent/'.portal-ready.json').exists():break
+                        time.sleep(.1)
+                    else:self.fail('Delegation did not become ready')
+                    self.assertNotIn(token,argv)
+                    snapshot = manager.launch_snapshot(manager.process_identity(p.pid))
+                    self.assertTrue(snapshot['environment']['PORTAL_CONNECT_LINK'].endswith(token))
+                finally:
+                    if installed.exists():subprocess.run([str(installed),'stop'],env=env,capture_output=True,timeout=30)
+                    if p.poll() is None:p.terminate()
+                    p.wait(timeout=15)
 
     def test_validation_and_ownership(self):
         for link in ('', 'https://relay.invalid/being/', 'file:///being/?token=x',

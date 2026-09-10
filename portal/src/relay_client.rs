@@ -86,6 +86,8 @@ fn derive_relay_url(_loom_link: &str, host: &str) -> String {
 }
 
 pub(crate) fn is_loopback_host(host: &str) -> bool {
+    // Deliberately conservative: localhost. and IPv4-mapped IPv6 addresses
+    // retain TLS. Only exact localhost and native loopback IPs permit plaintext.
     url::Url::parse(&format!("http://{host}")).is_ok_and(|url| match url.host() {
         Some(url::Host::Domain("localhost")) => true,
         Some(url::Host::Ipv4(address)) => address.is_loopback(),
@@ -230,7 +232,12 @@ async fn run_one_session(
         let _ = sock_ref.set_nodelay(true);
         let (ws, _) = tokio::time::timeout(
             Duration::from_secs(15),
-            tokio_tungstenite::client_async_tls(relay_url, tcp),
+            tokio_tungstenite::client_async_tls_with_config(relay_url, tcp, Some(
+                tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+                    max_message_size: Some(16 * 1024 * 1024),
+                    max_frame_size: Some(16 * 1024 * 1024),
+                    ..Default::default()
+                }), None),
         )
             .await
             .with_context(|| format!("TLS/WS handshake to relay {relay_url} timed out (15s)"))?
@@ -309,13 +316,14 @@ async fn run_one_session(
 
     let ws_write_out = std::sync::Arc::clone(&ws_write);
     let bridge_to_ws = async move {
-        let mut line = String::new();
+        let mut line = Vec::new();
         loop {
             line.clear();
-            match tokio::io::AsyncBufReadExt::read_line(&mut bridge_reader, &mut line).await {
+            match crate::mcp::limits::read_line(&mut bridge_reader, &mut line, 16 * 1024 * 1024).await {
                 Ok(0) => break,
                 Ok(_) => {
-                    let trimmed = line.trim();
+                    let Ok(text) = std::str::from_utf8(&line) else { break; };
+                    let trimmed = text.trim();
                     if !trimmed.is_empty()
                         && ws_write_out.lock().await.send(Message::Text(trimmed.to_string())).await.is_err() {
                             break;

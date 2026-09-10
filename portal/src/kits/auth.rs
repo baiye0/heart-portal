@@ -117,12 +117,8 @@ fn check_requirements(method: &KitAuthMethod, context: &Context<'_>) -> Check {
 }
 
 fn credential_fingerprint(kit_dir: &Path, file: &str) -> FileFingerprint {
-    let Ok(expanded) = crate::paths::expand_home(Path::new(file)) else {
-        return FileFingerprint::default();
-    };
-    let path = kit_dir.join(expanded);
     const MAX_BYTES: usize = 1024 * 1024;
-    match crate::bounded_file::read(&path, MAX_BYTES) {
+    match crate::bounded_file::read_beneath(kit_dir, Path::new(file), MAX_BYTES) {
         Ok(bytes) if !bytes.is_empty() && bytes.len() <= MAX_BYTES as usize => {
             FileFingerprint(Some(Sha256::digest(&bytes).into()))
         }
@@ -168,11 +164,19 @@ impl AuthState {
             {
                 check.error = Some("Auth setup tool is not declared in the kit manifest".into());
             }
+            let mut safe_url = method.url.clone();
             if let Some(url) = &method.url {
-                if !url::Url::parse(url)
-                    .is_ok_and(|u| matches!(u.scheme(), "https" | "http") && u.host_str().is_some())
-                {
-                    check.error = Some("Auth URL must be an absolute HTTP(S) URL".into());
+                if !url::Url::parse(url).is_ok_and(|u| {
+                    u.host_str().is_some()
+                        && (u.scheme() == "https"
+                            || (u.scheme() == "http"
+                                && u.host_str()
+                                    .is_some_and(crate::relay_client::is_loopback_host)))
+                }) {
+                    safe_url = None;
+                    check.error = Some(
+                        "Auth URL must use HTTPS (HTTP is allowed only for loopback hosts)".into(),
+                    );
                 }
             }
             let status = if !supported {
@@ -198,7 +202,7 @@ impl AuthState {
                 files: method.files.clone(),
                 missing_files: check.missing_files,
                 instructions: method.instructions.clone(),
-                url: method.url.clone(),
+                url: safe_url,
                 tools: method
                     .tools
                     .iter()

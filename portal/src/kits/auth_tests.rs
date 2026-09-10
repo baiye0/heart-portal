@@ -53,7 +53,7 @@ fn auth_methods_are_or_and_fields_within_a_method_are_and() {
 }
 
 #[test]
-fn auth_env_can_use_inherited_values_without_provision_env_entries() {
+fn auth_env_requires_local_values_without_host_inheritance() {
     let root = TestKits::new();
     let dir = root.install("inherited", "");
     set_provision(
@@ -62,6 +62,8 @@ fn auth_env_can_use_inherited_values_without_provision_env_entries() {
             {"id": "test-inherited", "provider": "env", "env": ["PATH"]}
         ]}}),
     );
+    assert!(first(&root).configuration_error().is_some());
+    root.write_env(&dir, "PATH=local-value");
     assert!(first(&root).configuration_error().is_none());
     root.write_env(&dir, "PATH={{YOUR_PATH}}");
     assert!(first(&root).auth.error.is_some());
@@ -242,4 +244,47 @@ fn grove_platform_aliases_are_compatible() {
     assert_eq!(root.scan().kits.len(), 1);
     set_provision(&dir, json!({"platforms": ["unsupported-os"]}));
     assert!(root.scan().kits.is_empty());
+}
+
+#[test]
+fn external_credential_paths_are_not_observed() {
+    let root = TestKits::new();
+    let dir = root.install("outside", "");
+    let external = root.0.join("credential");
+    std::fs::write(&external, "private-v1").unwrap();
+    for file in [
+        "../credential".to_string(),
+        external.to_string_lossy().into_owned(),
+        "~/credential".into(),
+    ] {
+        set_provision(
+            &dir,
+            json!({"auth":{"methods":[{"id":"file", "provider":"file", "files":[file]}]}}),
+        );
+        let before = first(&root);
+        assert!(before.configuration_error().is_some());
+        std::fs::write(&external, "private-v2").unwrap();
+        assert_eq!(before.auth, first(&root).auth);
+    }
+}
+
+#[test]
+fn auth_urls_require_tls_except_for_loopback() {
+    let root = TestKits::new();
+    let dir = root.install("login", "");
+    for (url, allowed) in [
+        ("https://example.test/login", true),
+        ("http://localhost:1234/login", true),
+        ("http://127.0.0.1:1234/login", true),
+        ("http://[::1]:1234/login", true),
+        ("http://localhost.example.test/login", false),
+        ("http://example.test/login", false),
+    ] {
+        set_provision(
+            &dir,
+            json!({"auth":{"methods":[{"id":"login", "provider":"kit", "url":url}]}}),
+        );
+        assert_eq!(first(&root).auth.error.is_none(), allowed, "{url}");
+        assert_eq!(first(&root).auth.methods[0].url.is_some(), allowed, "{url}");
+    }
 }

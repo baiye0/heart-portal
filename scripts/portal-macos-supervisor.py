@@ -20,7 +20,7 @@ spec.loader.exec_module(manager)
 
 def read(path):
     try:
-        return json.loads(path.read_text())
+        return json.loads(manager.metadata_text(path))
     except (OSError, ValueError):
         return {}
 
@@ -154,7 +154,10 @@ def watch(request):
 
 
 def main():
-    request = json.load(sys.stdin)
+    payload = sys.stdin.buffer.read(manager.METADATA_LIMIT + 1)
+    if len(payload) > manager.METADATA_LIMIT:
+        raise ValueError('Supervisor request exceeds 1 MiB.')
+    request = json.loads(payload)
     root = Path(request['root'])
     action = sys.argv[1]
     if action == 'watch':

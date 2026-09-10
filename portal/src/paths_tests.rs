@@ -269,3 +269,11 @@ fn invalid_migration_errors_do_not_echo_configuration_secrets() {
     let error = plan_migration(&source, &root.0.join("data"), None).unwrap_err();
     assert!(!format!("{error:#}").contains("private-token"));
 }
+
+#[test]
+fn oversized_configuration_is_rejected_before_parsing() {
+    let root = crate::kits::tests::TestKits::new();
+    let file = root.0.join("portal.toml");
+    std::fs::write(&file, "#".repeat(crate::bounded_file::CONFIG_LIMIT + 1)).unwrap();
+    assert!(crate::config::PortalConfig::load(file.to_str().unwrap()).is_err());
+}

@@ -140,7 +140,7 @@ pub fn locate_config(explicit: Option<&Path>, legacy_dirs: &[PathBuf]) -> Result
         return select_config(explicit, &[], Path::new(""));
     }
     if let Some(root) = legacy_dirs.first() {
-        match std::fs::read(root.join(".portal-launch.json")) {
+        match crate::bounded_file::read(&root.join(".portal-launch.json"), crate::bounded_file::CONFIG_LIMIT) {
             Ok(bytes) => {
                 let launch: serde_json::Value = serde_json::from_slice(&bytes)
                     .map_err(|_| anyhow::anyhow!("Invalid saved Portal launch configuration"))?;
@@ -237,7 +237,7 @@ pub fn plan_migration_with_installation(
         data.join("portal.toml")
     };
     let content =
-        std::fs::read_to_string(&source).context("Cannot read migration source configuration")?;
+        crate::bounded_file::text(&source, crate::bounded_file::CONFIG_LIMIT).context("Cannot read migration source configuration")?;
     if source.canonicalize().ok() == destination.canonicalize().ok() && destination.is_file() {
         return Ok(MigrationPlan {
             source,
@@ -294,7 +294,7 @@ pub fn plan_migration_with_installation(
     // Import the persistent launch identity only if the saved launch points to
     // this exact config. Never import a different Portal's link or OS tokens.
     let saved_launch =
-        match std::fs::read(dir.join(".portal-launch.json")) {
+        match crate::bounded_file::read(&dir.join(".portal-launch.json"), crate::bounded_file::CONFIG_LIMIT) {
             Ok(bytes) => Some(serde_json::from_slice::<serde_json::Value>(&bytes).map_err(
                 |_| anyhow::anyhow!("Invalid saved launch metadata; repair it before migration"),
             )?),
@@ -326,7 +326,7 @@ pub fn plan_migration_with_installation(
         );
     }
     let read_optional = |name: &str| -> Result<Option<String>> {
-        match std::fs::read_to_string(dir.join(name)) {
+        match crate::bounded_file::text(&dir.join(name), crate::bounded_file::CONFIG_LIMIT) {
             Ok(value) => Ok(Some(value.trim().into()).filter(|v: &String| !v.is_empty())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(_) => anyhow::bail!("Cannot read saved Portal identity file {}", name),
@@ -358,7 +358,7 @@ pub fn plan_migration_with_installation(
         table.insert("name".into(), toml::Value::String(name));
     }
     let document = PrivateDocument(toml::to_string_pretty(&document)?);
-    let already_applied = match std::fs::read_to_string(&destination) {
+    let already_applied = match crate::bounded_file::text(&destination, crate::bounded_file::CONFIG_LIMIT) {
         Ok(existing) => {
             anyhow::ensure!(existing == document.0, "Destination already contains a different config: {}. Use --profile to keep installations separate; nothing was overwritten", destination.display());
             true
@@ -379,7 +379,7 @@ pub fn plan_migration_with_installation(
 /// this source. For another installation with an external config, the caller
 /// supplies --installation explicitly; unrelated launch credentials are ignored.
 pub fn matching_installation(source: &Path, root: &Path) -> Result<bool> {
-    let bytes = match std::fs::read(root.join(".portal-launch.json")) {
+    let bytes = match crate::bounded_file::read(&root.join(".portal-launch.json"), crate::bounded_file::CONFIG_LIMIT) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(_) => anyhow::bail!("Cannot read saved launch metadata"),
@@ -402,7 +402,7 @@ impl MigrationPlan {
     pub fn apply(&self) -> Result<()> {
         if self.already_applied {
             anyhow::ensure!(
-                std::fs::read_to_string(&self.destination)? == self.document.0,
+                crate::bounded_file::text(&self.destination, crate::bounded_file::CONFIG_LIMIT)? == self.document.0,
                 "Destination changed after planning; migration was not applied"
             );
             return Ok(());

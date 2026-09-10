@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Deserialize from a kit's manifest.json.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct KitManifest {
     pub name: String,
     pub version: String,
@@ -20,7 +20,7 @@ pub struct KitManifest {
     pub provision: Option<KitProvision>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct KitProvision {
     #[serde(default, deserialize_with = "deserialize_env")]
     pub env: Vec<KitEnvVar>,
@@ -39,13 +39,13 @@ pub struct KitProvision {
     pub extensions: std::collections::BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct KitRuntime {
     pub name: String,
     pub version: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct KitDependency {
     pub name: String,
     #[serde(rename = "type")]
@@ -58,7 +58,7 @@ pub struct KitDependency {
 
 /// Methods are alternatives (OR); requirements within a method are AND.
 /// This is an additive Portal extension to Grove's existing provision metadata.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct KitAuth {
     #[serde(default = "auth_version")]
     pub version: u32,
@@ -74,7 +74,7 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct KitAuthMethod {
     pub id: String,
     /// Open provider identifier. Unknown providers remain visible as unsupported.
@@ -93,7 +93,7 @@ pub struct KitAuthMethod {
     pub tools: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct KitEnvVar {
     #[serde(default)]
     pub name: String,
@@ -126,7 +126,7 @@ fn deserialize_env<'de, D: serde::Deserializer<'de>>(
     })
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct KitToolDef {
     pub name: String,
     pub description: String,

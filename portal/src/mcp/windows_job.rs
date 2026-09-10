@@ -18,7 +18,8 @@ use windows_sys::Win32::{
             JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         },
         Threading::{
-            OpenThread, ResumeThread, CREATE_NO_WINDOW, CREATE_SUSPENDED, THREAD_SUSPEND_RESUME,
+            GetProcessIdOfThread, OpenThread, ResumeThread, CREATE_NO_WINDOW, CREATE_SUSPENDED,
+            THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
         },
     },
 };
@@ -87,8 +88,9 @@ impl KitJob {
 }
 
 fn resume_initial_thread(process_id: u32) -> Result<()> {
-    // Tokio does not expose the primary thread handle. A CREATE_SUSPENDED child
-    // has not run its loader yet, so its only thread is the one to resume.
+    // Tokio does not expose the primary thread handle. Capture every matching
+    // handle before resuming: an injected runtime/AV thread may precede the
+    // suspended primary thread in the snapshot. Never rely on enumeration order.
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
     if snapshot == INVALID_HANDLE_VALUE {
         return Err(std::io::Error::last_os_error()).context("Finding suspended Kit thread");
@@ -99,27 +101,86 @@ fn resume_initial_thread(process_id: u32) -> Result<()> {
         ..Default::default()
     };
     let mut found = unsafe { Thread32First(snapshot.as_raw_handle(), &mut entry) };
+    let mut threads = Vec::new();
     while found != 0 {
         if entry.th32OwnerProcessID == process_id {
-            let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
+            let thread = unsafe {
+                OpenThread(
+                    THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION,
+                    0,
+                    entry.th32ThreadID,
+                )
+            };
             if thread.is_null() {
                 return Err(std::io::Error::last_os_error())
                     .context("Opening suspended Kit thread");
             }
             let thread = unsafe { OwnedHandle::from_raw_handle(thread) };
-            let previous_count = unsafe { ResumeThread(thread.as_raw_handle()) };
-            if previous_count == u32::MAX {
-                return Err(std::io::Error::last_os_error()).context("Resuming Kit thread");
-            }
-            // Zero was already running; greater than one is still suspended.
             anyhow::ensure!(
-                previous_count == 1,
-                "Unexpected Kit thread suspend count: {previous_count}"
+                unsafe { GetProcessIdOfThread(thread.as_raw_handle()) } == process_id,
+                "Kit thread ownership changed during snapshot"
             );
-            return Ok(());
+            threads.push(thread);
         }
         entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
         found = unsafe { Thread32Next(snapshot.as_raw_handle(), &mut entry) };
     }
-    anyhow::bail!("Suspended Kit initial thread was not found")
+    resume_threads(threads, |thread| {
+        let count = unsafe { ResumeThread(thread.as_raw_handle()) };
+        if count == u32::MAX {
+            return Err(std::io::Error::last_os_error()).context("Resuming Kit thread");
+        }
+        Ok(count)
+    })
+}
+
+fn resume_threads<T>(
+    threads: impl IntoIterator<Item = T>,
+    mut resume: impl FnMut(T) -> Result<u32>,
+) -> Result<()> {
+    let mut resumed = false;
+    for thread in threads {
+        let count = resume(thread)?;
+        anyhow::ensure!(count <= 1, "Kit thread remains suspended");
+        resumed |= count == 1;
+    }
+    // Zero is acceptable only for auxiliary threads. CREATE_SUSPENDED must
+    // contribute at least one 1 -> 0 transition or this spawn fails closed.
+    anyhow::ensure!(resumed, "Suspended Kit initial thread was not found");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auxiliary_threads_do_not_hide_the_suspended_primary_thread() {
+        for counts in [[0, 1, 0], [1, 0, 1]] {
+            let mut visited = Vec::new();
+            resume_threads(counts, |count| {
+                visited.push(count);
+                Ok(count)
+            })
+            .unwrap();
+            assert_eq!(visited, counts);
+        }
+        for counts in [vec![], vec![0, 0], vec![1, 2]] {
+            assert!(resume_threads(counts, Ok).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn suspended_process_runs_only_after_job_assignment_and_resume() {
+        let mut command = Command::new("cmd.exe");
+        command.args(["/C", "exit", "0"]);
+        let (mut child, _job) = KitJob::spawn(&mut command).unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(10), child.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+    }
 }

@@ -191,6 +191,25 @@ try {
     Assert ((Get-ScheduledTask -TaskName $taskName).Settings.Enabled) 'restart restores logon recovery'
     Assert (@(Get-ChildItem -Force -LiteralPath $fixtureRoot | Where-Object { $_.Name -ne 'test-home' -and $_.FullName -ne $exe }).Count -eq 0) 'download directory contains no generated Portal files'
     Write-Output 'PASS: upgraded single exe preserves settings and supports stop/resume with logon recovery'
+    # A download-folder CLI delegates to the installed EXE using environment
+    # transport. Its new link must override a previously saved launch record.
+    $rotatedLink = 'http://127.0.0.1:9/rotated/?token=synthetic-rotated-token'
+    $result = Run-Portal @('--connect', $rotatedLink)
+    Assert ($result.code -ne 0) 'changing a running connection requires stop first'
+    Assert ([IO.File]::ReadAllText((Join-Path $testRoot '.portal-launch.json')) -eq $launchBefore) 'rejected connection change preserves saved settings'
+    $result = Run-Portal @('stop')
+    Assert ($result.code -eq 0) 'stop before changing connection succeeds'
+    $result = Run-Portal @('--connect', $rotatedLink)
+    Assert ($result.code -eq 0 -and (Test-PortalReady $testRoot $version)) "delegated connection override succeeds: $($result.error)"
+    $rotated = Read-PortalJson (Join-Path $testRoot '.portal-launch.json')
+    Assert ($rotated.environment.PORTAL_CONNECT_LINK -eq $rotatedLink) 'new connection survives delegation and replaces saved link'
+    Assert (($rotated.arguments -join ' ') -notlike '*synthetic-rotated-token*') 'saved process argv excludes connection token'
+    Assert ($rotated.arguments[1] -eq $effectiveConfig) 'connection change preserves saved config'
+    $runtimePid = (Read-PortalJson (Join-Path $testRoot '.portal-runtime.json')).pid
+    $runtimeCommand = (Get-CimInstance Win32_Process -Filter "ProcessId=$runtimePid").CommandLine
+    Assert ($runtimeCommand -notlike '*synthetic-rotated-token*') 'runtime process argv excludes connection token'
+    Assert (($result.output + $result.error) -notlike '*synthetic-rotated-token*') 'connection change output excludes token'
+    Write-Output 'PASS: delegated connection overrides saved launch without token-bearing child argv'
 } catch {
     $testFailure = $_
     Write-Output ("FAILED: " + $_.ToString() + "`n" + $_.ScriptStackTrace)

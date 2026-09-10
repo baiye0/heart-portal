@@ -299,10 +299,7 @@ fn parse_custom_mcp_config(content: &str, workspace_root: &Path) -> Result<Vec<M
 
         // Resolve the first command element relative to tools/ dir if it's a relative path
         let mut command = server.command;
-        if !command[0].starts_with('/')
-            && !command[0].contains("node")
-            && !command[0].contains("python")
-        {
+        if !std::path::Path::new(&command[0]).is_absolute() {
             // It's a script name — resolve relative to tools/
             let resolved = tools_dir.join(&command[0]);
             if resolved.exists() {
@@ -329,6 +326,23 @@ fn parse_custom_mcp_config(content: &str, workspace_root: &Path) -> Result<Vec<M
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_executables_are_resolved_without_guessing_runtime_names() {
+        let root = crate::kits::tests::TestKits::new();
+        let tools = root.0.join("tools");
+        std::fs::create_dir(&tools).unwrap();
+        for name in ["my-nodejs-wrapper", "python-adapter", "node"] {
+            std::fs::write(tools.join(name), "fixture").unwrap();
+            let input = format!("[[servers]]\nname='fixture'\ncommand=['{name}']\n");
+            let configs = parse_custom_mcp_config(&input, &root.0).unwrap();
+            assert_eq!(Path::new(&configs[0].command[0]), tools.join(name));
+        }
+        let configs =
+            parse_custom_mcp_config("[[servers]]\nname='fixture'\ncommand=['python3']", &root.0)
+                .unwrap();
+        assert_eq!(configs[0].command[0], "python3");
+    }
 
     #[test]
     fn command_base_metachar_detection() {

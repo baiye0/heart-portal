@@ -5,6 +5,19 @@ macOS and Linux, including when exec, file, custom tools or kits are disabled.
 No shell or access to configuration files is required. The tool is advertised
 with `readOnlyHint: true`; it returns a JSON string in `content[0].text`.
 
+Host details are private by default: `portal.pid`, `portal.executable` and the
+paths under `config` return `null`. The local administrator may opt in with
+the following setting in `portal.toml`, then restart Portal:
+
+```toml
+[security]
+expose_host_details = true
+```
+
+This exposes the details to every connected client; a tool argument cannot enable
+it. `capabilities.host_details_visible` reports the loaded choice. Build identity,
+connection state and kit health remain available without this opt-in.
+
 | Field | Meaning |
 | --- | --- |
 | `schema_version` | Response schema, currently `1`. Consumers should tolerate new fields. |
@@ -70,12 +83,15 @@ for the five-second scan. Status queries never launch kits, reload tools or rese
 
 Only explicitly selected diagnostic fields are returned. The response omits
 Loom connection links, tokens, environment/default values, credential contents,
-raw config/manifest data and arbitrary error strings. Paths and instance/kit names
-are visible to the connected Being. A configured credential flag describes
+raw config/manifest data and arbitrary error strings. Instance/kit names remain
+visible; Portal host paths/PID require the local opt-in above. Kit setup tools
+still expose their own installation paths and kit process IDs. A configured credential flag describes
 presence, not external authorization; the kit and service still validate access.
 
 `capabilities.kit_isolation` reports admission limits, reserved management tools
-and process ownership. `malicious_code_sandbox: false` and `same_os_user: true`
+and process ownership. `process_cleanup` distinguishes Windows `job-object`
+from Unix `best-effort-process-group`; the latter does not contain deliberately
+detached processes. `malicious_code_sandbox: false` and `same_os_user: true`
 are intentional: lifecycle containment does not prevent same-user hostile code
 or an unrestricted `portal_exec` command from affecting the host. See
 [the kit trust boundary](kit-configuration.md#portal-reliability-and-trust-boundary).

@@ -56,6 +56,9 @@ class KitLifecycleTests(unittest.TestCase):
             self.port = reserve.getsockname()[1]
         config = self.root / 'portal.toml'
         config.write_text(f"name='fixture'\nbind='127.0.0.1:{self.port}'\nworkspace='./workspace'\nkits_dir='./kits'\nkits_enabled=true\n[tools]\nexec=false\nfile=false\n[custom_tools]\nconfig_path='private-ignored-path'\ntoken='private-ignored-token'\n", encoding='utf-8')
+        if getattr(self, 'expose_host_details', True):
+            with config.open('a') as stream:
+                stream.write('[security]\nexpose_host_details=true\n')
         env = {key:value for key,value in os.environ.items() if not key.startswith(('PORTAL_', 'HEART_PORTAL_'))}
         env.update(HOME=str(self.root/'home'), USERPROFILE=str(self.root/'home'),
                    HEART_PORTAL_SUPERVISED='1', RUST_LOG='debug')
