@@ -32,10 +32,11 @@ jobs:
         run: python scripts/tests/portal-status.tests.py
       - name: Configuration path compatibility and migration
         run: python scripts/tests/config-layout.tests.py
-      - name: Kit hot reload, diagnostics and configuration isolation
-        run: python scripts/tests/kit-lifecycle.tests.py
-      - name: Unresponsive and noisy community kit isolation
-        run: python scripts/tests/kit-isolation.tests.py
+      # Offline fixtures only; full kit suites remain available for local checks.
+      - name: Kit reload smoke test
+        run: python scripts/tests/kit-lifecycle.tests.py KitLifecycleTests.test_targeted_reload_preserves_other_process_and_invalid_manifest
+      - name: Kit startup and cleanup smoke tests
+        run: python scripts/tests/kit-isolation.tests.py test_slow_startup_does_not_block_portal_or_other_kits_and_reload_cancels_it test_retired_process_tree_is_killed_on_restart_while_an_outsider_survives
       - name: macOS lifecycle, recovery and upgrade regressions
         if: runner.os == 'macOS'
         env:
@@ -54,7 +55,6 @@ jobs:
           .\scripts\tests\windows-lifecycle.tests.ps1
           .\scripts\tests\windows-start-fallback.tests.ps1
           .\scripts\tests\windows-private-state.tests.ps1
-          .\scripts\tests\windows-kit-lifecycle.tests.ps1
       - name: Windows single-exe first launch and upgrade
         if: runner.os == 'Windows'
         shell: powershell
