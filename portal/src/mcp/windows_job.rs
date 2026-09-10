@@ -107,9 +107,15 @@ fn resume_initial_thread(process_id: u32) -> Result<()> {
                     .context("Opening suspended Kit thread");
             }
             let thread = unsafe { OwnedHandle::from_raw_handle(thread) };
-            if unsafe { ResumeThread(thread.as_raw_handle()) } == u32::MAX {
+            let previous_count = unsafe { ResumeThread(thread.as_raw_handle()) };
+            if previous_count == u32::MAX {
                 return Err(std::io::Error::last_os_error()).context("Resuming Kit thread");
             }
+            // Zero was already running; greater than one is still suspended.
+            anyhow::ensure!(
+                previous_count == 1,
+                "Unexpected Kit thread suspend count: {previous_count}"
+            );
             return Ok(());
         }
         entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;

@@ -67,8 +67,8 @@ fn auth_env_can_use_inherited_values_without_provision_env_entries() {
     assert!(first(&root).auth.error.is_some());
 }
 
-#[test]
-fn file_provider_checks_presence_and_detects_rotation_without_exposing_bytes() {
+#[tokio::test]
+async fn file_provider_checks_presence_and_detects_rotation_without_exposing_bytes() {
     let root = TestKits::new();
     let dir = root.install("service-account", "");
     set_provision(
@@ -89,8 +89,17 @@ fn file_provider_checks_presence_and_detects_rotation_without_exposing_bytes() {
     let public = serde_json::to_string(&old.auth).unwrap();
     assert!(!public.contains("private-content") && !public.contains("fingerprints"));
     assert!(!format!("{:?}", old.auth).contains("private-content"));
+    let manager = KitManager::new(vec![old.clone()]);
+    assert!(!manager.refresh_kits(root.scan(), false).await);
     std::fs::write(dir.join("credentials.json"), "private-content-2").unwrap();
-    assert_ne!(old.auth, first(&root).auth);
+    let rotated = first(&root);
+    assert_ne!(old.auth, rotated.auth);
+    assert_eq!(public, serde_json::to_string(&rotated.auth).unwrap());
+    // Only file contents changed: the automatic scan must retire this generation
+    // even though the manifest, .env and public auth status are unchanged.
+    let report = manager.refresh_kits_target(root.scan(), false, None).await;
+    assert_eq!(report.reloaded, ["service-account"]);
+    assert!(!manager.refresh_kits(root.scan(), false).await);
     std::fs::remove_file(dir.join("credentials.json")).unwrap();
     assert!(first(&root).auth.error.is_some());
 }

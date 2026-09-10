@@ -41,8 +41,11 @@ errors and redirects as tool errors even when a response is HTML or empty.
 authorized.
 
 `not-started` means a process has not been started yet. A configured kit is
-started on its first tool call. `eager: true` currently prewarms at Portal
-startup; kits discovered later remain callable without restarting Portal.
+started on its first tool call. `eager: true` requests best-effort prewarming
+at Portal startup, in the background with a bounded timeout. Failures are logged
+and do not block Portal readiness; eager does not guarantee a running or healthy
+kit. Kits discovered or reloaded later start on their next tool call, without
+restarting Portal.
 Use the exact tool name from `tools/list`. Use `portal_status` to distinguish
 the actual local build from an older executable that shares its package version.
 

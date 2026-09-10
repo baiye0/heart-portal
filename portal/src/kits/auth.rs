@@ -15,6 +15,7 @@ pub struct AuthState {
     pub error: Option<String>,
     /// Only digests are retained for reload detection; neither bytes nor digests
     /// belong in user-visible status or debug output.
+    /// Derived PartialEq includes them in KitManager's auth-state comparison.
     #[serde(skip)]
     fingerprints: Vec<FileFingerprint>,
 }
