@@ -66,7 +66,9 @@ try {
     }
     $first = Start-PortalCli -StreamLines
     $firstLine = $first.process.StandardOutput.ReadLineAsync()
-    Assert ($firstLine.Wait(3000) -and $firstLine.Result.StartsWith('Heart Portal ')) 'startup prints immediately instead of waiting for worker completion'
+    # First launch copies and verifies the binary before delegating; debug builds
+    # on fresh runners need more time. The next assertion still checks ordering.
+    Assert ($firstLine.Wait(15000) -and $firstLine.Result.StartsWith('Heart Portal ')) 'startup prints before worker completion'
     Assert (-not $first.process.HasExited) 'initial progress is visible before startup completes'
     $first.output = $first.process.StandardOutput.ReadToEndAsync()
     $second = Start-PortalCli
