@@ -12,6 +12,7 @@ from pathlib import Path
 import plistlib
 import re
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -19,12 +20,30 @@ import time
 from urllib.parse import parse_qs, urlsplit
 
 LIFECYCLE_PROTOCOL = 2
+METADATA_LIMIT = 1024 * 1024
+
+
+def metadata_bytes(path):
+    """Read one regular metadata snapshot, including a bound on concurrent growth."""
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, 'rb') as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size > METADATA_LIMIT:
+            raise ValueError('Portal metadata must be a regular file no larger than 1 MiB.')
+        value = stream.read(METADATA_LIMIT + 1)
+        if len(value) > METADATA_LIMIT:
+            raise ValueError('Portal metadata exceeds 1 MiB.')
+        return value
+
+
+def metadata_text(path):
+    return metadata_bytes(path).decode('utf-8-sig')
 
 
 def binary_path(root):
     record = root / '.portal-executable'
     if record.is_file():
-        path = Path(record.read_text().strip()).resolve()
+        path = Path(metadata_text(record).strip()).resolve()
         allowed = [root / 'target/release/heart-portal'] + [root / name for name in
                    ('heart-portal', 'heart-portal-macos-arm64', 'heart-portal-macos-x86_64')]
         if path not in allowed:
@@ -58,7 +77,7 @@ def maintenance_lock(root, timeout=0):
 
 def saved(root, name):
     path = root / name
-    return path.read_text().strip() if path.exists() else ''
+    return metadata_text(path).strip() if path.exists() else ''
 
 
 def private_write(path, content):
@@ -124,7 +143,7 @@ def definition(root, label, config=None):
 
 def assert_owned(path, root, label):
     if path.exists():
-        value = plistlib.loads(path.read_bytes())
+        value = plistlib.loads(metadata_bytes(path))
         expected = definition(root, label)
         arguments = value.get('ProgramArguments', [])
         if (value.get('Label') != label
@@ -213,7 +232,7 @@ def launch_snapshot(identity):
 
 def supervisor_state(root):
     try:
-        state = json.loads((root / '.portal-supervisor.json').read_text())
+        state = json.loads(metadata_text(root / '.portal-supervisor.json'))
         return state if state.get('protocol') == 1 and identity_alive(state.get('owner')) else None
     except (OSError, ValueError, KeyError):
         return None
@@ -321,7 +340,7 @@ def install(args, root, path, label, domain, service):
     config_arg = getattr(args, 'config', None)
     if config_arg is None and path.exists():
         assert_owned(path, root, label)
-        arguments = plistlib.loads(path.read_bytes())['ProgramArguments']
+        arguments = plistlib.loads(metadata_bytes(path))['ProgramArguments']
         if len(arguments) == 5:
             config_arg = arguments[4]
     command = [str(binary)]
@@ -345,7 +364,7 @@ def install(args, root, path, label, domain, service):
         root / '.portal-executable': os.fsencode(binary.resolve()),
         path: plistlib.dumps(definition(root, label, config)),
     }
-    backups = {file: file.read_bytes() if file.exists() else None for file in updates}
+    backups = {file: metadata_bytes(file) if file.exists() else None for file in updates}
     manual_pids = checkout_pids(root) if not running else []
     # Reuse the existing launch snapshot for rollback, including an external config.
     # Capture before stopping anything; no duplicate argv or config parser.
@@ -363,7 +382,7 @@ def install(args, root, path, label, domain, service):
             source = support / name
             destination = root / 'scripts' / name
             if source.resolve() != destination.resolve():
-                private_write(destination, source.read_bytes())
+                private_write(destination, metadata_bytes(source))
         for file, data in updates.items():
             private_write(file, data)
         launchctl('enable', service)
@@ -414,7 +433,7 @@ def main():
         previous_plist = Path.home() / 'Library/LaunchAgents' / (previous_label + '.plist')
         if args.config is None and previous_plist.exists():
             assert_owned(previous_plist, root, previous_label)
-            arguments = plistlib.loads(previous_plist.read_bytes())['ProgramArguments']
+            arguments = plistlib.loads(metadata_bytes(previous_plist))['ProgramArguments']
             if len(arguments) == 5:
                 args.config = Path(arguments[4])
         command = [str(binary_path(root))]

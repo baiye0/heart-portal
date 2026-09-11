@@ -30,6 +30,10 @@ jobs:
         run: cargo build --locked
       - name: Runtime status over TCP and relay
         run: python scripts/tests/portal-status.tests.py
+      - name: Runtime security regressions
+        run: |
+          python scripts/tests/runtime-security.tests.py
+          python scripts/tests/kit-isolation.tests.py test_host_secrets_are_not_inherited_and_dotenv_values_remain_literal test_metadata_limits_reject_bad_files_without_losing_a_working_kit
       - name: Configuration path compatibility and migration
         run: python scripts/tests/config-layout.tests.py
       # Offline fixtures only; full kit suites remain available for local checks.
@@ -55,9 +59,11 @@ jobs:
           .\scripts\tests\windows-lifecycle.tests.ps1
           .\scripts\tests\windows-start-fallback.tests.ps1
           .\scripts\tests\windows-private-state.tests.ps1
+          .\scripts\tests\windows-console.tests.ps1
       - name: Windows single-exe first launch and upgrade
         if: runner.os == 'Windows'
         shell: powershell
         run: |
           .\scripts\tests\windows-package.tests.ps1 -Binary '.\target\debug\heart-portal.exe'
           .\scripts\tests\windows-package.tests.ps1 -Binary '.\target\debug\heart-portal.exe' -LocalOnly
+          .\scripts\tests\windows-connection-guidance.tests.ps1 -Binary '.\target\debug\heart-portal.exe'

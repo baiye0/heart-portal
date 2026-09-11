@@ -144,7 +144,51 @@ async fn transport_state_is_live_across_host_clones() {
         transport.set_connection_state(state);
         let status = query(&host).await;
         assert_eq!(status["connection"]["state"], expected);
-        assert_eq!(status["portal"]["pid"], std::process::id());
+        assert!(status["portal"]["pid"].is_null());
+    }
+}
+
+#[tokio::test]
+async fn host_details_require_local_configuration_not_tool_arguments() {
+    let root = TestKits::new();
+    let path = root.0.join("portal.toml");
+    for expose in [false, true] {
+        std::fs::write(
+            &path,
+            format!("kits_enabled=false\n[security]\nexpose_host_details={expose}\n"),
+        )
+        .unwrap();
+        let config = PortalConfig::load(path.to_str().unwrap()).unwrap();
+        assert!(config.warnings.is_empty());
+        let runtime = RuntimeStatus::capture(
+            &config,
+            ConfigLocation {
+                path: path.clone(),
+                source: "explicit",
+            },
+            true,
+            "fixture".into(),
+            false,
+            Instant::now(),
+        );
+        let host = ToolHost::new_with_runtime(&config, runtime);
+        let status = query(&host).await;
+        assert_eq!(status["capabilities"]["host_details_visible"], expose);
+        assert_eq!(status["portal"]["pid"].is_null(), !expose);
+        assert_eq!(status["portal"]["executable"].is_null(), !expose);
+        for name in [
+            "path",
+            "user_directory",
+            "workspace",
+            "kits_directory",
+            "custom_tools_config",
+        ] {
+            assert_eq!(status["config"][name].is_null(), !expose, "{name}");
+        }
+        assert!(host
+            .call("portal_status", json!({"expose_host_details":true}))
+            .await
+            .is_err());
     }
 }
 
@@ -152,7 +196,10 @@ async fn transport_state_is_live_across_host_clones() {
 async fn kit_status_and_setup_are_readonly_even_after_files_change() {
     let root = TestKits::new();
     let directory = root.install("sample", "PORTAL_TEST_KIT_TOKEN=private-test-token");
-    let host = ToolHost::new(&PortalConfig { kits_dir: Some(root.0.to_string_lossy().into()), ..PortalConfig::default() });
+    let host = ToolHost::new(&PortalConfig {
+        kits_dir: Some(root.0.to_string_lossy().into()),
+        ..PortalConfig::default()
+    });
     root.write_env(&directory, "");
     let changes = host.subscribe_tools_changed();
     for tool in ["portal_kits_status", "portal_kits_setup"] {
@@ -160,7 +207,10 @@ async fn kit_status_and_setup_are_readonly_even_after_files_change() {
         assert!(!result.to_string().contains("needs-configuration"));
     }
     assert!(!changes.has_changed().unwrap());
-    let refreshed = host.call("portal_kits_reload", json!({"kit":"sample"})).await.unwrap();
+    let refreshed = host
+        .call("portal_kits_reload", json!({"kit":"sample"}))
+        .await
+        .unwrap();
     assert!(refreshed.to_string().contains("needs-configuration"));
 }
 

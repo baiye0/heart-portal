@@ -48,7 +48,7 @@ pub fn migrated_source(exe: &Path) -> Result<bool> {
         return Ok(false);
     }
     let old = legacy_root(exe)?;
-    Ok(std::fs::read_to_string(root()?.join(".portal-origin"))
+    Ok(crate::bounded_file::text(&root()?.join(".portal-origin"), crate::bounded_file::CONFIG_LIMIT)
         .ok()
         .is_some_and(|saved| Path::new(saved.trim()) == old))
 }
@@ -191,7 +191,7 @@ if ($process) { $process.Dispose(); exit 1 }
 if (Test-SavedSupervisor $runtime) { exit 1 }
 $taskFile = Join-Path $root '.portal-task-name'
 if (Test-Path -LiteralPath $taskFile) {
-    $name = (Get-Content -LiteralPath $taskFile -Raw).Trim()
+    $name = (Read-PortalText $taskFile).Trim()
     $task = Get-ScheduledTask -ErrorAction Stop | Where-Object TaskName -eq $name
     if ($task -and $task.State -ne 'Disabled') { exit 1 }
 }
@@ -273,7 +273,7 @@ pub fn delegate(target: &Path, cli: &crate::Cli) -> Result<()> {
         command.arg("--name").arg(name);
     }
     if let Some(connect) = &cli.connect {
-        command.arg("--connect").arg(connect);
+        command.env("PORTAL_CONNECT_LINK", connect);
     }
     match &cli.command {
         Some(crate::Commands::Stop) => {

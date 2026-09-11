@@ -108,13 +108,10 @@ impl KitEnvironment {
                     env.error = Some("Invalid environment variable name in provision.env".into());
                     return env;
                 }
-                // A kit-local value wins over the inherited service environment,
-                // then the declared default. Explicit empty values stay empty.
+                // Only kit-local values and declared defaults satisfy credentials.
+                // A manifest cannot authorize access to the host environment.
                 if !env.values.contains_key(&env_key(&var.name)) {
-                    if let Some(value) = std::env::var(&var.name)
-                        .ok()
-                        .or_else(|| var.default.clone())
-                    {
+                    if let Some(value) = var.default.clone() {
                         if value.contains('\0') {
                             env.error = Some("Invalid environment value in provision.env".into());
                             return env;
@@ -123,8 +120,7 @@ impl KitEnvironment {
                     }
                 }
             }
-            // Auth alternatives can reference inherited values without adding
-            // globally required env entries (which would turn OR into AND).
+            // Validate auth references, but never source values from the host.
             for name in provision
                 .auth
                 .iter()
@@ -134,11 +130,6 @@ impl KitEnvironment {
                 if !valid_name(name) {
                     env.error = Some("Invalid environment variable name in provision.auth".into());
                     return env;
-                }
-                if !env.values.contains_key(&env_key(name)) {
-                    if let Ok(value) = std::env::var(name) {
-                        env.values.insert(env_key(name), value);
-                    }
                 }
             }
             let missing: Vec<_> = provision

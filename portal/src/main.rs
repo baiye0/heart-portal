@@ -886,7 +886,7 @@ where
                     debug!("Missing or invalid token in auth params");
                     ""
                 });
-            if token != expected {
+            if !constant_time_token_matches(&token, &expected) {
                 let error_resp = JsonRpcResponse {
                     jsonrpc: "2.0".to_string(),
                     id: id.as_ref().and_then(|v| v.as_u64()),
@@ -1347,4 +1347,33 @@ mod tests {
         assert!(!url.contains("supersecret"));
         assert!(!url.contains('?'));
     }
+}
+
+// Hash both strings to fixed-size values before the constant-time comparison.
+// Token length need not be secret; token contents must not determine comparison time.
+fn constant_time_token_matches(actual: &str, expected: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    use subtle::ConstantTimeEq;
+    bool::from(Sha256::digest(actual.as_bytes()).ct_eq(&Sha256::digest(expected.as_bytes())))
+}
+
+#[cfg(test)]
+#[test]
+fn token_comparison_accepts_only_equal_tokens() {
+    assert!(constant_time_token_matches("test-token", "test-token"));
+    assert!(!constant_time_token_matches("test-token", "test-tokee"));
+    assert!(!constant_time_token_matches("test-token", "test-token-long"));
+}
+
+#[cfg(test)]
+#[test]
+fn debug_configurations_redact_credentials_and_command_arguments() {
+    let mut config = config::PortalConfig::default();
+    config.connect_link = Some("synthetic-link-secret".into());
+    config.portal_mcp_token = Some("synthetic-mcp-secret".into());
+    assert!(!format!("{config:?}").contains("synthetic-"));
+    let server = mcp::McpServerConfig { name: "fixture".into(),
+        command: vec!["synthetic-command-secret".into()],
+        env: std::collections::HashMap::from([("TOKEN".into(), "synthetic-env-secret".into())]), cwd: None };
+    assert!(!format!("{server:?}").contains("synthetic-"));
 }

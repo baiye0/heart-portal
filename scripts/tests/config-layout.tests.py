@@ -148,8 +148,8 @@ class ConfigCliTests(unittest.TestCase):
         self.assertEqual(central.read_bytes(), original)
 
     def test_macos_installer_preserves_central_config_during_rollback(self):
-        # Run the installer file/config logic on every OS; native process ownership
-        # and launchd are exercised separately by the macOS lifecycle suite.
+        # Run the installer file/config logic on every OS; native metadata reads,
+        # process ownership and launchd have separate platform-specific coverage.
         spec = importlib.util.spec_from_file_location('portal_macos_config_test', REPO / 'scripts/portal-macos.py')
         manager = importlib.util.module_from_spec(spec)
         with patch.dict(sys.modules, {'fcntl': SimpleNamespace()}):
@@ -161,6 +161,11 @@ class ConfigCliTests(unittest.TestCase):
         args = SimpleNamespace(name='fixture', connect_link='https://relay.invalid/fixture/?token=fixture-private-token', config=central)
         real_run = subprocess.run
         with ExitStack() as stack:
+            if os.name == 'nt':
+                # This fixture uses ordinary files. Keep testing rollback on
+                # Windows without invoking the macOS-only O_NOFOLLOW/O_NONBLOCK
+                # reader; its link/size guards are tested in runtime-security.
+                stack.enter_context(patch.object(manager, 'metadata_bytes', side_effect=Path.read_bytes))
             stack.enter_context(patch.object(manager, 'binary_path', return_value=self.binary))
             stack.enter_context(patch.object(manager, 'stop_supervisor'))
             stack.enter_context(patch.object(manager, 'stop_checkout'))

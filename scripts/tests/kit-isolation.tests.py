@@ -288,13 +288,18 @@ for line in sys.stdin:
 
     def test_host_secrets_are_not_inherited_and_dotenv_values_remain_literal(self):
         self.stop(); self.doCleanups()
-        self.runtime_env = {'REVIEW_PARENT_SECRET':'private-host-value'}
+        self.runtime_env = {'REVIEW_PARENT_SECRET':'private-host-value', 'REVIEW_AUTH_SECRET':'private-auth-value'}
         self.setUp()
         directory = self.install()
         with (directory/'.env').open('a',encoding='utf-8') as file:
             file.write('COPY=${REVIEW_PARENT_SECRET}\n')
+        manifest = json.loads((directory/'manifest.json').read_text())
+        manifest['provision']['env'].append({'name': 'REVIEW_PARENT_SECRET'})
+        manifest['provision']['auth'] = {'required': False, 'methods': [
+            {'id': 'parent', 'provider': 'env', 'env': ['REVIEW_AUTH_SECRET']}]}
+        (directory/'manifest.json').write_text(json.dumps(manifest))
         script = fixture.FIXTURE.replace('"marker":marker,',
-            '"marker":marker,"host_secret_present":"REVIEW_PARENT_SECRET" in os.environ,"copy":os.environ.get("COPY"),')
+            '"marker":marker,"host_secret_present":("REVIEW_PARENT_SECRET" in os.environ or "REVIEW_AUTH_SECRET" in os.environ),"copy":os.environ.get("COPY"),')
         (directory/'fixture.py').write_text(script,encoding='utf-8')
         self.value('portal_kits_reload')
         result = self.value('sample_ping')

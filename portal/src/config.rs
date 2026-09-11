@@ -73,6 +73,8 @@ struct RawConfig {
 #[derive(Debug, Deserialize)]
 struct RawSecurityConfig {
     #[serde(default)]
+    expose_host_details: bool,
+    #[serde(default)]
     exec_allowlist: Option<Vec<String>>,
     #[serde(default)]
     workspace_root: Option<PathBuf>,
@@ -83,7 +85,7 @@ struct RawSecurityConfig {
 }
 
 /// Resolved portal configuration
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PortalConfig {
     pub name: String,
     pub connect_link: Option<String>,
@@ -97,6 +99,16 @@ pub struct PortalConfig {
     pub kits_enabled: bool,
     /// Startup diagnostics contain field names and fixed guidance, never values.
     pub warnings: Vec<ConfigWarning>,
+}
+
+impl std::fmt::Debug for PortalConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PortalConfig")
+            .field("name", &self.name)
+            .field("connect_link", &"<redacted>")
+            .field("portal_mcp_token", &"<redacted>")
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -121,6 +133,8 @@ pub struct ToolsConfig {
 
 #[derive(Debug, Clone)]
 pub struct SecurityConfig {
+    /// Local administrator opt-in for host paths/PID in portal_status.
+    pub expose_host_details: bool,
     pub exec_allowlist: Vec<String>,
     pub workspace_root: PathBuf,
     pub max_file_size: usize,
@@ -160,6 +174,7 @@ impl Default for ToolsConfig {
 impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
+            expose_host_details: false,
             exec_allowlist: vec![],
             workspace_root: default_workspace_root(),
             max_file_size: 10 * 1024 * 1024,
@@ -169,7 +184,7 @@ impl Default for SecurityConfig {
 
 impl PortalConfig {
     pub fn load(path: &str) -> Result<Self> {
-        let content = std::fs::read_to_string(path)?;
+        let content = crate::bounded_file::text(std::path::Path::new(path), crate::bounded_file::CONFIG_LIMIT)?;
         let raw: RawConfig = toml::from_str(content.trim_start_matches('\u{feff}'))
             .map_err(|_| anyhow::anyhow!("Invalid TOML configuration in {}", path))?;
         let mut warnings = diagnostics::collect(&raw);
@@ -198,6 +213,7 @@ impl PortalConfig {
         let workspace = crate::paths::resolve_relative(&workspace, std::path::Path::new(path))?;
 
         let security = SecurityConfig {
+            expose_host_details: raw.security.as_ref().is_some_and(|s| s.expose_host_details),
             exec_allowlist: raw
                 .security
                 .as_ref()

@@ -129,6 +129,7 @@ impl ToolHost {
     pub(super) async fn handle_status(&self) -> Result<Value> {
         let runtime = &self.runtime;
         let config = &self.config;
+        let details = config.security.expose_host_details;
         // Do not use refresh_kits/list_healthy_tools here: both can change state.
         // Never include raw config, manifests, defaults, commands or error text.
         let statuses = self.kits.statuses().await;
@@ -152,10 +153,10 @@ impl ToolHost {
                 "name": runtime.name,
                 "version": PORTAL_VERSION,
                 "build_id": runtime.build_id,
-                "executable": runtime.executable,
+                "executable": if details { json!(runtime.executable) } else { Value::Null },
                 "os": std::env::consts::OS,
                 "arch": std::env::consts::ARCH,
-                "pid": std::process::id(),
+                "pid": details.then(std::process::id),
                 "started_at_unix_secs": runtime.started_at_unix_secs,
                 "uptime_seconds": runtime.started.elapsed().as_secs(),
             },
@@ -168,18 +169,19 @@ impl ToolHost {
                 },
             },
             "config": {
-                "path": runtime.config_location.path,
+                "path": if details { json!(runtime.config_location.path) } else { Value::Null },
                 "source": runtime.config_location.source,
                 "loaded_from_file": runtime.config_loaded,
                 "snapshot": "loaded-at-startup",
                 "reload_requires_restart": true,
-                "user_directory": runtime.user_directory,
-                "workspace": config.security.workspace_root,
-                "kits_directory": runtime.kits_directory,
-                "custom_tools_config": config.security.workspace_root.join("tools/mcp.toml"),
+                "user_directory": if details { json!(runtime.user_directory) } else { Value::Null },
+                "workspace": if details { json!(config.security.workspace_root) } else { Value::Null },
+                "kits_directory": if details { json!(runtime.kits_directory) } else { Value::Null },
+                "custom_tools_config": if details { json!(config.security.workspace_root.join("tools/mcp.toml")) } else { Value::Null },
                 "warnings": config.warnings,
             },
             "capabilities": {
+                "host_details_visible": details,
                 "schema_version": 1,
                 "read_only_status": true,
                 "tools_list_changed_notifications": true,
@@ -213,6 +215,7 @@ impl ToolHost {
                     "max_calls_per_connection": crate::mcp::limits::WORK_REQUESTS,
                     "reserved_management_requests_per_connection": crate::mcp::limits::MANAGEMENT_REQUESTS,
                     "process_tree_ownership": true,
+                    "process_cleanup": if cfg!(windows) { "job-object" } else { "best-effort-process-group" },
                     "max_process_generations": crate::mcp::limits::PROCESS_GENERATIONS,
                     "max_generations_per_kit": crate::mcp::limits::KIT_GENERATIONS,
                     "same_os_user": true,

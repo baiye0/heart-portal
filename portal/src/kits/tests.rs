@@ -223,7 +223,7 @@ fn dotenv_parsing_precedence_and_redaction() {
     assert_eq!(env.values["PORTAL_TEST_KIT_TOKEN"], "a=b # $literal");
     assert_eq!(env.values["MULTILINE"], "one\ntwo");
     assert_eq!(env.values["EMPTY"], "");
-    assert_eq!(env.values["PATH"], std::env::var("PATH").unwrap());
+    assert_eq!(env.values["PATH"], "fallback");
     assert_eq!(env.values["PORTAL_TEST_DEFAULT"], "default-value");
     assert!(std::env::var("PORTAL_TEST_KIT_TOKEN").is_err());
     let status = serde_json::to_string(&env.statuses(&manifest)).unwrap();

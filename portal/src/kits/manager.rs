@@ -13,7 +13,7 @@ use crate::mcp::{McpConnection, McpServerConfig};
 use crate::tools::ToolInfo;
 
 use super::environment::EnvStatus;
-use super::loader::{command_binary_exists, format_command, KitScan, LoadedKit};
+use super::loader::{command_binary_exists, KitScan, LoadedKit};
 
 const MAX_FAILURES: u8 = 3;
 const SPAWN_TIMEOUT_SECS: u64 = 30;
@@ -236,7 +236,6 @@ impl KitManager {
                 let _ = timeout(Duration::from_secs(5), owned.shutdown()).await;
             }
         }
-        let command_text = format_command(&config.command);
         info!("Spawning kit '{}'", name);
         let started_at = unix_ms();
         let starting = Instant::now();
@@ -272,12 +271,9 @@ impl KitManager {
                 Ok(connection)
             }
             failure => {
-                let (code, error) = match failure {
-                    Ok(Err(error)) => ("mcp-start-failed", error.to_string()),
-                    Err(_) => (
-                        "mcp-start-timeout",
-                        format!("timed out after {} seconds", seconds),
-                    ),
+                let code = match failure {
+                    Ok(Err(_)) => "mcp-start-failed",
+                    Err(_) => "mcp-start-timeout",
                     Ok(Ok(_)) => unreachable!(),
                 };
                 state.diagnostics.last_lifecycle_error = Some(code);
@@ -287,8 +283,8 @@ impl KitManager {
                     name
                 );
                 anyhow::bail!(
-                    "Kit '{}' failed to start: {}. Command: {}. Check that the command exists and the MCP server implements the stdio protocol.",
-                    name, error, command_text
+                    "Kit '{}' failed to start ({}). Inspect portal_kits_status and the kit runtime configuration.",
+                    name, code
                 )
             }
         }
@@ -694,10 +690,8 @@ impl KitManager {
             }
 
             if let Some(state) = kits.get_mut(&name) {
-                let old_json = serde_json::to_string(&state.kit.manifest).unwrap_or_default();
-                let new_json = serde_json::to_string(&kit.manifest).unwrap_or_default();
                 if (force && target.is_none_or(|target| target == name))
-                    || old_json != new_json
+                    || state.kit.manifest != kit.manifest
                     || state.kit.command != kit.command
                     || state.kit.kit_dir != kit.kit_dir
                     || state.kit.environment != kit.environment
@@ -845,19 +839,17 @@ fn check_startable(state: &mut KitState) -> Result<()> {
 
     if state.unhealthy {
         anyhow::bail!(
-            "Kit '{}' is unhealthy. Command: {}. Check that the command exists and the MCP server implements the stdio protocol.",
-            state.kit.manifest.name,
-            format_command(&state.kit.command)
+            "Kit '{}' is unhealthy (mcp-start-failed). Inspect the kit runtime configuration.",
+            state.kit.manifest.name
         );
     }
 
     if state.failure_count >= MAX_FAILURES {
         state.unhealthy = true;
         anyhow::bail!(
-            "Kit '{}' is unhealthy after {} failed restart attempts. Command: {}. Check that the command exists and the MCP server implements the stdio protocol.",
+            "Kit '{}' is unhealthy after {} failed restart attempts (mcp-start-failed). Inspect the kit runtime configuration.",
             state.kit.manifest.name,
-            state.failure_count,
-            format_command(&state.kit.command)
+            state.failure_count
         );
     }
 

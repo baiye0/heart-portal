@@ -49,7 +49,7 @@ pub fn recover_interrupted() -> Result<()> {
     if !journal_path.exists() {
         return Ok(());
     }
-    let journal: serde_json::Value = serde_json::from_slice(&std::fs::read(journal_path)?)?;
+    let journal: serde_json::Value = serde_json::from_slice(&crate::bounded_file::metadata_bytes(journal_path)?)?;
     let stage = PathBuf::from(journal["stage"].as_str().context("Upgrade journal has no stage")?)
         .canonicalize()?;
     anyhow::ensure!(stage.parent() == Some(root.join(".portal-upgrades").as_path()),
@@ -58,16 +58,16 @@ pub fn recover_interrupted() -> Result<()> {
         anyhow::ensure!(stage.join(name).canonicalize()?.parent() == Some(stage.as_path()),
             "Upgrade recovery file is outside this installation");
     }
-    let request: serde_json::Value = serde_json::from_slice(&std::fs::read(stage.join("request.json"))?)?;
+    let request: serde_json::Value = serde_json::from_slice(&crate::bounded_file::metadata_bytes(stage.join("request.json"))?)?;
     anyhow::ensure!(Path::new(request["root"].as_str().context("Recovery request has no root")?)
         .canonicalize()? == root, "Recovery request belongs to another installation");
     if let Some(path) = request["target"].as_str() {
         anyhow::ensure!(Path::new(path).canonicalize()? == target,
             "Recovery request belongs to another executable");
     }
-    let python = std::fs::read_to_string(root.join(".portal-python"))
+    let python = crate::bounded_file::optional_text(&root.join(".portal-python"))?
         .map(|s| PathBuf::from(s.trim()))
-        .unwrap_or_else(|_| PathBuf::from("/usr/bin/python3"));
+        .unwrap_or_else(|| PathBuf::from("/usr/bin/python3"));
     anyhow::ensure!(python.is_absolute() && python.is_file(),
         "Upgrade recovery requires Python 3.9+; install it or update .portal-python");
     // The saved worker reacquires maintenance and rechecks the journal. Another
@@ -94,7 +94,7 @@ pub fn startup_guard() -> Result<Option<std::fs::File>> {
     // restart cross the lock; do not pretend it has KeepAlive/portal_restart.
     if let Ok(nonce) = std::env::var("HEART_PORTAL_UPGRADE_START") {
         if root.join(".portal-upgrade.json").is_file()
-            && std::fs::read_to_string(root.join(".portal-launch-nonce")).ok().as_deref() == Some(nonce.as_str())
+            && crate::bounded_file::optional_text(&root.join(".portal-launch-nonce"))?.as_deref() == Some(nonce.as_str())
         {
             return Ok(None);
         }
@@ -124,8 +124,11 @@ pub fn publish_ready() -> Result<()> {
     let Ok(root) = installation_root(&std::env::current_exe()?) else {
         return Ok(());
     };
-    let Ok(nonce) = std::env::var("HEART_PORTAL_READY_NONCE")
-        .or_else(|_| std::fs::read_to_string(root.join(".portal-launch-nonce"))) else {
+    let nonce = match std::env::var("HEART_PORTAL_READY_NONCE") {
+        Ok(nonce) => Some(nonce),
+        Err(_) => crate::bounded_file::optional_text(&root.join(".portal-launch-nonce"))?,
+    };
+    let Some(nonce) = nonce else {
         return Ok(());
     };
     let target = std::env::var_os("HEART_PORTAL_READY_FILE").map(PathBuf::from)
@@ -152,7 +155,7 @@ pub fn show_status() -> Result<()> {
         println!("No upgrade recorded for {}", root.display());
         return Ok(());
     }
-    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+    let value: serde_json::Value = serde_json::from_slice(&crate::bounded_file::metadata_bytes(path)?)?;
     println!("{}", serde_json::to_string_pretty(&value)?);
     if matches!(
         value["state"].as_str(),
@@ -215,9 +218,9 @@ async fn handoff_to(bytes: &[u8], version: Option<&str>, target: &Path) -> Resul
     }
     // bootstrap creates a sibling job owned by launchd; setsid/double-fork alone
     // cannot escape launchd's process-group cleanup when Portal is booted out.
-    let python = std::fs::read_to_string(root.join(".portal-python"))
+    let python = crate::bounded_file::optional_text(&root.join(".portal-python"))?
         .map(|s| PathBuf::from(s.trim()))
-        .unwrap_or_else(|_| PathBuf::from("/usr/bin/python3"));
+        .unwrap_or_else(|| PathBuf::from("/usr/bin/python3"));
     anyhow::ensure!(
         python.is_absolute() && python.is_file(),
         "Installed Python 3 runtime is missing; reinstall Python and update .portal-python"
@@ -234,7 +237,7 @@ async fn handoff_to(bytes: &[u8], version: Option<&str>, target: &Path) -> Resul
     loop {
         if stage.join("error.json").exists() {
             let error: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(stage.join("error.json"))?)?;
+                serde_json::from_slice(&crate::bounded_file::metadata_bytes(stage.join("error.json"))?)?;
             bail!(
                 "Upgrade rejected; installed binary unchanged: {}",
                 error["message"]
@@ -243,11 +246,11 @@ async fn handoff_to(bytes: &[u8], version: Option<&str>, target: &Path) -> Resul
         if !stage.join("accepted.json").exists() && stage.join("result.json").exists() {
             bail!(
                 "Updater completed before acceptance: {}",
-                std::fs::read_to_string(stage.join("result.json"))?
+                crate::bounded_file::metadata_text(stage.join("result.json"))?
             );
         }
         if stage.join("accepted.json").exists() {
-            let accepted: serde_json::Value = serde_json::from_slice(&std::fs::read(stage.join("accepted.json"))?)?;
+            let accepted: serde_json::Value = serde_json::from_slice(&crate::bounded_file::metadata_bytes(stage.join("accepted.json"))?)?;
             if accepted["signature_identity_preserved"] == false {
                 eprintln!("Signing identity changed; macOS may require one-time authorization. Upgrade will continue.");
             }

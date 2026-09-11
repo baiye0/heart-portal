@@ -38,11 +38,11 @@ if (-not (Test-Path -LiteralPath $config)) {
 if (-not (Test-Path -LiteralPath $config)) { throw "Portal config not found: $config" }
 if (-not (Test-Path -LiteralPath $linkFile)) { throw "Connection file not found: $linkFile" }
 
-$loomLink = (Get-Content -LiteralPath $linkFile -Raw).Trim()
+$loomLink = (Read-PortalText $linkFile).Trim()
 if ([string]::IsNullOrWhiteSpace($loomLink)) { throw "Connection file is empty: $linkFile" }
 
 if ([string]::IsNullOrWhiteSpace($PortalName) -and (Test-Path -LiteralPath $nameFile)) {
-    $PortalName = (Get-Content -LiteralPath $nameFile -Raw).Trim()
+    $PortalName = (Read-PortalText $nameFile).Trim()
 }
 if ([string]::IsNullOrWhiteSpace($PortalName)) {
     throw "Portal name is not configured. Run install-portal-windows.ps1 or pass -PortalName explicitly."

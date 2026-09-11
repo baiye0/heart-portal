@@ -33,6 +33,8 @@ must not silently change the files a Being can access.
    An installed runtime never selects a config from an unrelated current directory.
 4. `~/.heart-portal/portal.toml` for a new installation.
 
+Config and saved launch/identity metadata reads are limited to 1 MiB and regular,
+non-symlink files; oversized files fail before parsing.
 A missing explicit/saved config or unreadable/invalid config is an error. It
 does not fall back to another Portal's configuration. A saved instance is not
 silently switched when a central config already exists. Changing only `--name`

@@ -23,6 +23,8 @@ function Wait-Line([string]$Expected) {
     throw "Reader did not show '$Expected'. Output: $script:observed"
 }
 try {
+    [void][IO.Directory]::CreateDirectory((Join-Path $root 'scripts'))
+    Copy-Item -LiteralPath (Join-Path $repo 'scripts\portal-lifecycle.ps1') -Destination (Join-Path $root 'scripts')
     $utf8 = [Text.UTF8Encoding]::new($false)
     $log = Join-Path $root 'portal-runtime.log'
     [IO.File]::WriteAllText($log, "startup-history`nPortal relay handshake OK - historical log text`n", $utf8)

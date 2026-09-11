@@ -57,12 +57,22 @@ impl std::error::Error for RequestTimeout {}
 static PROCESS_CAPACITY: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 
 /// Configuration for a stdio MCP server process.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct McpServerConfig {
     pub name: String,
     pub command: Vec<String>,
     pub env: HashMap<String, String>,
     pub cwd: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for McpServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpServerConfig")
+            .field("name", &self.name)
+            .field("command", &"<redacted>")
+            .field("env", &"<redacted>")
+            .finish_non_exhaustive()
+    }
 }
 
 /// A stdio JSON-RPC connection to a single MCP server.
@@ -669,6 +679,13 @@ impl McpConnection {
                 false
             };
             if closed {
+                #[cfg(unix)]
+                if let Some(owner) = &self.owner {
+                    // Keep the group leader unreaped until abort signals its
+                    // group. Reaping it here would allow its PGID to be reused.
+                    let _ = tokio::time::timeout(Duration::from_millis(250), owner.wait_unreaped()).await;
+                }
+                #[cfg(not(unix))]
                 if let Some(child) = &mut self.child {
                     let _ = tokio::time::timeout(Duration::from_millis(250), child.wait()).await;
                 }

@@ -10,7 +10,7 @@ pub(crate) const KIT_GENERATIONS: usize = 2;
 pub(super) const PENDING_REQUESTS: usize = 16;
 
 /// Bound allocation before copying a line, including a stream without newlines.
-pub(super) async fn read_line<R: AsyncBufRead + Unpin>(
+pub(crate) async fn read_line<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     line: &mut Vec<u8>,
     limit: usize,

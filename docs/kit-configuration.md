@@ -41,15 +41,21 @@ errors and redirects as tool errors even when a response is HTML or empty.
 authorized.
 
 `not-started` means a process has not been started yet. A configured kit is
-started on its first tool call. `eager: true` currently prewarms at Portal
-startup; kits discovered later remain callable without restarting Portal.
+started on its first tool call. `eager: true` requests best-effort prewarming
+at Portal startup, in the background with a bounded timeout. Failures are logged
+and do not block Portal readiness; eager does not guarantee a running or healthy
+kit. Kits discovered or reloaded later start on their next tool call, without
+restarting Portal.
 Use the exact tool name from `tools/list`. Use `portal_status` to distinguish
 the actual local build from an older executable that shares its package version.
 
-Configuration precedence is kit `.env`, then inherited variables explicitly
-named by `provision.env` or `provision.auth`,
-then the optional string `default` in a `provision.env` entry. Explicit empty
-values override inherited values. Portal does not mutate its own environment,
+Configuration precedence is kit `.env`, then the optional string `default` in
+a `provision.env` entry. Explicit empty values override defaults. Manifest
+`provision.env` and `provision.auth.env` declarations never authorize inheritance
+of host variables. Put required credentials in the kit-local `.env` or use the
+kit-managed login flow. Runtime basics such as PATH and locale remain available;
+they do not satisfy declared credential requirements without a local value.
+Portal does not mutate its own environment,
 so one kit's `.env` does not leak into other kits. Existing kits without
 `provision.env` also receive `.env` values. `PORTAL_KIT_NAME` and `PORTAL_KIT_DIR`
 are set by Portal. Unless the kit explicitly sets PATH, Unix PATH includes the
@@ -109,6 +115,9 @@ service-specific code to Portal:
 }
 ```
 
+Authorization URLs must use HTTPS, except HTTP on loopback hosts for local login callbacks.
+Rejected URLs are marked invalid and omitted from setup/status URL fields.
+
 Methods are alternatives: either PAT **or** email **and** API token satisfies
 local preflight. Separately required `provision.env` entries still apply to all
 methods. Leave alternative credentials out of global required entries, or mark
@@ -118,7 +127,7 @@ when the kit supports useful anonymous operations.
 | Provider | Requirements and behavior |
 | --- | --- |
 | `env` | All names in `env` must have nonempty, non-placeholder values. Supports API keys, bearer/PAT tokens, Basic credentials, etc. |
-| `file` | All paths in `files` must be readable, nonempty regular, non-symlink credential files, at most 1 MiB each. Relative paths use the kit directory; absolute and `~/` paths are supported. Contents are never returned. |
+| `file` | All paths in `files` must be readable, nonempty regular, non-symlink credential files, at most 1 MiB each. Only paths within the kit directory are accepted; absolute paths, `..`, `~/` and links escaping that directory are rejected. External CLI credentials should use a kit-managed login flow instead of having Portal fingerprint host files. Contents are never returned. |
 | `kit` | The kit owns OAuth, device-code, CLI, desktop login or another custom flow. Supply `tools`, `instructions` and/or `url` to guide setup. Optional `env`/`files` are prerequisites for bootstrapping the flow. |
 
 Both `env` and `file` methods can combine environment and file requirements.
@@ -245,9 +254,12 @@ Windows launches each kit suspended, assigns it to a non-breakaway Job Object
 with a 32-process limit, then resumes it. This owns descendants even if the kit
 launcher exits or Portal is forcibly terminated. macOS/Linux use a dedicated
 process group for ordinary descendants and kill the group during managed
-cleanup. Unix groups do not contain children that deliberately detach, and
+cleanup. This Unix cleanup is best-effort. Unix groups do not contain children that deliberately detach, and
 SIGKILL of Portal does not execute cleanup. Retired connections stay owned
 through shutdown; cleanup does not search for arbitrary matching process names.
+Portal keeps the group leader unreaped until the one-time group signal, preventing
+PGID reuse during managed cleanup. Windows enumerates all captured thread handles
+before resuming, so an auxiliary thread cannot hide the suspended primary thread.
 
 An async tool returning a job ID has finished its MCP request, even if a child
 job is still running. On Windows that child remains in the kit's Job Object
@@ -265,4 +277,8 @@ that hostile code or unrestricted shell commands cannot affect Portal. Do not
 run untrusted community code on the assumption that these limits provide that
 guarantee. Enforcing that boundary requires a separate OS identity or sandbox
 with explicitly granted resources and a separate host administration channel.
+In particular, environment filtering does not prevent same-user kit code from
+reading Portal credentials on disk or inspecting accessible host processes.
+`portal_status` hides host paths and the Portal PID by default; only the local
+administrator can expose them with `security.expose_host_details = true`.
 `portal_status.capabilities.kit_isolation` exposes this limitation explicitly.

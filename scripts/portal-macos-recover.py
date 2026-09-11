@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import runpy
 import sys
+import stat
 
 
 def main():
@@ -16,7 +17,16 @@ def main():
     saved = runpy.run_path(str(worker))
     if saved['main']() != 0:
         raise RuntimeError(f'Recovery did not finish; see {stage / "worker.log"} and retry normal startup.')
-    result = json.loads((stage / 'result.json').read_text())
+    # The saved worker may predate metadata_bytes; bound this recovery bridge locally.
+    fd = os.open(stage / 'result.json', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 1024 * 1024:
+            raise ValueError('Invalid recovery result metadata.')
+        payload = stream.read(1024 * 1024 + 1)
+        if len(payload) > 1024 * 1024:
+            raise ValueError('Recovery result exceeds 1 MiB.')
+    result = json.loads(payload)
     if result['state'] not in ('rolled_back', 'succeeded'):
         raise RuntimeError(f'Recovery ended with {result["state"]}; see {stage / "worker.log"}.')
     manager = saved['manager']

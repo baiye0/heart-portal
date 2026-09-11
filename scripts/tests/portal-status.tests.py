@@ -104,7 +104,7 @@ class RuntimeStatusTests(unittest.TestCase):
             f"name='configured-name'\nbind='127.0.0.1:{port}'\n"
             "workspace='./workspace'\nkits_dir='./kits'\nkits_enabled=false\n"
             "portal_mcp_token='private-config-token'\n" + extra +
-            "[tools]\nexec=false\nfile=false\ncustom_tools_enabled=false\n", encoding='utf-8')
+            "[tools]\nexec=false\nfile=false\ncustom_tools_enabled=false\n[security]\nexpose_host_details=true\n", encoding='utf-8')
         self.process = subprocess.Popen([str(self.binary), '--config', str(self.config), *args],
             cwd=self.root, env=self.env, stdout=self.log, stderr=self.log,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
@@ -182,6 +182,20 @@ class RuntimeStatusTests(unittest.TestCase):
             self.assertIsNone(self.process.poll())
             log = (self.root/'runtime.log').read_text(encoding='utf-8', errors='replace')
             self.assertNotIn('private-relay-token', log)
+
+    def test_oversized_relay_frame_is_rejected_without_waiting_for_payload(self):
+        with socket.socket() as relay:
+            relay.bind(('127.0.0.1', 0))
+            relay.listen(2)
+            relay.settimeout(20)
+            self.env['PORTAL_CONNECT_LINK'] = f'http://127.0.0.1:{relay.getsockname()[1]}/status-being?token=private-relay-token'
+            self.start(9100, '--name', 'effective-relay-name')
+            with self.accept_relay(relay) as connection:
+                # Only the header: reject before allocating or waiting for 16 MiB.
+                connection.sendall(b'\x81\x7f' + struct.pack('!Q', 16 * 1024 * 1024 + 1))
+                with self.accept_relay(relay) as recovered:
+                    self.relay_status(recovered)
+                    self.assertIsNone(self.process.poll())
 
     def test_silent_relay_times_out_and_reconnects_without_restarting(self):
         with socket.socket() as relay:
