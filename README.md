@@ -31,7 +31,6 @@ Portal connects **outbound** to Hearth's relay endpoint — no port forwarding n
 | `portal_file_write` | `path`, `content` | Write files inside the workspace. |
 | `portal_file_list` | `path` | List directory contents. |
 | `portal_web_fetch` | `url` | Fetch content from a URL. |
-| `portal_web_search` | `query` | Search the web. |
 | `portal_search` | `query` | Search text across the workspace. |
 | `portal_screenshot` | `path`, `region`, `display` | Capture a screenshot to a workspace file. |
 | `portal_tools_reload` | none | Reload custom tools without restarting Portal. |
