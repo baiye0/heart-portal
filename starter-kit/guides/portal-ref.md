@@ -11,7 +11,6 @@
 | `portal_file_list` | `path` | Directory listing | `{"path": "."}` |
 | `portal_search` | `pattern`, optional `path`, `max_matches` | Ripgrep-style matches | `{"pattern": "TODO"}` |
 | `portal_web_fetch` | `url`, optional `max_chars` | Fetched body (truncated) | `{"url": "https://example.com"}` |
-| `portal_web_search` | `query`, optional `count` (default 5, max 10) | JSON array of `{title, url, snippet}` | `{"query": "rust async book", "count": 5}` |
 | `portal_tools_reload` | (none) | Reload custom tools | `{}` |
 | `portal_kits_status` | (none; kits enabled) | Kit status, credential variable names and configured flags; no values | `{}` |
 | `portal_kits_setup` | `kit` | Runtime, dependencies, setup instructions and auth alternatives; no local credential values | `{"kit":"jira"}` |
