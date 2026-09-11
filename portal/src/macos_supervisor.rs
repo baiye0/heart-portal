@@ -76,7 +76,7 @@ async fn run(action: &str, arguments: Vec<String>, connect: Option<&str>) -> Res
         ("portal-macos-supervisor.py", include_bytes!("../../scripts/portal-macos-supervisor.py").as_slice()),
     ] {
         let path = support.join(name);
-        if std::fs::read(&path).ok().as_deref() != Some(bytes) {
+        if crate::bounded_file::metadata_bytes(&path).ok().as_deref() != Some(bytes) {
             private_write(&path, bytes)?;
         }
     }
@@ -84,9 +84,9 @@ async fn run(action: &str, arguments: Vec<String>, connect: Option<&str>) -> Res
         "root": root, "target": target, "arguments": arguments, "token": token,
         "cwd": std::env::current_dir()?, "runtime_pid": std::process::id()
     }))?;
-    let python = std::fs::read_to_string(root.join(".portal-python"))
+    let python = crate::bounded_file::optional_text(&root.join(".portal-python"))?
         .map(|s| PathBuf::from(s.trim()))
-        .unwrap_or_else(|_| PathBuf::from("/usr/bin/python3"));
+        .unwrap_or_else(|| PathBuf::from("/usr/bin/python3"));
     anyhow::ensure!(
         python.is_absolute() && python.is_file(),
         "Portal supervision requires Python 3.9+; install it or update .portal-python"

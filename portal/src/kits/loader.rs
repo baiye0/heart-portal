@@ -5,6 +5,8 @@ use tracing::{debug, warn};
 
 use crate::config::PortalConfig;
 
+use super::auth::AuthState;
+use super::environment::KitEnvironment;
 use super::manifest::KitManifest;
 
 #[derive(Debug, Clone)]
@@ -12,6 +14,23 @@ pub struct LoadedKit {
     pub manifest: KitManifest,
     pub kit_dir: PathBuf,
     pub command: Vec<String>,
+    pub environment: KitEnvironment,
+    pub auth: AuthState,
+}
+
+impl LoadedKit {
+    pub fn configuration_error(&self) -> Option<&str> {
+        self.environment
+            .error
+            .as_deref()
+            .or(self.auth.error.as_deref())
+    }
+}
+
+pub struct KitScan {
+    pub kits: Vec<LoadedKit>,
+    /// Retain the last valid kit while an installer is writing its manifest.
+    pub invalid_dirs: Vec<PathBuf>,
 }
 
 pub fn load_kits(config: &PortalConfig) -> Result<Vec<LoadedKit>> {
@@ -24,50 +43,133 @@ pub fn load_kits(config: &PortalConfig) -> Result<Vec<LoadedKit>> {
 }
 
 pub fn load_kits_from_dir(kits_dir: &Path) -> Result<Vec<LoadedKit>> {
-    if !kits_dir.exists() {
+    Ok(scan_kits_from_dir(kits_dir)?.kits)
+}
+
+pub fn scan_kits_from_dir(kits_dir: &Path) -> Result<KitScan> {
+    if !kits_dir.try_exists()? {
         debug!("No kits directory at {}", kits_dir.display());
-        return Ok(Vec::new());
+        return Ok(KitScan {
+            kits: vec![],
+            invalid_dirs: vec![],
+        });
     }
 
     let mut entries = std::fs::read_dir(kits_dir)
         .with_context(|| format!("Reading kits directory {}", kits_dir.display()))?
+        .take(4097)
         .collect::<std::io::Result<Vec<_>>>()
         .with_context(|| format!("Reading entries from kits directory {}", kits_dir.display()))?;
     entries.sort_by_key(|entry| entry.path());
+    anyhow::ensure!(
+        entries.len() <= 4096,
+        "Too many entries in kits directory; keeping current inventory"
+    );
 
     let mut kits = Vec::new();
+    let mut invalid_dirs = Vec::new();
+    let mut manifests = 0;
     for entry in entries {
         let kit_dir = entry.path();
-        if !kit_dir.is_dir() {
-            continue;
+        match std::fs::metadata(&kit_dir) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => continue,
+            Err(err) => {
+                // A temporary access failure must not be treated as uninstall.
+                warn!(
+                    "Cannot inspect kit directory {}: {}",
+                    kit_dir.display(),
+                    err
+                );
+                invalid_dirs.push(kit_dir);
+                continue;
+            }
         }
 
         let manifest_path = kit_dir.join("manifest.json");
         if !manifest_path.exists() {
+            invalid_dirs.push(kit_dir);
             continue;
         }
+
+        manifests += 1;
+        anyhow::ensure!(
+            manifests <= 128,
+            "Too many kit manifests; keeping current inventory"
+        );
 
         match load_manifest(&kit_dir, &manifest_path) {
             Ok(Some(kit)) => kits.push(kit),
             Ok(None) => {}
             Err(err) => {
-                warn!(
-                    "Skipping kit manifest {}: {}",
-                    manifest_path.display(),
-                    err
-                );
+                invalid_dirs.push(kit_dir);
+                warn!("Skipping kit manifest {}: {}", manifest_path.display(), err);
             }
         }
     }
 
-    Ok(kits)
+    // Never let another directory take over an existing kit name or tool route.
+    // Keeping both directories invalid preserves the previously loaded owner.
+    let mut owners = std::collections::HashMap::new();
+    let mut conflicts = std::collections::HashSet::new();
+    for (index, kit) in kits.iter().enumerate() {
+        let routes = std::iter::once(format!("kit:{}", kit.manifest.name)).chain(
+            kit.manifest
+                .tools
+                .iter()
+                .map(|tool| format!("tool:{}", tool_route(&kit.manifest.name, &tool.name))),
+        );
+        for route in routes {
+            if let Some(previous) = owners.insert(route, index) {
+                conflicts.insert(previous);
+                conflicts.insert(index);
+            }
+        }
+    }
+    let kits = kits.into_iter().enumerate().filter_map(|(index, kit)| {
+        if conflicts.contains(&index) {
+            warn!("Kit '{}' conflicts with another kit name or tool route; keeping previous inventory entry", kit.manifest.name);
+            invalid_dirs.push(kit.kit_dir);
+            None
+        } else { Some(kit) }
+    }).collect();
+
+    Ok(KitScan { kits, invalid_dirs })
 }
 
 fn load_manifest(kit_dir: &Path, manifest_path: &Path) -> Result<Option<LoadedKit>> {
-    let content = std::fs::read_to_string(manifest_path)
+    let content = crate::bounded_file::text(manifest_path, 256 * 1024)
         .with_context(|| format!("Reading kit manifest {}", manifest_path.display()))?;
     let manifest: KitManifest = serde_json::from_str(&content)
         .with_context(|| format!("Parsing kit manifest {}", manifest_path.display()))?;
+    anyhow::ensure!(is_valid_kit_name(&manifest.name), "Invalid kit name");
+    anyhow::ensure!(
+        manifest.name.len() <= 64 && manifest.tools.len() <= 128 && manifest.command.len() <= 64,
+        "Kit manifest exceeds name, tool or command limits"
+    );
+    anyhow::ensure!(
+        manifest.tools.iter().all(|tool| !tool.name.is_empty()
+            && tool.name.len() <= 128
+            && tool
+                .name
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-' || c == b'.')),
+        "Invalid kit tool name"
+    );
+    if let Some(provision) = &manifest.provision {
+        anyhow::ensure!(
+            provision.env.len() <= 256,
+            "Too many kit environment requirements"
+        );
+        if let Some(auth) = &provision.auth {
+            anyhow::ensure!(
+                auth.methods.len() <= 16
+                    && auth.methods.iter().map(|m| m.files.len()).sum::<usize>() <= 16
+                    && auth.methods.iter().all(|m| m.env.len() <= 256),
+                "Too many kit authentication requirements"
+            );
+        }
+    }
 
     if !platform_matches(&manifest) {
         debug!(
@@ -78,12 +180,17 @@ fn load_manifest(kit_dir: &Path, manifest_path: &Path) -> Result<Option<LoadedKi
         return Ok(None);
     }
 
-    let command = resolve_command(kit_dir, &manifest.command);
+    let environment = KitEnvironment::load(kit_dir, &manifest);
+    let command =
+        resolve_command_with_environment(kit_dir, &manifest.command, &environment.process_values());
     for warning in manifest_validation_warnings(&manifest, &command) {
         warn!("{}", warning);
     }
 
+    let auth = AuthState::load(kit_dir, &manifest, &environment);
     Ok(Some(LoadedKit {
+        environment,
+        auth,
         manifest,
         kit_dir: kit_dir.to_path_buf(),
         command,
@@ -91,14 +198,23 @@ fn load_manifest(kit_dir: &Path, manifest_path: &Path) -> Result<Option<LoadedKi
 }
 
 fn platform_matches(manifest: &KitManifest) -> bool {
-    let Some(platforms) = &manifest.platform else {
+    let platforms = manifest.platform.as_ref().or_else(|| {
+        manifest
+            .provision
+            .as_ref()
+            .map(|p| &p.platforms)
+            .filter(|p| !p.is_empty())
+    });
+    let Some(platforms) = platforms else {
         return true;
     };
 
     let current = current_platform();
     platforms.iter().any(|platform| {
         let normalized = platform.to_ascii_lowercase();
-        normalized == current || (current == "darwin" && normalized == "macos")
+        normalized == current
+            || (current == "darwin" && normalized == "macos")
+            || (current == "windows" && normalized == "win32")
     })
 }
 
@@ -121,7 +237,20 @@ pub fn current_platform() -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn resolve_command(kit_dir: &Path, command: &[String]) -> Vec<String> {
+    resolve_command_with_environment(
+        kit_dir,
+        command,
+        &KitEnvironment::default().process_values(),
+    )
+}
+
+fn resolve_command_with_environment(
+    kit_dir: &Path,
+    command: &[String],
+    env: &std::collections::HashMap<String, String>,
+) -> Vec<String> {
     let mut resolved = command.to_vec();
     if resolved.is_empty() {
         return resolved;
@@ -130,7 +259,9 @@ fn resolve_command(kit_dir: &Path, command: &[String]) -> Vec<String> {
     let first = Path::new(&resolved[0]);
 
     if first.is_absolute() {
-        if let Some(program) = find_binary_at(first) {
+        if let Some(program) =
+            find_binary_at_with_extensions(first, env.get("PATHEXT").map(String::as_str))
+        {
             resolved[0] = program.to_string_lossy().into_owned();
         }
         return resolved;
@@ -138,7 +269,9 @@ fn resolve_command(kit_dir: &Path, command: &[String]) -> Vec<String> {
 
     let candidate = kit_dir.join(first);
     let has_path_separator = resolved[0].contains('/') || resolved[0].contains('\\');
-    if let Some(program) = find_binary_at(&candidate) {
+    if let Some(program) =
+        find_binary_at_with_extensions(&candidate, env.get("PATHEXT").map(String::as_str))
+    {
         resolved[0] = program.to_string_lossy().into_owned();
         return resolved;
     }
@@ -147,14 +280,26 @@ fn resolve_command(kit_dir: &Path, command: &[String]) -> Vec<String> {
         return resolved;
     }
 
-    #[cfg(windows)]
-    if !has_path_separator {
-        if let Some(program) = find_binary_on_path(&resolved[0]) {
-            resolved[0] = program.to_string_lossy().to_string();
+    if let Some(path) = env.get("PATH") {
+        for dir in std::env::split_paths(path) {
+            // Relative PATH entries are relative to the child's working directory.
+            let path = kit_dir.join(dir).join(first);
+            if let Some(program) =
+                find_binary_at_with_extensions(&path, env.get("PATHEXT").map(String::as_str))
+            {
+                resolved[0] = program.to_string_lossy().to_string();
+                return resolved;
+            }
         }
     }
-
+    // Do not let preflight or CreateProcess fall back to the host's PATH when
+    // the kit explicitly selected a different environment with no such binary.
+    resolved[0] = candidate.to_string_lossy().into_owned();
     resolved
+}
+
+pub(super) fn tool_route(kit: &str, tool: &str) -> String {
+    format!("{kit}_{tool}").replace('-', "_")
 }
 
 pub(crate) fn manifest_validation_warnings(
@@ -213,7 +358,13 @@ pub(crate) fn format_command(command: &[String]) -> String {
 fn binary_exists(binary: &str) -> bool {
     let path = Path::new(binary);
     if path.is_absolute() || binary.contains('/') || binary.contains('\\') {
-        return find_binary_at(path).is_some();
+        // Kit loading already resolved extensions using the kit's PATHEXT.
+        // Re-resolving here using the host environment could select another file.
+        #[cfg(windows)]
+        if path.extension().is_none() {
+            return false;
+        }
+        return path.is_file();
     }
 
     find_binary_on_path(binary).is_some()
@@ -230,12 +381,16 @@ fn find_binary_on_path(binary: &str) -> Option<PathBuf> {
 }
 
 fn find_binary_at(path: &Path) -> Option<PathBuf> {
-    // npm installs both a POSIX `codex` shim and `codex.cmd`. On Windows,
+    find_binary_at_with_extensions(path, std::env::var("PATHEXT").ok().as_deref())
+}
+
+fn find_binary_at_with_extensions(path: &Path, _pathext: Option<&str>) -> Option<PathBuf> {
+    // npm installs both a POSIX shim and a `.cmd` launcher. On Windows,
     // selecting the extensionless file first fails with Win32 error 193.
     #[cfg(windows)]
     if path.extension().is_none() {
-        for ext in std::env::var("PATHEXT")
-            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
+        for ext in _pathext
+            .unwrap_or(".COM;.EXE;.BAT;.CMD")
             .split(';')
             .filter(|ext| !ext.is_empty())
         {
@@ -269,53 +424,46 @@ pub fn kits_dir(config: &PortalConfig) -> PathBuf {
 }
 
 fn expand_home(path: &str) -> PathBuf {
-    if path == "~" {
-        return home_dir().unwrap_or_else(|| PathBuf::from(path));
-    }
-
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = home_dir() {
-            return home.join(rest);
-        }
-    }
-
-    PathBuf::from(path)
-}
-
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
-        .or_else(|| {
-            // Fallback for systemd services where $HOME is not set
-            #[cfg(unix)]
-            {
-                // SAFETY: getuid is always safe
-                let uid = unsafe { libc::getuid() };
-                // SAFETY: getpwuid returns a pointer to a static struct or null
-                let pw = unsafe { libc::getpwuid(uid) };
-                if !pw.is_null() {
-                    let dir = unsafe { std::ffi::CStr::from_ptr((*pw).pw_dir) };
-                    if let Ok(s) = dir.to_str() {
-                        return Some(PathBuf::from(s));
-                    }
-                }
-                None
-            }
-            #[cfg(windows)]
-            {
-                None
-            }
-            #[cfg(not(any(unix, windows)))]
-            {
-                None
-            }
-        })
+    crate::paths::expand_home(Path::new(path)).unwrap_or_else(|err| {
+        warn!("Cannot expand kit directory: {}", err);
+        PathBuf::from(path)
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_empty_path_does_not_fall_back_to_host_runtime() {
+        let root = crate::kits::tests::TestKits::new();
+        #[cfg(windows)]
+        let program = "cmd.exe";
+        #[cfg(not(windows))]
+        let program = "sh";
+        let env = std::collections::HashMap::from([("PATH".into(), String::new())]);
+        let command = resolve_command_with_environment(&root.0, &[program.into()], &env);
+        assert_eq!(PathBuf::from(&command[0]), root.0.join(program));
+        assert!(!command_binary_exists(&command));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn kit_pathext_controls_shim_selection_and_does_not_fall_back() {
+        let root = crate::kits::tests::TestKits::new();
+        std::fs::write(root.0.join("runtime.exe"), "fixture").unwrap();
+        std::fs::write(root.0.join("runtime.cmd"), "@echo off\r\n").unwrap();
+        let mut env = std::collections::HashMap::from([
+            ("PATH".into(), root.0.to_string_lossy().into_owned()),
+            ("PATHEXT".into(), ".CMD;.EXE".into()),
+        ]);
+        let command = resolve_command_with_environment(&root.0, &["runtime".into()], &env);
+        assert_eq!(PathBuf::from(&command[0]), root.0.join("runtime.CMD"));
+        assert!(command_binary_exists(&command));
+        env.insert("PATHEXT".into(), String::new());
+        let command = resolve_command_with_environment(&root.0, &["runtime".into()], &env);
+        assert!(!command_binary_exists(&command));
+    }
     use crate::kits::manifest::KitToolDef;
 
     #[test]
@@ -332,6 +480,7 @@ mod tests {
             permissions: None,
             workspace: None,
             eager: None,
+            provision: None,
         };
 
         assert!(!platform_matches(&manifest));
@@ -340,10 +489,7 @@ mod tests {
     #[test]
     fn resolves_relative_command_from_kit_dir() {
         let kit_dir = Path::new("heart-kit");
-        let command = resolve_command(
-            kit_dir,
-            &["bin/server".to_string(), "--stdio".to_string()],
-        );
+        let command = resolve_command(kit_dir, &["bin/server".to_string(), "--stdio".to_string()]);
 
         assert_eq!(PathBuf::from(&command[0]), kit_dir.join("bin/server"));
         assert_eq!(command[1], "--stdio");
@@ -354,23 +500,23 @@ mod tests {
     fn resolves_windows_npm_shim_before_posix_script() {
         let dir = std::env::temp_dir().join(format!("portal kit {}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&dir).unwrap();
-        std::fs::write(dir.join("codex"), "#!/bin/sh\n").unwrap();
-        std::fs::write(dir.join("codex.cmd"), "@echo off\r\n").unwrap();
+        std::fs::write(dir.join("kit-runner"), "#!/bin/sh\n").unwrap();
+        std::fs::write(dir.join("kit-runner.cmd"), "@echo off\r\n").unwrap();
         for program in [
-            "codex".to_string(),
-            "./codex".to_string(),
-            dir.join("codex").to_string_lossy().into_owned(),
+            "kit-runner".to_string(),
+            "./kit-runner".to_string(),
+            dir.join("kit-runner").to_string_lossy().into_owned(),
         ] {
             let command = resolve_command(&dir, &[program, "mcp-server".into()]);
             assert_eq!(
                 PathBuf::from(&command[0]).canonicalize().unwrap(),
-                dir.join("codex.cmd").canonicalize().unwrap()
+                dir.join("kit-runner.cmd").canonicalize().unwrap()
             );
             assert!(command_binary_exists(&command));
             assert_eq!(command[1], "mcp-server");
         }
-        std::fs::remove_file(dir.join("codex.cmd")).unwrap();
-        assert!(find_binary_at(&dir.join("codex")).is_none());
+        std::fs::remove_file(dir.join("kit-runner.cmd")).unwrap();
+        assert!(find_binary_at(&dir.join("kit-runner")).is_none());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -388,14 +534,21 @@ mod tests {
             permissions: None,
             workspace: None,
             eager: None,
+            provision: None,
         };
 
         let warnings = manifest_validation_warnings(&manifest, &[]);
 
         assert_eq!(warnings.len(), 3);
-        assert!(warnings.iter().any(|warning| warning.contains("invalid name")));
-        assert!(warnings.iter().any(|warning| warning.contains("command is empty")));
-        assert!(warnings.iter().any(|warning| warning.contains("no tools defined")));
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("invalid name")));
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("command is empty")));
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("no tools defined")));
     }
 
     #[test]
@@ -416,6 +569,7 @@ mod tests {
             permissions: None,
             workspace: None,
             eager: None,
+            provision: None,
         };
 
         let warnings = manifest_validation_warnings(&manifest, &manifest.command);

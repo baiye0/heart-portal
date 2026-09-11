@@ -1,9 +1,76 @@
 # Windows lifecycle protocol v1. Lock files are never deleted: the open handle,
 # not the presence of the file, owns the lock (including across logon sessions).
+# Native child processes can inherit PowerShell 7's incompatible module path.
+# Resolve utility commands (notably Get-FileHash) from this host's own module.
+Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1') -ErrorAction Stop
+
+
+# Open the object itself and inspect its handle before reading: path metadata
+# alone permits a symlink/reparse replacement between the check and the open.
+if (-not ('PortalBoundedMetadata' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Text;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public static class PortalBoundedMetadata {
+    [StructLayout(LayoutKind.Sequential)]
+    struct Info {
+        public uint Attributes;
+        public System.Runtime.InteropServices.ComTypes.FILETIME Creation, Access, Write;
+        public uint Volume, SizeHigh, SizeLow, Links, IndexHigh, IndexLow;
+    }
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern SafeFileHandle CreateFileW(string name, uint access, uint share,
+        IntPtr security, uint disposition, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool GetFileInformationByHandle(SafeFileHandle handle, out Info info);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern uint GetFileType(SafeFileHandle handle);
+    public static string Read(string path) {
+        const int limit = 1024 * 1024;
+        using (var handle = CreateFileW(path, 0x80000000, 7, IntPtr.Zero, 3, 0x00200000, IntPtr.Zero)) {
+            if (handle.IsInvalid) {
+                int error = Marshal.GetLastWin32Error();
+                if (error == 2 || error == 3) throw new FileNotFoundException("Portal metadata is absent.");
+                throw new IOException("Cannot open Portal metadata.", unchecked((int)(0x80070000u | (uint)error)));
+            }
+            Info info;
+            if (GetFileType(handle) != 1 || !GetFileInformationByHandle(handle, out info) ||
+                (info.Attributes & (0x400 | 0x10)) != 0 || info.SizeHigh != 0 || info.SizeLow > limit)
+                throw new IOException("Portal metadata must be a regular non-link file no larger than 1 MiB.");
+            using (var stream = new FileStream(handle, FileAccess.Read))
+            using (var bytes = new MemoryStream()) {
+                var buffer = new byte[4096];
+                int count;
+                while ((count = stream.Read(buffer, 0, Math.Min(buffer.Length, limit + 1 - (int)bytes.Length))) != 0) {
+                    bytes.Write(buffer, 0, count);
+                    if (bytes.Length > limit) throw new IOException("Portal metadata exceeds 1 MiB.");
+                }
+                return new UTF8Encoding(false, true).GetString(bytes.ToArray()).TrimStart('\uFEFF');
+            }
+        }
+    }
+}
+'@
+}
+
+function Read-PortalText([string]$Path) {
+    for ($attempt = 0; $attempt -lt 20; $attempt++) {
+        try { return [PortalBoundedMetadata]::Read($Path) }
+        catch [IO.FileNotFoundException] { return $null }
+        catch [IO.IOException] {
+            if (($_.Exception.HResult -band 0xffff) -notin @(32, 33) -or $attempt -eq 19) { throw }
+            Start-Sleep -Milliseconds 50
+        }
+    }
+}
+
 function Get-PortalExecutable([string]$Root) {
     $saved = Join-Path $Root '.portal-executable'
     if (Test-Path -LiteralPath $saved) {
-        $relative = [IO.File]::ReadAllText($saved).Trim()
+        $relative = (Read-PortalText $saved).Trim()
         if ($relative -notin @('heart-portal.exe', 'heart-portal-windows-x86_64.exe', 'heart-portal-windows-aarch64.exe', 'target\release\heart-portal.exe')) { throw 'Invalid saved Portal executable path.' }
         return (Join-Path $Root $relative)
     }
@@ -92,26 +159,9 @@ function Read-PortalJson([string]$Path) {
     if ([IO.Path]::GetFileName($Path) -in @('.portal-launch.json', '.portal-direct.json', '.portal-upgrade.json', 'request.json')) {
         Protect-PortalFile $Path
     }
-    # Readers keep a snapshot of the old file while a writer atomically swaps
-    # in the next one. ReadAllText's default sharing prevents that replacement.
-    for ($attempt = 0; $attempt -lt 20; $attempt++) {
-        $stream = $null
-        $reader = $null
-        try {
-            $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read,
-                ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
-            $reader = [IO.StreamReader]::new($stream, [Text.Encoding]::UTF8)
-            return ($reader.ReadToEnd() | ConvertFrom-Json)
-        } catch [IO.FileNotFoundException] { return $null }
-        catch [IO.DirectoryNotFoundException] { return $null }
-        catch [IO.IOException] {
-            if (($_.Exception.HResult -band 0xffff) -notin @(32, 33) -or $attempt -eq 19) { throw }
-            Start-Sleep -Milliseconds 50
-        } finally {
-            if ($reader) { $reader.Dispose() }
-            elseif ($stream) { $stream.Dispose() }
-        }
-    }
+    $text = Read-PortalText $Path
+    if ($null -eq $text) { return $null }
+    return ($text | ConvertFrom-Json)
 }
 
 function Set-PortalUpgradeStatus([string]$Root, [string]$State, [string]$Message, [string]$Version = '') {

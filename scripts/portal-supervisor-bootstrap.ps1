@@ -2,6 +2,7 @@
 # process, so replacing/restarting it never removes the recovery owner.
 param([Parameter(Mandatory=$true)][string]$Root, [string]$PortalName = '', [int]$RestartDelaySeconds = 5)
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'portal-lifecycle.ps1')
 $Root = (Resolve-Path -LiteralPath $Root).Path
 while ($true) {
     $gate = $null
@@ -21,7 +22,7 @@ while ($true) {
             catch [IO.IOException] { if (($_.Exception.HResult -band 0xffff) -notin @(32, 33)) { throw } }
             if ($owner) {
                 try {
-                    $journal = [IO.File]::ReadAllText($journalPath) | ConvertFrom-Json
+                    $journal = (Read-PortalText $journalPath) | ConvertFrom-Json
                     if ($journal.recovery_script) {
                         $recovery = [IO.Path]::GetFullPath($journal.recovery_script)
                         $stageRoot = [IO.Path]::GetFullPath((Join-Path $Root '.portal-upgrades')) + '\'

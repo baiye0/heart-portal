@@ -4,11 +4,13 @@ $repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 . (Join-Path $repo 'scripts\portal-task-common.ps1')
 $tempBase = [IO.Path]::GetTempPath()
 $root = Join-Path $tempBase ("portal guidance test ' 测-" + [guid]::NewGuid().ToString('N'))
-$app = Join-Path $root 'app'
+$download = Join-Path $root 'app'
+$app = Join-Path $root 'profile\.heart-portal\runtime'
 $configDir = Join-Path $root "configuration ' 测"
 $workspace = Join-Path $root 'original-workspace'
-foreach ($directory in @($app,$configDir,$workspace)) { [void][IO.Directory]::CreateDirectory($directory) }
-$exe = Join-Path $app 'heart-portal.exe'
+foreach ($directory in @($download,$configDir,$workspace)) { [void][IO.Directory]::CreateDirectory($directory) }
+$exe = Join-Path $download 'heart-portal.exe'
+$runtimeExe = Join-Path $app 'heart-portal.exe'
 $config = Join-Path $configDir 'portal.toml'
 $relay = $null; $reader = $null
 $utf8 = [Text.UTF8Encoding]::new($false)
@@ -123,7 +125,7 @@ try {
             $pong = Join-Path $root 'relay-pong.txt'
             (Test-Path -LiteralPath $pong) -and [IO.File]::ReadAllText($pong) -eq $failure
         } 'the original WebSocket still answers ping after adoption'
-        $instances = @(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq $exe })
+        $instances = @(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq $runtimeExe })
         Assert ($instances.Count -eq 1 -and $instances[0].ProcessId -eq $connectedRuntime.pid) 'only the original Portal is running'
     }
     $logLength = (Get-Item -LiteralPath (Join-Path $app 'portal-runtime.log')).Length
