@@ -15,7 +15,6 @@ pub(crate) mod text;
 #[cfg(test)]
 mod utf8_tests;
 mod web;
-mod web_search;
 
 use crate::config::PortalConfig;
 use crate::kits::{loader, manager::KitManager};
@@ -335,25 +334,6 @@ impl ToolHost {
                     "required": ["url"]
                 }),
             });
-
-            tools.push(ToolInfo {
-                name: "portal_web_search".to_string(),
-                description: "Search the web. Returns titles, URLs, and snippets.".to_string(),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "Search query"
-                        },
-                        "count": {
-                            "type": "integer",
-                            "description": "Number of results (default 5, max 10)"
-                        }
-                    },
-                    "required": ["query"]
-                }),
-            });
         }
 
         if self.config.tools.file {
@@ -634,7 +614,6 @@ impl ToolHost {
             }
             "portal_search" => search::search(&self.config, arguments).await,
             "portal_web_fetch" => web::fetch(arguments).await,
-            "portal_web_search" => web_search::search(arguments).await,
             "portal_oauth_authorize" => oauth::authorize(arguments).await,
             "portal_tools_reload" => self.handle_tools_reload().await,
             "portal_kits_setup" => {
@@ -759,6 +738,20 @@ mod kit_refresh_tests {
             .unwrap()
             .unwrap();
         serde_json::from_str(&line).unwrap()
+    }
+
+    #[tokio::test]
+    async fn web_search_is_not_registered_or_dispatchable() {
+        let host = ToolHost::new(&PortalConfig::default());
+        assert!(!host
+            .list_builtin_tools()
+            .iter()
+            .any(|tool| tool.name == "portal_web_search"));
+        let error = host
+            .call("portal_web_search", serde_json::json!({"query": "test"}))
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "Unknown tool: portal_web_search");
     }
 
     #[tokio::test]

@@ -271,16 +271,20 @@ async fn run_capture(path: &Path, region: &CaptureRegion, display_idx: Option<u6
 }
 
 fn powershell_capture_script(path: &Path, region: &CaptureRegion) -> String {
-    let path = powershell_single_quoted(&path.to_string_lossy());
+    let path = powershell_single_quoted(&powershell_compatible_path(path));
     match region {
         CaptureRegion::Full => format!(
-            "Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; \
+            "$ErrorActionPreference = 'Stop'; $bitmap = $null; $graphics = $null; try {{ \
+             Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; \
              $screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds; \
              $bitmap = New-Object System.Drawing.Bitmap($screen.Width, $screen.Height); \
              $graphics = [System.Drawing.Graphics]::FromImage($bitmap); \
              $graphics.CopyFromScreen($screen.Location, [System.Drawing.Point]::Empty, $screen.Size); \
-             $bitmap.Save({}, [System.Drawing.Imaging.ImageFormat]::Png); \
-             $graphics.Dispose(); $bitmap.Dispose()",
+             $bitmap.Save({}, [System.Drawing.Imaging.ImageFormat]::Png) \
+             }} finally {{ \
+             if ($null -ne $graphics) {{ $graphics.Dispose() }}; \
+             if ($null -ne $bitmap) {{ $bitmap.Dispose() }} \
+             }}",
             path
         ),
         CaptureRegion::Rect {
@@ -289,12 +293,16 @@ fn powershell_capture_script(path: &Path, region: &CaptureRegion) -> String {
             width,
             height,
         } => format!(
-            "Add-Type -AssemblyName System.Drawing; \
+            "$ErrorActionPreference = 'Stop'; $bitmap = $null; $graphics = $null; try {{ \
+             Add-Type -AssemblyName System.Drawing; \
              $bitmap = New-Object System.Drawing.Bitmap({w}, {h}); \
              $graphics = [System.Drawing.Graphics]::FromImage($bitmap); \
              $graphics.CopyFromScreen({x}, {y}, 0, 0, (New-Object System.Drawing.Size({w}, {h}))); \
-             $bitmap.Save({path}, [System.Drawing.Imaging.ImageFormat]::Png); \
-             $graphics.Dispose(); $bitmap.Dispose()",
+             $bitmap.Save({path}, [System.Drawing.Imaging.ImageFormat]::Png) \
+             }} finally {{ \
+             if ($null -ne $graphics) {{ $graphics.Dispose() }}; \
+             if ($null -ne $bitmap) {{ $bitmap.Dispose() }} \
+             }}",
             w = width,
             h = height,
             x = x,
@@ -302,6 +310,35 @@ fn powershell_capture_script(path: &Path, region: &CaptureRegion) -> String {
             path = path
         ),
     }
+}
+
+/// Windows canonicalization produces verbatim paths (`\\?\...`). The .NET
+/// Framework APIs used by Windows PowerShell's System.Drawing reject that
+/// spelling even though ordinary filesystem APIs accept it.
+fn powershell_compatible_path(path: &Path) -> String {
+    let value = path.to_string_lossy();
+    const VERBATIM_UNC: &str = r"\\?\UNC\";
+    const VERBATIM: &str = r"\\?\";
+
+    if value
+        .get(..VERBATIM_UNC.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(VERBATIM_UNC))
+    {
+        return format!(r"\\{}", &value[VERBATIM_UNC.len()..]);
+    }
+
+    if let Some(rest) = value.strip_prefix(VERBATIM) {
+        let bytes = rest.as_bytes();
+        if bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'\\' | b'/')
+        {
+            return rest.to_string();
+        }
+    }
+
+    value.into_owned()
 }
 
 fn powershell_single_quoted(value: &str) -> String {
@@ -456,6 +493,38 @@ mod tests {
     }
 
     #[test]
+    fn powershell_removes_verbatim_disk_prefix() {
+        assert_eq!(
+            powershell_compatible_path(Path::new(r"\\?\C:\tmp\shot.png")),
+            r"C:\tmp\shot.png"
+        );
+    }
+
+    #[test]
+    fn powershell_converts_verbatim_unc_prefix() {
+        assert_eq!(
+            powershell_compatible_path(Path::new(r"\\?\UNC\server\share\shot.png")),
+            r"\\server\share\shot.png"
+        );
+    }
+
+    #[test]
+    fn powershell_preserves_ordinary_and_unknown_verbatim_paths() {
+        assert_eq!(
+            powershell_compatible_path(Path::new(r"C:\tmp\shot.png")),
+            r"C:\tmp\shot.png"
+        );
+        assert_eq!(
+            powershell_compatible_path(Path::new(r"\\?\Volume{abc}\shot.png")),
+            r"\\?\Volume{abc}\shot.png"
+        );
+        assert_eq!(
+            powershell_compatible_path(Path::new("截图目录/截图.png")),
+            "截图目录/截图.png"
+        );
+    }
+
+    #[test]
     fn windows_rect_script_contains_region_and_png_save() {
         let script = powershell_capture_script(
             Path::new(r"C:\tmp\shot.png"),
@@ -469,5 +538,15 @@ mod tests {
         assert!(script.contains("CopyFromScreen(10, 20, 0, 0"));
         assert!(script.contains("System.Drawing.Size(300, 400)"));
         assert!(script.contains("[System.Drawing.Imaging.ImageFormat]::Png"));
+        assert!(script.contains("$ErrorActionPreference = 'Stop'"));
+        assert!(script.contains("finally"));
+    }
+
+    #[test]
+    fn windows_script_uses_powershell_compatible_path() {
+        let script =
+            powershell_capture_script(Path::new(r"\\?\C:\tmp\shot.png"), &CaptureRegion::Full);
+        assert!(script.contains(r"'C:\tmp\shot.png'"));
+        assert!(!script.contains(r"\\?\C:\tmp\shot.png"));
     }
 }
