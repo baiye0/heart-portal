@@ -262,6 +262,45 @@ struct CallbackTask {
     output_encoding: OutputEncoding,
 }
 
+/// Exit code reported to Heart for a session deliberately killed via kill/kill_all.
+///
+/// POSIX convention: death by signal N is reported as 128+N (SIGKILL=9 -> 137);
+/// Heart recognizes this range as a deliberate kill rather than an ordinary exit.
+/// On Unix, signal deaths surface naturally via `ExitStatus::signal()`. On
+/// Windows there is no signal channel -- `taskkill /F` terminates the process
+/// with a plain exit code (1), indistinguishable from a natural exit -- so a
+/// deliberate kill is rewritten to 128+9 using the killed flag, which kill()
+/// sets before sending any signal.
+const SIGKILL_EXIT_CODE: i32 = 128 + 9;
+
+fn session_exit_code(status: Option<&std::process::ExitStatus>, killed: bool) -> i32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(s) = status {
+            if let Some(sig) = s.signal() {
+                return 128 + sig;
+            }
+            if let Some(c) = s.code() {
+                // Exited on its own after our signal (e.g. it handles SIGTERM
+                // and exits cleanly): still report a deliberate kill.
+                return if killed { SIGKILL_EXIT_CODE } else { c };
+            }
+        }
+        if killed { SIGKILL_EXIT_CODE } else { -1 }
+    }
+    #[cfg(not(unix))]
+    {
+        if killed {
+            return SIGKILL_EXIT_CODE;
+        }
+        status.and_then(|s| s.code()).unwrap_or_else(|| {
+            tracing::debug!("Process terminated by signal, no exit code available");
+            -1
+        })
+    }
+}
+
 /// Last `max` bytes of `data` (tail — the interesting end of a build/test log).
 fn tail(data: &[u8], max: usize) -> &[u8] {
     let mut start = data.len().saturating_sub(max);
@@ -563,13 +602,9 @@ impl ProcessManager {
         let killed_wait = Arc::clone(&killed);
         let callback_output_encoding = output_encoding;
         tokio::spawn(async move {
-            let code = match child.wait().await {
-                Ok(s) => s.code().unwrap_or_else(|| {
-                    tracing::debug!("Process terminated by signal, no exit code available");
-                    -1
-                }),
-                Err(_) => -1,
-            };
+            let wait_status = child.wait().await.ok();
+            let killed = killed_wait.load(Ordering::SeqCst);
+            let code = session_exit_code(wait_status.as_ref(), killed);
             let now = tokio::time::Instant::now();
             {
                 let mut g = sessions_wait.lock().await;
