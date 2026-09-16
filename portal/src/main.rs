@@ -76,6 +76,12 @@ struct Cli {
     /// Path to portal.toml (positional)
     #[arg(value_name = "CONFIG")]
     config_positional: Option<String>,
+    /// Override the config file's exec tool setting for managed desktop runs.
+    #[arg(long, hide = true)]
+    exec_enabled: Option<bool>,
+    /// Override the config file's kits setting for managed desktop runs.
+    #[arg(long, hide = true)]
+    kits_enabled: Option<bool>,
 }
 
 #[derive(Subcommand)]
@@ -389,6 +395,13 @@ async fn main() -> Result<()> {
         defaults.security.workspace_root = paths::data_dir()?.join("workspace");
         defaults
     };
+    if let Some(enabled) = cli.exec_enabled {
+        config.tools.exec = enabled;
+    }
+    if let Some(enabled) = cli.kits_enabled {
+        config.kits_enabled = enabled;
+        config.tools.custom_tools_enabled = enabled;
+    }
     for warning in &config.warnings {
         warn!(
             "Config warning [{}] {}: {}",

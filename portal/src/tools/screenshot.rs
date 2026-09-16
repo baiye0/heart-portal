@@ -259,15 +259,32 @@ async fn run_capture(path: &Path, region: &CaptureRegion, display_idx: Option<u6
     }
 
     let script = powershell_capture_script(path, region);
-    let mut command = Command::new("powershell");
+    // The desktop client deliberately launches Portal with a restricted PATH.
+    // Resolve the inbox PowerShell executable absolutely so screenshots do not
+    // depend on PATH containing System32.
+    let powershell = powershell_executable()?;
+    let mut command = Command::new(&powershell);
     command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
-    run_command("powershell", command).await.map_err(|e| {
+    run_command(powershell.to_string_lossy().as_ref(), command).await.map_err(|e| {
         if e.to_string().contains("not found") {
             anyhow::anyhow!("powershell not found; portal_screenshot on Windows requires PowerShell")
         } else {
             e
         }
     })
+}
+
+#[cfg(target_os = "windows")]
+fn powershell_executable() -> Result<std::path::PathBuf> {
+    let root = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("WINDIR"))
+        .ok_or_else(|| anyhow::anyhow!("Windows system directory is unavailable (SystemRoot/WINDIR missing)"))?;
+    let path = std::path::PathBuf::from(root)
+        .join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+    if !path.is_file() {
+        anyhow::bail!("Windows PowerShell was not found at {}", path.display());
+    }
+    Ok(path)
 }
 
 fn powershell_capture_script(path: &Path, region: &CaptureRegion) -> String {
