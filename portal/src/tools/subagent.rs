@@ -41,6 +41,16 @@ pub fn is_subagent_tool(name: &str) -> bool {
     TOOL_NAMES.contains(&name)
 }
 
+/// Only `portal_subagent_setup`: advertised on its own when the sub-agent is
+/// enabled but pi is not installed yet, because calling it is how pi gets
+/// installed (see [`SubagentManager::ensure_pi_installed`]).
+pub fn setup_tool() -> ToolInfo {
+    list_tools()
+        .into_iter()
+        .find(|t| t.name == "portal_subagent_setup")
+        .expect("portal_subagent_setup is declared in list_tools")
+}
+
 /// Tool declarations, added to `tools/list` only when the sub-agent is
 /// available (enabled *and* pi resolvable).
 pub fn list_tools() -> Vec<ToolInfo> {
@@ -145,7 +155,7 @@ pub fn list_tools() -> Vec<ToolInfo> {
         },
         ToolInfo {
             name: "portal_subagent_setup".to_string(),
-            description: "Configure your sub-agent's LLM provider, model, and API key. Run without arguments to see current config (key is masked). Required before first use if no provider is configured. Pass an empty string to clear a field.".to_string(),
+            description: "Configure your sub-agent's LLM provider, model, and API key. Run without arguments to see current config (key is masked). Required before first use if no provider is configured. Pass an empty string to clear a field. If the pi agent binary is not installed yet, this installs Portal's pinned copy first (needs npm).".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -307,16 +317,31 @@ async fn setup(manager: &Arc<SubagentManager>, arguments: Value) -> Result<Value
         thinking: string_field(&arguments, "thinking")?,
     };
 
+    // pi first: without the binary no amount of model configuration helps.
+    // The install is attempted (never silently skipped) and its failure is
+    // reported alongside whatever else this call did, so the being learns
+    // both facts at once instead of over two round trips.
+    let install_error = match manager.ensure_pi_installed().await {
+        Ok(_) => None,
+        Err(e) => Some(format!("{e:#}")),
+    };
+    let pi_installed = manager.pi_installed();
+
     if update.is_empty() {
         let model = manager.model_config();
         let needs_setup = manager.needs_setup();
         return Ok(json!({
             "current": model.to_status_json(),
-            "ready": !needs_setup,
+            "ready": !needs_setup && pi_installed,
+            "pi_installed": pi_installed,
+            "install_error": install_error,
             "supported_providers": SUBAGENT_PROVIDERS,
             "thinking_levels": SUBAGENT_THINKING_LEVELS,
             "hint": if needs_setup {
                 SETUP_GUIDANCE
+            } else if !pi_installed {
+                "The pi agent binary is not installed and could not be installed \
+                 automatically; see install_error."
             } else {
                 "Configured. Call with provider/model/api_key/thinking to change; \
                  pass \"\" to clear a field."
@@ -325,7 +350,14 @@ async fn setup(manager: &Arc<SubagentManager>, arguments: Value) -> Result<Value
     }
 
     let outcome = manager.configure_model(update).await?;
-    let mut note = String::from("Sub-agent configured. You can now use portal_subagent_spawn.");
+    let mut note = if pi_installed {
+        String::from("Sub-agent configured. You can now use portal_subagent_spawn.")
+    } else {
+        String::from(
+            "Model saved, but the pi agent binary is not installed so portal_subagent_spawn \
+             is not available yet; see install_error.",
+        )
+    };
     if outcome.daemon_restarted {
         note.push_str(" The pi daemon was restarted so the new credentials take effect; \
              existing sessions resume from their files on the next spawn.");
@@ -334,6 +366,8 @@ async fn setup(manager: &Arc<SubagentManager>, arguments: Value) -> Result<Value
         "ok": true,
         "current": outcome.model.to_status_json(),
         "daemon_restarted": outcome.daemon_restarted,
+        "pi_installed": pi_installed,
+        "install_error": install_error,
         "note": note,
     }))
 }

@@ -46,7 +46,8 @@ use crate::heart_callback::{
 use ledger::{Ledger, LedgerCallbackState, LedgerTaskStatus, TaskRecord};
 use pi_client::{PiClient, DEFAULT_REQUEST_TIMEOUT};
 use pi_daemon::{
-    PiDaemon, PiDaemonConfig, StdioRun, StdioTask, Transport, TransportMode, SHUTDOWN_GRACE,
+    PiDaemon, PiDaemonConfig, Provision, StdioRun, StdioTask, Transport, TransportMode,
+    SHUTDOWN_GRACE,
 };
 use protocol::{
     AutonomousConfig, AutonomousStatus, Command, DaemonMessage, PromptComplete, PromptRequest,
@@ -417,7 +418,9 @@ pub struct SubagentManager {
     config_path: Option<PathBuf>,
     workspace_root: PathBuf,
     /// Resolved pi argv. `None` ⇒ pi is not installed, the tools stay hidden.
-    command: Option<Vec<String>>,
+    /// Filled in later by [`Self::ensure_pi_installed`] when
+    /// `portal_subagent_setup` gets pi installed. Read through [`Self::command`].
+    command: StdMutex<Option<Vec<String>>>,
     /// Swapped for a fresh instance when the provider or key changes, since a
     /// daemon's environment is fixed at spawn. Read through [`Self::daemon`].
     daemon: StdMutex<Arc<PiDaemon>>,
@@ -464,7 +467,14 @@ impl SubagentManager {
     pub fn new(config: &PortalConfig, callback: HeartCallback) -> Arc<Self> {
         let sub = config.subagent.clone();
         let state_dir = sub.resolved_state_dir();
-        let command = PiDaemon::resolve_command(sub.command.as_deref());
+        let mut command = PiDaemon::resolve_command(sub.command.as_deref());
+
+        // No pi anywhere (or Portal's own copy at the wrong version): install
+        // the pinned one. Best effort — every failure mode leaves `command`
+        // as it was and Portal carries on without the sub-agent.
+        if sub.enabled && sub.command.is_none() && sub.auto_install {
+            command = Self::provision_at_startup(command);
+        }
 
         if sub.enabled {
             match &command {
@@ -476,7 +486,8 @@ impl SubagentManager {
                 None => warn!(
                     "subagent enabled but no pi binary found (looked at \
                      ~/.heart-portal/pi/bin/pi, then pi and prime-agent on PATH); \
-                     portal_subagent_* tools are hidden"
+                     portal_subagent_* tools are hidden until portal_subagent_setup \
+                     installs it"
                 ),
             }
         }
@@ -498,7 +509,7 @@ impl SubagentManager {
             config_path: config.config_path.clone(),
             config: sub,
             workspace_root: config.security.workspace_root.clone(),
-            command,
+            command: StdMutex::new(command),
             daemon: StdMutex::new(daemon),
             sessions: AsyncMutex::new(HashMap::new()),
             tasks: AsyncMutex::new(HashMap::new()),
@@ -515,9 +526,51 @@ impl SubagentManager {
         })
     }
 
+    /// Startup half of auto-provisioning: decide whether the resolved
+    /// `command` calls for an install, run it (with backoff), and re-resolve.
+    fn provision_at_startup(resolved: Option<Vec<String>>) -> Option<Vec<String>> {
+        let Some(root) = pi_daemon::bundled_pi_root() else {
+            return resolved;
+        };
+        if !pi_daemon::bundled_pi_wants_provisioning(resolved.as_deref(), &root) {
+            return resolved;
+        }
+        match pi_daemon::auto_provision_pi(false) {
+            Provision::Ready(_) => PiDaemon::resolve_command(None).or(resolved),
+            // Each of these already logged why; the sub-agent stays as it was.
+            Provision::NoNpm
+            | Provision::Deferred
+            | Provision::Failed(_)
+            | Provision::Unsupported => resolved,
+        }
+    }
+
+    /// Snapshot of the resolved pi argv.
+    fn command(&self) -> Option<Vec<String>> {
+        self.command
+            .lock()
+            .map(|c| c.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+    }
+
+    /// Whether a pi binary has been resolved (independent of `enabled`).
+    pub fn pi_installed(&self) -> bool {
+        self.command().is_some()
+    }
+
     /// Enabled *and* pi actually resolvable. Gates tool advertisement.
     pub fn is_available(&self) -> bool {
-        self.config.enabled && self.command.is_some()
+        self.config.enabled && self.pi_installed()
+    }
+
+    /// Enabled and either available or able to become so through
+    /// `portal_subagent_setup` (which auto-installs pi). Gates advertising
+    /// the setup tool on its own when the rest are hidden. An explicit
+    /// `[subagent].command` that does not resolve is a config error, not
+    /// something setup can fix, so it does not count.
+    pub fn setup_offered(&self) -> bool {
+        self.config.enabled
+            && (self.pi_installed() || (self.config.auto_install && self.config.command.is_none()))
     }
 
     pub fn wants_eager_start(&self) -> bool {
@@ -528,13 +581,87 @@ impl SubagentManager {
         if !self.config.enabled {
             anyhow::bail!("the sub-agent is disabled in configuration ([subagent].enabled)");
         }
-        if self.command.is_none() {
+        if !self.pi_installed() {
             anyhow::bail!(
-                "no pi binary found: install pi, put it on PATH, or set \
-                 [subagent].command in portal.toml"
+                "no pi binary found: run portal_subagent_setup to install it, put pi on \
+                 PATH, or set [subagent].command in portal.toml"
             );
         }
         Ok(())
+    }
+
+    /// Make sure pi is installed, installing Portal's pinned copy if it is
+    /// not. Called by `portal_subagent_setup`, so the backoff that guards
+    /// startup does not apply: the being asked. Returns whether an install
+    /// happened. Refuses (rather than silently doing nothing) when
+    /// `[subagent].command` names a binary that does not exist — that is a
+    /// configuration to fix, not something to paper over.
+    pub async fn ensure_pi_installed(self: &Arc<Self>) -> Result<bool> {
+        if self.pi_installed() {
+            return Ok(false);
+        }
+        if let Some(argv) = self.config.command.as_deref().filter(|a| !a.is_empty()) {
+            anyhow::bail!(
+                "[subagent].command is set to '{}' but that does not exist; fix or remove \
+                 it in portal.toml so Portal can install its own copy",
+                argv[0]
+            );
+        }
+        if !self.config.auto_install {
+            anyhow::bail!(
+                "no pi binary found and [subagent].auto_install is false; install pi \
+                 ({}@{}) yourself or set [subagent].command",
+                pi_daemon::PI_NPM_PACKAGE,
+                pi_daemon::PI_PINNED_VERSION
+            );
+        }
+
+        let outcome = tokio::task::spawn_blocking(|| pi_daemon::auto_provision_pi(true))
+            .await
+            .map_err(|e| anyhow::anyhow!("the pi installer panicked: {e}"))?;
+        match outcome {
+            Provision::Ready(_) => {}
+            Provision::NoNpm => anyhow::bail!(
+                "could not auto-install pi: npm is not on PATH. Install Node.js (which \
+                 brings npm) and call portal_subagent_setup again, or install pi \
+                 yourself and put it on PATH"
+            ),
+            Provision::Failed(reason) => anyhow::bail!("could not auto-install pi: {reason}"),
+            Provision::Unsupported => anyhow::bail!(
+                "auto-installing pi is not supported on this platform; install pi and \
+                 set [subagent].command"
+            ),
+            // `force` disables the backoff, so this cannot come back; treat it
+            // like a failure rather than trusting that.
+            Provision::Deferred => anyhow::bail!("pi auto-install was deferred; try again"),
+        }
+
+        let Some(command) = PiDaemon::resolve_command(None) else {
+            anyhow::bail!(
+                "pi was installed but still does not resolve; check ~/.heart-portal/pi/bin/pi"
+            );
+        };
+        self.adopt_command(command).await;
+        Ok(true)
+    }
+
+    /// Switch the manager over to a freshly resolved pi argv: the daemon's
+    /// argv is fixed at construction, so it is replaced the same way a
+    /// credential change replaces it.
+    async fn adopt_command(self: &Arc<Self>, command: Vec<String>) {
+        info!("subagent now available: pi at {}", command[0]);
+        if let Ok(mut slot) = self.command.lock() {
+            *slot = Some(command.clone());
+        }
+        let old = self.daemon();
+        old.shutdown(SHUTDOWN_GRACE).await;
+        let mut daemon_config = old.config().clone();
+        daemon_config.command = command;
+        let fresh = Arc::new(PiDaemon::new(daemon_config));
+        if let Ok(mut slot) = self.daemon.lock() {
+            *slot = fresh;
+        }
+        *self.pump_generation.lock().await = None;
     }
 
     // ── model configuration ─────────────────────────────────────────
@@ -1962,7 +2089,7 @@ impl SubagentManager {
         Ok(json!({
             "enabled": self.config.enabled,
             "available": self.is_available(),
-            "command_resolved": self.command.is_some(),
+            "command_resolved": self.pi_installed(),
             "state_dir": self.config.resolved_state_dir().display().to_string(),
             "daemon": daemon.to_json(),
             "auth": {
@@ -2029,7 +2156,7 @@ impl SubagentManager {
         }
         json!({
             "enabled": self.config.enabled,
-            "command_resolved": self.command.is_some(),
+            "command_resolved": self.pi_installed(),
             "state_dir": self.config.resolved_state_dir().display().to_string(),
             "daemon": daemon.to_json(),
             "sessions": sessions,
@@ -2202,7 +2329,7 @@ impl SubagentManager {
     /// Portal is going away: abort running tasks without waking the being
     /// (shutdown is not a result), then stop the daemon.
     pub async fn shutdown(self: &Arc<Self>) {
-        if self.command.is_none() {
+        if !self.pi_installed() {
             return;
         }
         self.shutting_down.store(true, Ordering::SeqCst);
@@ -2397,6 +2524,8 @@ mod tests {
         // A provider is "configured": these tests are about everything that
         // happens after first-use setup.
         config.subagent.model.provider = Some("anthropic".to_string());
+        // Never let a test machine without pi trigger a real `npm install`.
+        config.subagent.auto_install = false;
         tweak(&mut config.subagent);
         SubagentManager::new(&config, HeartCallback::new())
     }
@@ -2717,6 +2846,39 @@ mod tests {
         assert!(!m.wants_eager_start());
         let err = m.ensure_available().unwrap_err().to_string();
         assert!(err.contains("no pi binary found"), "{err}");
+        let _ = std::fs::remove_dir_all(ws);
+    }
+
+    #[tokio::test]
+    async fn setup_cannot_install_over_an_explicit_command_that_does_not_exist() {
+        let ws = temp_workspace("nopi-explicit");
+        let m = manager_for(&ws, |c| {
+            c.auto_install = true;
+            c.command = Some(vec![ws.join("no-such-pi").display().to_string()]);
+        });
+        // A misconfiguration is not something setup should paper over, so the
+        // setup tool is not dangled either.
+        assert!(!m.setup_offered());
+        let err = m.ensure_pi_installed().await.unwrap_err().to_string();
+        assert!(err.contains("[subagent].command"), "{err}");
+        assert!(!m.pi_installed());
+        let _ = std::fs::remove_dir_all(ws);
+    }
+
+    #[tokio::test]
+    async fn setup_refuses_to_install_when_auto_install_is_off() {
+        let ws = temp_workspace("nopi-optout");
+        let m = manager_for(&ws, |c| {
+            c.command = Some(vec![ws.join("no-such-pi").display().to_string()]);
+        });
+        let err = m.ensure_pi_installed().await.unwrap_err().to_string();
+        // The explicit-command refusal wins; both are configuration to fix.
+        assert!(err.contains("does not exist"), "{err}");
+
+        // With pi present nothing is installed and nothing is refused.
+        let ready = manager_for(&ws, |c| c.command = Some(vec!["/bin/sh".to_string()]));
+        assert!(ready.setup_offered());
+        assert_eq!(ready.ensure_pi_installed().await.unwrap(), false);
         let _ = std::fs::remove_dir_all(ws);
     }
 

@@ -24,6 +24,20 @@
 //! The decision is cached for the life of the process: a pi that cannot
 //! daemonise will not learn to during one Portal run, and retrying would cost
 //! a doomed spawn on every single task.
+//!
+//! When no pi resolves at all, [`auto_provision_pi`] installs Portal's own
+//! pinned copy under `~/.heart-portal/pi` with npm:
+//!
+//! ```text
+//! ~/.heart-portal/pi/
+//!   VERSION                    ← PI_PINNED_VERSION; a mismatch re-installs
+//!   bin/pi                     → node_modules/.bin/pi   (what resolve_command finds)
+//!   node_modules/.bin/pi       ← npm install --prefix ~/.heart-portal/pi <pkg>@<ver>
+//!   .provision-attempt         ← unix time of the last failed automatic try
+//! ```
+//!
+//! Every failure — no npm, timeout, npm error — is a [`Provision`] variant and
+//! a log line, never a crash: Portal runs without the sub-agent.
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -46,6 +60,22 @@ use super::transcript;
 
 /// Candidate binaries, in resolution order, when `[subagent].command` is unset.
 const PI_BINARY_CANDIDATES: [&str; 2] = ["pi", "prime-agent"];
+/// Where Portal keeps the pi it installs itself (`~`-relative).
+const BUNDLED_PI_ROOT: &str = "~/.heart-portal/pi";
+/// The npm package that ships the `pi` binary.
+pub const PI_NPM_PACKAGE: &str = "@mariozechner/pi-coding-agent";
+/// The exact version `auto_provision_pi` installs. Bumping this makes the
+/// next startup re-install (`VERSION` no longer matches).
+pub const PI_PINNED_VERSION: &str = "0.65.2";
+/// Upper bound on one `npm install` run; past it npm is killed and the
+/// attempt counts as failed.
+pub const NPM_INSTALL_TIMEOUT: Duration = Duration::from_secs(120);
+/// A failed *automatic* attempt is not retried more often than this, so a
+/// machine without network does not pay 30 s on every Portal start. An
+/// explicit request (`portal_subagent_setup`) ignores the backoff.
+const PROVISION_RETRY_BACKOFF: Duration = Duration::from_secs(60 * 60);
+/// Poll interval while waiting for npm.
+const NPM_POLL: Duration = Duration::from_millis(200);
 /// How long `ensure_running` waits for a freshly spawned daemon to greet.
 pub const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Interval of the readiness loop.
@@ -703,6 +733,15 @@ impl PiDaemon {
     /// then `pi` / `prime-agent` on PATH. `None` ⇒ the sub-agent is unavailable
     /// and its tools are not advertised.
     pub fn resolve_command(configured: Option<&[String]>) -> Option<Vec<String>> {
+        Self::resolve_command_with_bundled(configured, bundled_pi_root().as_deref())
+    }
+
+    /// [`Self::resolve_command`] with the bundled install root made explicit,
+    /// so tests can point it at a scratch directory instead of `$HOME`.
+    pub fn resolve_command_with_bundled(
+        configured: Option<&[String]>,
+        bundled_root: Option<&Path>,
+    ) -> Option<Vec<String>> {
         if let Some(argv) = configured.filter(|a| !a.is_empty()) {
             let program = expand_home(&argv[0]);
             let resolved = if argv[0].contains('/') || argv[0].contains('\\') {
@@ -715,9 +754,11 @@ impl PiDaemon {
             return Some(out);
         }
 
-        let bundled = expand_home("~/.heart-portal/pi/bin/pi");
-        if bundled.exists() {
-            return Some(vec![bundled.display().to_string()]);
+        if let Some(root) = bundled_root {
+            let bundled = bundled_pi_binary(root);
+            if bundled.exists() {
+                return Some(vec![bundled.display().to_string()]);
+            }
         }
 
         PI_BINARY_CANDIDATES
@@ -725,6 +766,279 @@ impl PiDaemon {
             .find_map(|name| find_on_path(name))
             .map(|p| vec![p.display().to_string()])
     }
+}
+
+// ── auto-provisioning ───────────────────────────────────────────────
+
+/// `~/.heart-portal/pi`, or `None` when there is no home directory to put
+/// it under.
+pub fn bundled_pi_root() -> Option<PathBuf> {
+    home_dir().map(|_| expand_home(BUNDLED_PI_ROOT))
+}
+
+/// `<root>/bin/pi` — the path `resolve_command` looks at.
+pub fn bundled_pi_binary(root: &Path) -> PathBuf {
+    root.join("bin").join("pi")
+}
+
+/// `<root>/VERSION` — which pinned version the install under `root` is.
+pub fn bundled_pi_version_file(root: &Path) -> PathBuf {
+    root.join("VERSION")
+}
+
+/// Where npm puts the launcher for the package's `bin` entry.
+fn npm_bin_pi(root: &Path) -> PathBuf {
+    root.join("node_modules").join(".bin").join("pi")
+}
+
+/// Marker for the last automatic attempt (unix seconds), so a failing
+/// install is not retried on every start.
+fn last_attempt_file(root: &Path) -> PathBuf {
+    root.join(".provision-attempt")
+}
+
+/// What [`auto_provision_pi`] found or did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Provision {
+    /// pi is installed at this path at the pinned version — either it was
+    /// already, or it just got installed.
+    Ready(PathBuf),
+    /// No `npm` on PATH; nothing was attempted.
+    NoNpm,
+    /// An automatic attempt failed recently and the backoff has not elapsed.
+    Deferred,
+    /// npm ran and did not produce a working binary. The string is the
+    /// human-readable reason (npm's stderr tail, a timeout, …).
+    Failed(String),
+    /// Auto-provisioning is not implemented for this platform.
+    Unsupported,
+}
+
+impl Provision {
+    /// The installed binary, if there is one.
+    pub fn binary(&self) -> Option<&Path> {
+        match self {
+            Provision::Ready(path) => Some(path),
+            _ => None,
+        }
+    }
+}
+
+/// True when the install under `root` is complete and at the pinned version.
+pub fn bundled_pi_is_current(root: &Path) -> bool {
+    bundled_pi_binary(root).exists()
+        && std::fs::read_to_string(bundled_pi_version_file(root))
+            .map(|v| v.trim() == PI_PINNED_VERSION)
+            .unwrap_or(false)
+}
+
+/// Whether `resolved` (the output of `resolve_command`) calls for a
+/// provisioning attempt: no pi at all, or Portal's own bundled copy at some
+/// other version than the pinned one. A pi found on PATH is the user's and is
+/// left alone.
+pub fn bundled_pi_wants_provisioning(resolved: Option<&[String]>, root: &Path) -> bool {
+    match resolved {
+        None => true,
+        Some(argv) => {
+            let bundled = bundled_pi_binary(root);
+            argv.first().is_some_and(|p| Path::new(p) == bundled) && !bundled_pi_is_current(root)
+        }
+    }
+}
+
+/// Install Portal's own pinned pi under `~/.heart-portal/pi` if it is not
+/// already there at [`PI_PINNED_VERSION`]. Best effort, never fatal: every
+/// way this can go wrong is a [`Provision`] variant, not an error.
+///
+/// `force` skips the retry backoff — for an explicit request from the being,
+/// as opposed to Portal's own startup check.
+///
+/// Blocks for up to [`NPM_INSTALL_TIMEOUT`]; call it from a blocking
+/// context (`spawn_blocking`) when inside the runtime.
+pub fn auto_provision_pi(force: bool) -> Provision {
+    let Some(root) = bundled_pi_root() else {
+        return Provision::Failed("no home directory to install pi under".to_string());
+    };
+    let npm = find_on_path(if cfg!(windows) { "npm.cmd" } else { "npm" });
+    provision_pi_into(&root, npm.as_deref(), force)
+}
+
+/// The testable core of [`auto_provision_pi`]: `root` and the npm program are
+/// explicit. `npm = None` models a machine without npm.
+pub fn provision_pi_into(root: &Path, npm: Option<&Path>, force: bool) -> Provision {
+    if bundled_pi_is_current(root) {
+        return Provision::Ready(bundled_pi_binary(root));
+    }
+
+    let Some(npm) = npm else {
+        warn!("Could not auto-install pi (npm not found), sub-agent will be unavailable");
+        return Provision::NoNpm;
+    };
+
+    if !cfg!(unix) {
+        warn!("auto-installing pi is only supported on unix; install pi manually");
+        return Provision::Unsupported;
+    }
+
+    if !force && attempted_recently(root) {
+        info!(
+            "skipping pi auto-install: the last attempt failed less than {}h ago",
+            PROVISION_RETRY_BACKOFF.as_secs() / 3600
+        );
+        return Provision::Deferred;
+    }
+
+    if let Err(e) = std::fs::create_dir_all(root) {
+        return Provision::Failed(format!("creating {}: {e}", root.display()));
+    }
+    record_attempt(root);
+
+    match std::fs::read_to_string(bundled_pi_version_file(root)) {
+        Ok(old) => info!(
+            "Auto-installing pi agent... (replacing {} with {PI_PINNED_VERSION})",
+            old.trim()
+        ),
+        Err(_) => info!(
+            "Auto-installing pi agent... ({PI_NPM_PACKAGE}@{PI_PINNED_VERSION} into {})",
+            root.display()
+        ),
+    }
+    if let Err(reason) = run_npm_install(npm, root) {
+        warn!("Could not auto-install pi: {reason}; sub-agent will be unavailable");
+        return Provision::Failed(reason);
+    }
+
+    let target = npm_bin_pi(root);
+    if !target.exists() {
+        let reason = format!(
+            "npm finished but {} does not exist; the package layout may have changed",
+            target.display()
+        );
+        warn!("Could not auto-install pi: {reason}; sub-agent will be unavailable");
+        return Provision::Failed(reason);
+    }
+
+    let binary = bundled_pi_binary(root);
+    if let Err(e) = link_binary(&target, &binary) {
+        let reason = format!("linking {} -> {}: {e}", binary.display(), target.display());
+        warn!("Could not auto-install pi: {reason}; sub-agent will be unavailable");
+        return Provision::Failed(reason);
+    }
+
+    if let Err(e) = std::fs::write(bundled_pi_version_file(root), format!("{PI_PINNED_VERSION}\n")) {
+        // The install is usable; only the pin is missing, so the next start
+        // will re-install. Say so rather than fail.
+        warn!("pi installed but could not write its VERSION file: {e}");
+    }
+    let _ = std::fs::remove_file(last_attempt_file(root));
+
+    info!("pi agent installed successfully ({PI_PINNED_VERSION} at {})", binary.display());
+    Provision::Ready(binary)
+}
+
+/// `npm install --prefix <root> <package>@<version>`, killed after
+/// [`NPM_INSTALL_TIMEOUT`]. `Err` carries a one-line reason.
+fn run_npm_install(npm: &Path, root: &Path) -> std::result::Result<(), String> {
+    let spec = format!("{PI_NPM_PACKAGE}@{PI_PINNED_VERSION}");
+    let mut child = std::process::Command::new(npm)
+        .arg("install")
+        .arg("--prefix")
+        .arg(root)
+        .arg("--no-fund")
+        .arg("--no-audit")
+        .arg("--loglevel=error")
+        .arg(&spec)
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawning {}: {e}", npm.display()))?;
+
+    // Drain stderr on a helper thread so a chatty npm cannot block on a
+    // full pipe while we wait for it.
+    let stderr = child.stderr.take();
+    let stderr_reader = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        if let Some(mut stderr) = stderr {
+            let _ = stderr.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let deadline = std::time::Instant::now() + NPM_INSTALL_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(format!("npm install did not finish within {NPM_INSTALL_TIMEOUT:?}"));
+            }
+            Ok(None) => std::thread::sleep(NPM_POLL),
+            Err(e) => break Err(format!("waiting for npm: {e}")),
+        }
+    };
+    let stderr_tail = stderr_reader
+        .join()
+        .map(|buf| {
+            let from = buf.len().saturating_sub(STDIO_STDERR_TAIL_BYTES);
+            String::from_utf8_lossy(&buf[from..]).trim().to_string()
+        })
+        .unwrap_or_default();
+
+    match status? {
+        s if s.success() => Ok(()),
+        s => Err(match stderr_tail.is_empty() {
+            true => format!("npm install exited {s}"),
+            false => format!("npm install exited {s}: {}", last_line(&stderr_tail)),
+        }),
+    }
+}
+
+/// `bin/pi -> node_modules/.bin/pi`, replacing whatever was there.
+#[cfg(unix)]
+fn link_binary(target: &Path, link: &Path) -> std::io::Result<()> {
+    if let Some(parent) = link.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::symlink_metadata(link) {
+        Ok(_) => std::fs::remove_file(link)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(not(unix))]
+fn link_binary(_target: &Path, _link: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "auto-provisioning pi is unix-only",
+    ))
+}
+
+fn attempted_recently(root: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(last_attempt_file(root)) else {
+        return false;
+    };
+    let Ok(at) = text.trim().parse::<u64>() else {
+        return false;
+    };
+    let now = unix_now_secs();
+    now.saturating_sub(at) < PROVISION_RETRY_BACKOFF.as_secs()
+}
+
+fn record_attempt(root: &Path) {
+    let _ = std::fs::write(last_attempt_file(root), format!("{}\n", unix_now_secs()));
+}
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// One task to run as its own pi process ([`PiDaemon::run_stdio_task`]).
@@ -1104,6 +1418,196 @@ mod tests {
         let d = daemon_for(PathBuf::from("/state/subagent"));
         d.shutdown(Duration::from_millis(50)).await;
         assert!(!d.health().await.running);
+    }
+
+    // ── auto-provisioning ───────────────────────────────────────────
+
+    /// A stand-in `npm` that does what a real `npm install --prefix <root>
+    /// <pkg>@<ver>` would leave behind: an executable `node_modules/.bin/pi`
+    /// under the prefix. Records its argv so the test can check the spec.
+    /// `extra` shell runs first (to fail, hang, …).
+    #[cfg(unix)]
+    fn fake_npm(root: &Path, extra: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = root.join("fake-npm");
+        let script = format!(
+            r###"#!/bin/sh
+echo "argv: $*" >> '{log}'
+{extra}
+prefix=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --prefix) prefix="$2"; shift ;;
+  esac
+  shift
+done
+mkdir -p "$prefix/node_modules/.bin"
+printf '#!/bin/sh\necho fake-pi\n' > "$prefix/node_modules/.bin/pi"
+chmod 755 "$prefix/node_modules/.bin/pi"
+"###,
+            log = root.join("npm-argv.log").display(),
+        );
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provisioning_builds_the_documented_layout_and_pins_the_version() {
+        let root = temp_dir("prov");
+        let npm = fake_npm(&root, "");
+        let install = root.join("pi");
+
+        let outcome = provision_pi_into(&install, Some(&npm), false);
+        let binary = bundled_pi_binary(&install);
+        assert_eq!(outcome, Provision::Ready(binary.clone()));
+        assert_eq!(outcome.binary(), Some(binary.as_path()));
+
+        // bin/pi is a symlink onto npm's launcher, and it runs.
+        let link = std::fs::read_link(&binary).expect("bin/pi must be a symlink");
+        assert_eq!(link, install.join("node_modules/.bin/pi"));
+        assert!(is_executable(&binary), "{}", binary.display());
+        assert_eq!(
+            std::fs::read_to_string(bundled_pi_version_file(&install)).unwrap().trim(),
+            PI_PINNED_VERSION
+        );
+        assert!(bundled_pi_is_current(&install));
+        assert!(
+            !last_attempt_file(&install).exists(),
+            "a successful install clears the backoff marker"
+        );
+
+        // npm was asked for exactly the pinned package into exactly that prefix.
+        let argv = std::fs::read_to_string(root.join("npm-argv.log")).unwrap();
+        assert!(argv.contains("install"), "{argv}");
+        assert!(argv.contains(&format!("--prefix {}", install.display())), "{argv}");
+        assert!(argv.contains(&format!("{PI_NPM_PACKAGE}@{PI_PINNED_VERSION}")), "{argv}");
+
+        // Current ⇒ a second call is a no-op: npm is not run again.
+        let again = provision_pi_into(&install, Some(&npm), false);
+        assert_eq!(again, Provision::Ready(binary));
+        assert_eq!(
+            std::fs::read_to_string(root.join("npm-argv.log")).unwrap().matches("install").count(),
+            1,
+            "npm must not run when the pinned version is already installed"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_command_finds_the_bundled_binary_after_provisioning() {
+        let root = temp_dir("provres");
+        let install = root.join("pi");
+
+        // Nothing installed under the bundled root yet.
+        assert!(!bundled_pi_binary(&install).exists());
+        assert!(bundled_pi_wants_provisioning(None, &install));
+
+        let npm = fake_npm(&root, "");
+        assert!(matches!(provision_pi_into(&install, Some(&npm), false), Provision::Ready(_)));
+
+        let resolved = PiDaemon::resolve_command_with_bundled(None, Some(&install)).unwrap();
+        assert_eq!(resolved, vec![bundled_pi_binary(&install).display().to_string()]);
+        // The bundled copy at the pinned version does not want re-installing…
+        assert!(!bundled_pi_wants_provisioning(Some(&resolved), &install));
+        // …but the same copy at another version does.
+        std::fs::write(bundled_pi_version_file(&install), "0.0.1\n").unwrap();
+        assert!(bundled_pi_wants_provisioning(Some(&resolved), &install));
+        // A pi that is not ours is never re-installed, whatever VERSION says.
+        assert!(!bundled_pi_wants_provisioning(Some(&["/usr/local/bin/pi".to_string()]), &install));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_version_mismatch_reinstalls_over_the_old_link() {
+        let root = temp_dir("provver");
+        let install = root.join("pi");
+        let npm = fake_npm(&root, "");
+
+        // An older install: a stale link and an old VERSION.
+        let stale_target = root.join("old-pi");
+        std::fs::write(&stale_target, "#!/bin/sh\necho old\n").unwrap();
+        std::fs::create_dir_all(install.join("bin")).unwrap();
+        std::os::unix::fs::symlink(&stale_target, bundled_pi_binary(&install)).unwrap();
+        std::fs::write(bundled_pi_version_file(&install), "0.60.0\n").unwrap();
+        assert!(!bundled_pi_is_current(&install));
+
+        assert!(matches!(provision_pi_into(&install, Some(&npm), false), Provision::Ready(_)));
+        assert_eq!(
+            std::fs::read_link(bundled_pi_binary(&install)).unwrap(),
+            install.join("node_modules/.bin/pi"),
+            "the link must be replaced, not left pointing at the old binary"
+        );
+        assert!(bundled_pi_is_current(&install));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn without_npm_provisioning_degrades_gracefully() {
+        let root = temp_dir("provnonpm");
+        let install = root.join("pi");
+        assert_eq!(provision_pi_into(&install, None, false), Provision::NoNpm);
+        assert_eq!(provision_pi_into(&install, None, true), Provision::NoNpm);
+        assert!(!bundled_pi_binary(&install).exists());
+        assert!(!bundled_pi_version_file(&install).exists());
+        // Nothing was even attempted, so nothing is on disk to back off from.
+        assert!(!install.exists(), "no npm ⇒ no directory churn");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_npm_is_reported_and_backed_off_until_forced() {
+        let root = temp_dir("provfail");
+        let install = root.join("pi");
+        let npm = fake_npm(&root, "echo 'npm ERR! network unreachable' >&2; exit 1");
+
+        match provision_pi_into(&install, Some(&npm), false) {
+            Provision::Failed(reason) => {
+                assert!(reason.contains("network unreachable"), "{reason}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert!(!bundled_pi_binary(&install).exists());
+        assert!(!bundled_pi_version_file(&install).exists(), "no pin without a binary");
+        assert!(last_attempt_file(&install).exists());
+
+        // Startup does not hammer npm after a fresh failure…
+        assert_eq!(provision_pi_into(&install, Some(&npm), false), Provision::Deferred);
+        let runs = || std::fs::read_to_string(root.join("npm-argv.log")).unwrap().matches("install").count();
+        assert_eq!(runs(), 1);
+        // …but an explicit request (portal_subagent_setup) tries again now.
+        assert!(matches!(provision_pi_into(&install, Some(&npm), true), Provision::Failed(_)));
+        assert_eq!(runs(), 2);
+
+        // An old marker no longer defers.
+        std::fs::write(last_attempt_file(&install), "1\n").unwrap();
+        assert!(matches!(provision_pi_into(&install, Some(&npm), false), Provision::Failed(_)));
+        assert_eq!(runs(), 3);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn npm_that_leaves_no_binary_is_a_failure_not_a_dangling_link() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_dir("provempty");
+        let install = root.join("pi");
+        // Exits 0 without producing node_modules/.bin/pi.
+        let npm = root.join("silent-npm");
+        std::fs::write(&npm, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&npm, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        match provision_pi_into(&install, Some(&npm), true) {
+            Provision::Failed(reason) => assert!(reason.contains("does not exist"), "{reason}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert!(std::fs::symlink_metadata(bundled_pi_binary(&install)).is_err());
+        assert!(!bundled_pi_version_file(&install).exists());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     // ── stdio fallback ──────────────────────────────────────────────

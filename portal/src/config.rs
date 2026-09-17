@@ -116,6 +116,7 @@ pub struct PortalConfig {
 /// [subagent]
 /// enabled = true
 /// command = ["~/.heart-portal/pi/bin/pi"]   # omit to search PATH
+/// auto_install = true                        # npm-install a pinned pi when none is found
 /// state_dir = "~/.heart-portal/subagent"
 /// max_concurrent = 3
 /// idle_unload_secs = 1800
@@ -144,6 +145,12 @@ pub struct SubagentConfig {
     /// `~/.heart-portal/pi/bin/pi`, then `pi`, then `prime-agent` on PATH.
     #[serde(default)]
     pub command: Option<Vec<String>>,
+
+    /// When `command` is unset and no pi resolves, install Portal's own pinned
+    /// copy under `~/.heart-portal/pi` with npm (best effort; no npm ⇒ the
+    /// sub-agent simply stays unavailable). Set false to never run npm.
+    #[serde(default = "default_true")]
+    pub auto_install: bool,
 
     /// Ledger, daemon socket, pi agent dir and pi sessions.
     /// Default `~/.heart-portal/subagent`. Sensitive: holds auth + transcripts.
@@ -373,6 +380,7 @@ impl Default for SubagentConfig {
         Self {
             enabled: true,
             command: None,
+            auto_install: true,
             state_dir: None,
             eager: false,
             max_concurrent: default_max_concurrent(),
@@ -784,6 +792,7 @@ web_fetch = false
         assert_eq!(s.budget.timeout_secs, 1800);
         assert_eq!(s.budget.max_continuations, 3);
         assert!(s.command.is_none());
+        assert!(s.auto_install, "a missing pi is provisioned unless opted out");
         assert!(s.env_passthrough.contains(&"PATH".to_string()));
         assert!(s.env_passthrough.contains(&"ANTHROPIC_API_KEY".to_string()));
     }

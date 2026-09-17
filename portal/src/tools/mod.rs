@@ -561,9 +561,12 @@ impl ToolHost {
         }
 
         // Only advertise the sub-agent when it can actually run: a being should
-        // never be offered a tool that fails on every call.
+        // never be offered a tool that fails on every call. The one exception
+        // is setup, which is how a missing pi gets installed.
         if self.subagent.is_available() {
             tools.extend(subagent::list_tools());
+        } else if self.subagent.setup_offered() {
+            tools.push(subagent::setup_tool());
         }
 
         if self.config.kits_enabled {
