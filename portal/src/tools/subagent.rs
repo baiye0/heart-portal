@@ -1,8 +1,9 @@
 //! MCP tools `portal_subagent_*` — delegate work to the being's sub-agent.
 //!
-//! Four tools (PRD §6): `spawn` starts a task and returns immediately,
-//! `status` shows what is happening, `log` is the pullable transcript, and
-//! `control` steers, follows up, or cancels.
+//! Five tools (PRD §6): `spawn` starts a task and returns immediately,
+//! `status` shows what is happening, `log` is the pullable transcript,
+//! `control` steers, follows up, or cancels, and `setup` lets the being pick
+//! the sub-agent's LLM provider, model and key without touching the server.
 //!
 //! The being never receives a result here: completion arrives in their inbox
 //! through Portal's callback. That asymmetry is the whole point — the being
@@ -12,8 +13,10 @@ use anyhow::Result;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
+use crate::config::{SUBAGENT_PROVIDERS, SUBAGENT_THINKING_LEVELS};
 use crate::subagent::{
-    Budget, SpawnRequest, SubagentManager, DEFAULT_LOG_LIMIT, DEFAULT_SESSION_KEY,
+    Budget, ModelConfigUpdate, SpawnRequest, SubagentManager, DEFAULT_LOG_LIMIT,
+    DEFAULT_SESSION_KEY, SETUP_GUIDANCE,
 };
 use crate::tools::{value_as_u64, ToolInfo};
 
@@ -26,11 +29,12 @@ const MIN_MAX_TOKENS: u64 = 1_000;
 /// `portal_process`-compatible long-poll cap.
 const MAX_LOG_TIMEOUT_MS: u64 = 300_000;
 
-pub const TOOL_NAMES: [&str; 4] = [
+pub const TOOL_NAMES: [&str; 5] = [
     "portal_subagent_spawn",
     "portal_subagent_status",
     "portal_subagent_log",
     "portal_subagent_control",
+    "portal_subagent_setup",
 ];
 
 pub fn is_subagent_tool(name: &str) -> bool {
@@ -139,6 +143,31 @@ pub fn list_tools() -> Vec<ToolInfo> {
                 "required": ["action", "task_id"]
             }),
         },
+        ToolInfo {
+            name: "portal_subagent_setup".to_string(),
+            description: "Configure your sub-agent's LLM provider, model, and API key. Run without arguments to see current config (key is masked). Required before first use if no provider is configured. Pass an empty string to clear a field.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "provider": {
+                        "type": "string",
+                        "description": "LLM provider: anthropic, openrouter, openai, gemini, groq, xai"
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "Model id, e.g. claude-sonnet-4-5, deepseek/deepseek-chat"
+                    },
+                    "api_key": {
+                        "type": "string",
+                        "description": "API key for the provider. Stored in portal.toml, never logged."
+                    },
+                    "thinking": {
+                        "type": "string",
+                        "description": "Thinking level: off, minimal, low, medium, high, xhigh, max. Default: medium"
+                    }
+                }
+            }),
+        },
     ]
 }
 
@@ -153,6 +182,7 @@ pub async fn handle(
         "portal_subagent_status" => status(manager, arguments).await,
         "portal_subagent_log" => log(manager, arguments).await,
         "portal_subagent_control" => control(manager, arguments).await,
+        "portal_subagent_setup" => setup(manager, arguments).await,
         other => anyhow::bail!("Unknown tool: {other}"),
     };
 
@@ -258,6 +288,56 @@ async fn control(manager: &Arc<SubagentManager>, arguments: Value) -> Result<Val
     }
 }
 
+/// `portal_subagent_setup`: show `[subagent.model]` (key masked) when called
+/// bare, otherwise merge the given fields, persist, and switch over.
+async fn setup(manager: &Arc<SubagentManager>, arguments: Value) -> Result<Value> {
+    // A non-string where a string belongs is a caller error, not "unset".
+    fn string_field(arguments: &Value, key: &str) -> Result<Option<String>> {
+        match arguments.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(s)) => Ok(Some(s.clone())),
+            Some(other) => anyhow::bail!("'{key}' must be a string, got {other}"),
+        }
+    }
+
+    let update = ModelConfigUpdate {
+        provider: string_field(&arguments, "provider")?,
+        model: string_field(&arguments, "model")?,
+        api_key: string_field(&arguments, "api_key")?,
+        thinking: string_field(&arguments, "thinking")?,
+    };
+
+    if update.is_empty() {
+        let model = manager.model_config();
+        let needs_setup = manager.needs_setup();
+        return Ok(json!({
+            "current": model.to_status_json(),
+            "ready": !needs_setup,
+            "supported_providers": SUBAGENT_PROVIDERS,
+            "thinking_levels": SUBAGENT_THINKING_LEVELS,
+            "hint": if needs_setup {
+                SETUP_GUIDANCE
+            } else {
+                "Configured. Call with provider/model/api_key/thinking to change; \
+                 pass \"\" to clear a field."
+            },
+        }));
+    }
+
+    let outcome = manager.configure_model(update).await?;
+    let mut note = String::from("Sub-agent configured. You can now use portal_subagent_spawn.");
+    if outcome.daemon_restarted {
+        note.push_str(" The pi daemon was restarted so the new credentials take effect; \
+             existing sessions resume from their files on the next spawn.");
+    }
+    Ok(json!({
+        "ok": true,
+        "current": outcome.model.to_status_json(),
+        "daemon_restarted": outcome.daemon_restarted,
+        "note": note,
+    }))
+}
+
 /// Per-task budget: config defaults with the being's overrides, clamped to the
 /// schema's limits so a typo cannot pin the machine for six hours.
 fn parse_budget(default: Budget, raw: Option<&Value>) -> Result<Budget> {
@@ -311,22 +391,44 @@ mod tests {
         dir
     }
 
-    fn manager(workspace: &PathBuf) -> Arc<SubagentManager> {
+    fn base_config(workspace: &PathBuf) -> PortalConfig {
         let mut config = PortalConfig::default();
         config.security.workspace_root = workspace.clone();
         config.subagent.state_dir = Some(workspace.join("state").display().to_string());
         // A real binary that is not pi: enough to exercise validation paths
         // without spawning a daemon.
         config.subagent.command = Some(vec!["/bin/sh".to_string()]);
+        // Independent of whatever `*_API_KEY` this machine exports.
+        config.subagent.env_passthrough = vec!["PATH".to_string(), "HOME".to_string()];
+        config
+    }
+
+    /// A configured manager: these tests are about what happens after setup.
+    fn manager(workspace: &PathBuf) -> Arc<SubagentManager> {
+        let mut config = base_config(workspace);
+        config.subagent.model.provider = Some("anthropic".to_string());
         SubagentManager::new(&config, HeartCallback::new())
+    }
+
+    /// Fresh install: a portal.toml on disk, nothing in `[subagent.model]`.
+    fn unconfigured_manager(workspace: &PathBuf) -> (Arc<SubagentManager>, PathBuf) {
+        let path = workspace.join("portal.toml");
+        std::fs::write(&path, "name = \"vale\"\n").unwrap();
+        let mut config = base_config(workspace);
+        config.config_path = Some(path.clone());
+        (SubagentManager::new(&config, HeartCallback::new()), path)
     }
 
     fn text_of(response: &Value) -> String {
         response["content"][0]["text"].as_str().unwrap().to_string()
     }
 
+    fn parsed(response: &Value) -> Value {
+        serde_json::from_str(&text_of(response)).unwrap()
+    }
+
     #[test]
-    fn four_tools_are_declared_with_required_fields() {
+    fn five_tools_are_declared_with_required_fields() {
         let tools = list_tools();
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, TOOL_NAMES.to_vec());
@@ -343,6 +445,152 @@ mod tests {
             .as_array()
             .unwrap();
         assert_eq!(actions.len(), 3);
+        let setup = &tools[4];
+        assert_eq!(setup.name, "portal_subagent_setup");
+        assert!(setup.input_schema.get("required").is_none(), "bare call shows status");
+        for field in ["provider", "model", "api_key", "thinking"] {
+            assert_eq!(setup.input_schema["properties"][field]["type"], "string", "{field}");
+        }
+        assert!(setup.description.contains("masked"));
+    }
+
+    #[tokio::test]
+    async fn spawn_before_setup_returns_guidance_not_a_provider_error() {
+        let ws = temp_workspace("firstuse");
+        let (m, _) = unconfigured_manager(&ws);
+        let resp = handle(&m, "portal_subagent_spawn", json!({"brief": "do it"}))
+            .await
+            .unwrap();
+        assert_eq!(resp["isError"], true);
+        let text = text_of(&resp);
+        assert!(text.starts_with("Sub-agent is not configured yet."), "{text}");
+        assert!(text.contains("portal_subagent_setup(provider=\"anthropic\""), "{text}");
+        assert!(text.contains("Supported providers: anthropic, openrouter, openai, gemini, groq, xai"), "{text}");
+        let _ = std::fs::remove_dir_all(ws);
+    }
+
+    #[tokio::test]
+    async fn setup_without_arguments_shows_status_with_the_key_masked() {
+        let ws = temp_workspace("setupstatus");
+        let (m, _) = unconfigured_manager(&ws);
+
+        let resp = handle(&m, "portal_subagent_setup", json!({})).await.unwrap();
+        assert_eq!(resp["isError"], false);
+        let status = parsed(&resp);
+        assert_eq!(status["ready"], false);
+        assert_eq!(status["current"]["configured"], false);
+        assert!(status["current"]["provider"].is_null());
+        assert!(status["current"]["api_key"].is_null());
+        assert!(status["hint"].as_str().unwrap().contains("portal_subagent_setup"));
+        assert_eq!(status["supported_providers"][0], "anthropic");
+
+        // Configure, then look again: the key is recognisable but unusable.
+        let secret = "sk-ant-api03-status-test-secret-value";
+        handle(
+            &m,
+            "portal_subagent_setup",
+            json!({"provider": "anthropic", "model": "claude-sonnet-4-5", "api_key": secret}),
+        )
+        .await
+        .unwrap();
+        let resp = handle(&m, "portal_subagent_setup", json!({})).await.unwrap();
+        let status = parsed(&resp);
+        assert_eq!(status["ready"], true);
+        assert_eq!(status["current"]["provider"], "anthropic");
+        assert_eq!(status["current"]["model"], "claude-sonnet-4-5");
+        assert_eq!(status["current"]["api_key"], "sk-ant-...***");
+        assert!(!text_of(&resp).contains(secret), "raw key must never come back");
+
+        // Nor through portal_subagent_status.
+        let resp = handle(&m, "portal_subagent_status", json!({})).await.unwrap();
+        assert!(!text_of(&resp).contains(secret), "{resp}");
+        assert_eq!(parsed(&resp)["auth"]["api_key"], "sk-ant-...***");
+        let _ = std::fs::remove_dir_all(ws);
+    }
+
+    #[tokio::test]
+    async fn setup_with_arguments_persists_and_unlocks_spawn() {
+        let ws = temp_workspace("setupargs");
+        let (m, path) = unconfigured_manager(&ws);
+        let secret = "sk-or-v1-setup-args-secret-value";
+
+        let resp = handle(
+            &m,
+            "portal_subagent_setup",
+            json!({
+                "provider": "openrouter",
+                "model": "deepseek/deepseek-chat",
+                "api_key": secret,
+                "thinking": "low"
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["isError"], false, "{resp}");
+        let body = parsed(&resp);
+        assert_eq!(body["ok"], true);
+        assert!(body["note"].as_str().unwrap().contains("portal_subagent_spawn"));
+        assert_eq!(body["current"]["provider"], "openrouter");
+        assert_eq!(body["current"]["thinking"], "low");
+        assert_eq!(body["current"]["api_key"], "sk-or-v...***");
+        assert!(!text_of(&resp).contains(secret));
+
+        // Persisted where Portal loaded its config from, around existing keys.
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.starts_with("name = \"vale\"\n"), "{written}");
+        let reloaded = PortalConfig::load(path.to_str().unwrap()).unwrap();
+        assert_eq!(reloaded.subagent.model.provider.as_deref(), Some("openrouter"));
+        assert_eq!(reloaded.subagent.model.model.as_deref(), Some("deepseek/deepseek-chat"));
+        assert_eq!(reloaded.subagent.model.thinking.as_deref(), Some("low"));
+        assert_eq!(reloaded.subagent.model.api_key.as_deref(), Some(secret));
+
+        // Spawn now gets past the first-use gate to ordinary validation.
+        assert!(!m.needs_setup());
+        let resp = handle(
+            &m,
+            "portal_subagent_spawn",
+            json!({"brief": "do it", "workdir": "/etc"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["isError"], true);
+        assert!(text_of(&resp).contains("outside the workspace root"), "{resp}");
+        let _ = std::fs::remove_dir_all(ws);
+    }
+
+    #[tokio::test]
+    async fn setup_rejects_bad_input_without_writing() {
+        let ws = temp_workspace("setupbad");
+        let (m, path) = unconfigured_manager(&ws);
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let resp = handle(&m, "portal_subagent_setup", json!({"api_key": "sk-lonely-key"}))
+            .await
+            .unwrap();
+        assert_eq!(resp["isError"], true);
+        assert!(text_of(&resp).contains("needs a provider"), "{resp}");
+
+        let resp = handle(&m, "portal_subagent_setup", json!({"provider": "hal9000"}))
+            .await
+            .unwrap();
+        assert_eq!(resp["isError"], true);
+        assert!(text_of(&resp).contains("unknown provider 'hal9000'"), "{resp}");
+
+        let resp = handle(&m, "portal_subagent_setup", json!({"provider": 42}))
+            .await
+            .unwrap();
+        assert_eq!(resp["isError"], true);
+        assert!(text_of(&resp).contains("'provider' must be a string"), "{resp}");
+
+        let resp = handle(&m, "portal_subagent_setup", json!({"provider": "groq", "thinking": "hard"}))
+            .await
+            .unwrap();
+        assert_eq!(resp["isError"], true);
+        assert!(text_of(&resp).contains("unknown thinking level"), "{resp}");
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before, "nothing written");
+        assert!(m.needs_setup());
+        let _ = std::fs::remove_dir_all(ws);
     }
 
     #[test]

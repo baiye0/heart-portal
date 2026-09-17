@@ -35,7 +35,10 @@ use tokio::sync::{mpsc, Mutex as AsyncMutex, Semaphore};
 use tokio::time;
 use tracing::{debug, info, warn};
 
-use crate::config::{PortalConfig, SubagentConfig};
+use crate::config::{
+    PortalConfig, SubagentConfig, SubagentModelConfig, SUBAGENT_PROVIDERS,
+    SUBAGENT_THINKING_LEVELS,
+};
 use crate::heart_callback::{
     clamp_str, clamp_str_tail, fit_payload, HeartCallback, CALLBACK_COMMAND_MAX_BYTES,
 };
@@ -82,6 +85,16 @@ const STDIO_SESSION_PREFIX: &str = "stdio:";
 const STDIO_NO_SESSION: &str = "this pi has no daemon mode, so each task runs as its own \
      process: there is no live session to steer into. Cancel the task (which kills the \
      process) or spawn a new one with a fuller brief.";
+
+/// What a being sees on its first `portal_subagent_spawn` when nothing tells
+/// pi which LLM to talk to. Actionable, not a provider stack trace.
+pub const SETUP_GUIDANCE: &str = "Sub-agent is not configured yet. Run portal_subagent_setup \
+to choose your provider and API key.\n\
+\n\
+Example:\n  \
+portal_subagent_setup(provider=\"anthropic\", model=\"claude-sonnet-4-5\", api_key=\"sk-ant-...\")\n\
+\n\
+Supported providers: anthropic, openrouter, openai, gemini, groq, xai";
 
 /// The contract every sub-agent session is created with (PRD §7.1). It exists
 /// because the sub-agent cannot ask questions: it must decide, state its
@@ -304,6 +317,83 @@ struct ModelChoice {
     api_key: Option<String>,
 }
 
+/// What `portal_subagent_setup` asked to change in `[subagent.model]`.
+/// `None` leaves a field alone; `Some("")` clears it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelConfigUpdate {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub api_key: Option<String>,
+    pub thinking: Option<String>,
+}
+
+impl ModelConfigUpdate {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Merge onto `current`, validating the result as a whole so the being
+    /// hears about every problem before anything is written.
+    fn apply_to(&self, current: &SubagentModelConfig) -> Result<SubagentModelConfig> {
+        fn merge(field: &Option<String>, current: &Option<String>) -> Option<String> {
+            match field.as_deref().map(str::trim) {
+                None => current.clone(),
+                Some("") => None,
+                Some(v) => Some(v.to_string()),
+            }
+        }
+        let next = SubagentModelConfig {
+            provider: merge(&self.provider, &current.provider).map(|p| p.to_ascii_lowercase()),
+            model: merge(&self.model, &current.model),
+            thinking: merge(&self.thinking, &current.thinking).map(|t| t.to_ascii_lowercase()),
+            api_key: merge(&self.api_key, &current.api_key),
+        };
+
+        if let Some(provider) = next.provider.as_deref() {
+            if !SUBAGENT_PROVIDERS.contains(&provider) {
+                anyhow::bail!(
+                    "unknown provider '{provider}'; supported: {}",
+                    SUBAGENT_PROVIDERS.join(", ")
+                );
+            }
+        }
+        if let Some(level) = next.thinking.as_deref() {
+            if !SUBAGENT_THINKING_LEVELS.contains(&level) {
+                anyhow::bail!(
+                    "unknown thinking level '{level}'; one of: {}",
+                    SUBAGENT_THINKING_LEVELS.join(", ")
+                );
+            }
+        }
+        if let Some(key) = next.api_key.as_deref() {
+            if next.provider.is_none() {
+                anyhow::bail!(
+                    "api_key needs a provider so the key reaches the right service; \
+                     pass provider too (supported: {})",
+                    SUBAGENT_PROVIDERS.join(", ")
+                );
+            }
+            if key.chars().any(char::is_whitespace) || !key.is_ascii() {
+                anyhow::bail!("api_key contains whitespace or non-ASCII characters; check the paste");
+            }
+        }
+        if let Some(model) = next.model.as_deref() {
+            if model.chars().any(char::is_whitespace) {
+                anyhow::bail!("model id must not contain whitespace");
+            }
+        }
+        Ok(next)
+    }
+}
+
+/// Result of a successful `configure_model`.
+#[derive(Debug, Clone)]
+pub struct ModelConfigOutcome {
+    pub model: SubagentModelConfig,
+    /// A live daemon was stopped so the new credentials take effect.
+    pub daemon_restarted: bool,
+}
+
 /// Outcome of one run, before it becomes a callback.
 #[derive(Debug, Clone, Default)]
 struct TaskOutcome {
@@ -317,11 +407,20 @@ struct TaskOutcome {
 // ── manager ─────────────────────────────────────────────────────────
 
 pub struct SubagentManager {
+    /// Everything but `[subagent.model]`, which lives in `model` because the
+    /// being can change it at runtime through `portal_subagent_setup`.
     config: SubagentConfig,
+    /// The live `[subagent.model]`. Read through [`Self::model`].
+    model: StdMutex<SubagentModelConfig>,
+    /// Where `[subagent.model]` is written back; `None` when Portal started
+    /// from in-memory defaults.
+    config_path: Option<PathBuf>,
     workspace_root: PathBuf,
     /// Resolved pi argv. `None` ⇒ pi is not installed, the tools stay hidden.
     command: Option<Vec<String>>,
-    daemon: Arc<PiDaemon>,
+    /// Swapped for a fresh instance when the provider or key changes, since a
+    /// daemon's environment is fixed at spawn. Read through [`Self::daemon`].
+    daemon: StdMutex<Arc<PiDaemon>>,
     sessions: AsyncMutex<HashMap<String, Arc<SessionState>>>,
     tasks: AsyncMutex<HashMap<String, Arc<TaskState>>>,
     ledger: AsyncMutex<Ledger>,
@@ -395,10 +494,12 @@ impl SubagentManager {
         let max_concurrent = sub.max_concurrent.max(1);
 
         Arc::new(Self {
+            model: StdMutex::new(sub.model.clone()),
+            config_path: config.config_path.clone(),
             config: sub,
             workspace_root: config.security.workspace_root.clone(),
             command,
-            daemon,
+            daemon: StdMutex::new(daemon),
             sessions: AsyncMutex::new(HashMap::new()),
             tasks: AsyncMutex::new(HashMap::new()),
             ledger: AsyncMutex::new(ledger),
@@ -436,6 +537,137 @@ impl SubagentManager {
         Ok(())
     }
 
+    // ── model configuration ─────────────────────────────────────────
+
+    /// Snapshot of the live `[subagent.model]`.
+    fn model(&self) -> SubagentModelConfig {
+        self.model
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+    }
+
+    /// Public, for the setup tool's status view. Contains the raw key: mask
+    /// it before showing it to anyone.
+    pub fn model_config(&self) -> SubagentModelConfig {
+        self.model()
+    }
+
+    fn daemon(&self) -> Arc<PiDaemon> {
+        self.daemon
+            .lock()
+            .map(|d| Arc::clone(&d))
+            .unwrap_or_else(|poisoned| Arc::clone(&poisoned.into_inner()))
+    }
+
+    /// True when nothing anywhere tells pi which LLM to use: no
+    /// `[subagent.model]`, no provider key forwarded from Portal's own
+    /// environment, and no `pi login` credentials in the agent dir. The
+    /// first spawn then gets [`SETUP_GUIDANCE`] instead of a provider error.
+    pub fn needs_setup(&self) -> bool {
+        if self.model().is_configured() {
+            return false;
+        }
+        let key_in_env = self.config.env_passthrough.iter().any(|name| {
+            name.ends_with("_API_KEY")
+                && std::env::var_os(name).is_some_and(|v| !v.is_empty())
+        });
+        if key_in_env {
+            return false;
+        }
+        !self.daemon().agent_dir().join("auth.json").is_file()
+    }
+
+    /// Apply `update` to `[subagent.model]`: validate, persist to portal.toml,
+    /// then switch the running manager over. When the provider or key changed
+    /// the pi daemon is replaced, because its environment was fixed at spawn;
+    /// that is refused while a task is running rather than killing it.
+    pub async fn configure_model(
+        self: &Arc<Self>,
+        update: ModelConfigUpdate,
+    ) -> Result<ModelConfigOutcome> {
+        let current = self.model();
+        let next = update.apply_to(&current)?;
+
+        let Some(path) = self.config_path.clone() else {
+            anyhow::bail!(
+                "Portal was started without a config file, so there is nowhere to save \
+                 this; create portal.toml (see portal.example.toml) and restart Portal"
+            );
+        };
+
+        let credentials_changed =
+            next.provider != current.provider || next.api_key != current.api_key;
+        if credentials_changed && self.has_running_tasks().await {
+            anyhow::bail!(
+                "a sub-agent task is still running; wait for it to finish (or cancel it \
+                 with portal_subagent_control) before changing the provider or API key"
+            );
+        }
+
+        crate::config::write_subagent_model(&path, &next)?;
+        if let Ok(mut live) = self.model.lock() {
+            *live = next.clone();
+        }
+
+        let daemon_restarted = if credentials_changed {
+            self.replace_daemon(&next).await
+        } else {
+            false
+        };
+        info!(
+            "sub-agent model configured: provider={} model={} thinking={} key={}",
+            next.provider.as_deref().unwrap_or("-"),
+            next.model.as_deref().unwrap_or("-"),
+            next.thinking.as_deref().unwrap_or("-"),
+            if next.api_key.is_some() { "set" } else { "unset" }
+        );
+        Ok(ModelConfigOutcome {
+            model: next,
+            daemon_restarted,
+        })
+    }
+
+    async fn has_running_tasks(&self) -> bool {
+        for task in self.tasks.lock().await.values() {
+            if !task.status().await.is_finished() {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Stop the current daemon (if any) and install a fresh `PiDaemon` that
+    /// will start with `next`'s credentials in its environment. Loaded
+    /// sessions are forgotten — their files stay, so the next spawn resumes
+    /// them. Returns whether a running daemon was actually stopped.
+    async fn replace_daemon(self: &Arc<Self>, next: &SubagentModelConfig) -> bool {
+        let old = self.daemon();
+        let was_running = old.client().await.is_some();
+        if was_running {
+            info!("restarting the pi daemon so the new provider credentials take effect");
+        }
+        old.shutdown(SHUTDOWN_GRACE).await;
+        for session in self.sessions.lock().await.values() {
+            let mut inner = session.inner.lock().await;
+            inner.active_session_id = None;
+            inner.attached = false;
+        }
+        *self.pump_generation.lock().await = None;
+
+        let mut daemon_config = old.config().clone();
+        daemon_config.api_key = next.api_key.clone();
+        daemon_config.provider = next.provider.clone();
+        let fresh = Arc::new(PiDaemon::new(daemon_config));
+        if let Ok(mut slot) = self.daemon.lock() {
+            *slot = fresh;
+        }
+        // The provider precheck is about the *old* credentials.
+        self.auth_checked.store(false, Ordering::SeqCst);
+        *self.models_available.lock().await = None;
+        was_running
+    }
+
     // ── daemon / client ─────────────────────────────────────────────
 
     /// The transport for the next task: a connected daemon client, or the
@@ -449,7 +681,7 @@ impl SubagentManager {
         if self.shutting_down.load(Ordering::SeqCst) {
             anyhow::bail!("Portal is shutting down; the pi daemon will not be started again");
         }
-        let transport = self.daemon.ensure_transport().await?;
+        let transport = self.daemon().ensure_transport().await?;
         *self.last_activity.lock().await = time::Instant::now();
 
         let Transport::Daemon(client) = &transport else {
@@ -488,14 +720,12 @@ impl SubagentManager {
 
     /// `[subagent.model]` with this task's overrides applied.
     fn model_choice(&self, req: &SpawnRequest) -> ModelChoice {
+        let model = self.model();
         ModelChoice {
-            provider: self.config.model.provider.clone(),
-            model: req.model.clone().or_else(|| self.config.model.model.clone()),
-            thinking: req
-                .thinking
-                .clone()
-                .or_else(|| self.config.model.thinking.clone()),
-            api_key: self.config.model.api_key.clone(),
+            provider: model.provider,
+            model: req.model.clone().or(model.model),
+            thinking: req.thinking.clone().or(model.thinking),
+            api_key: model.api_key,
         }
     }
 
@@ -622,6 +852,10 @@ impl SubagentManager {
         self.ensure_available()?;
         if self.shutting_down.load(Ordering::SeqCst) {
             anyhow::bail!("Portal is shutting down");
+        }
+        // First use: say how to configure, not which provider call failed.
+        if self.needs_setup() {
+            anyhow::bail!("{SETUP_GUIDANCE}");
         }
 
         let brief = req.brief.trim().to_string();
@@ -868,16 +1102,15 @@ impl SubagentManager {
             append_system_prompt.push(extra.to_string());
         }
 
+        let model = self.model();
+        let daemon = self.daemon();
         let config = SessionRuntimeConfig {
             cwd: session.cwd.display().to_string(),
-            agent_dir: Some(self.daemon.agent_dir().display().to_string()),
-            session_dir: Some(self.daemon.sessions_dir().display().to_string()),
-            provider: self.config.model.provider.clone(),
-            model: req.model.clone().or_else(|| self.config.model.model.clone()),
-            thinking: req
-                .thinking
-                .clone()
-                .or_else(|| self.config.model.thinking.clone()),
+            agent_dir: Some(daemon.agent_dir().display().to_string()),
+            session_dir: Some(daemon.sessions_dir().display().to_string()),
+            provider: model.provider,
+            model: req.model.clone().or(model.model),
+            thinking: req.thinking.clone().or(model.thinking),
             append_system_prompt,
             skills: self.config.skills.clone(),
             extensions: self.config.extensions.clone(),
@@ -1007,7 +1240,7 @@ impl SubagentManager {
             anyhow::bail!(
                 "pi has no configured provider; run `PRIME_AGENT_CODING_AGENT_DIR={} pi login` \
                  once, or pass an API key via [subagent].env_passthrough",
-                self.daemon.agent_dir().display()
+                self.daemon().agent_dir().display()
             );
         }
         Ok(())
@@ -1066,7 +1299,7 @@ impl SubagentManager {
             transcript: Some(lines_tx),
         };
 
-        let daemon = Arc::clone(&self.daemon);
+        let daemon = self.daemon();
         let mut handle = tokio::spawn(async move { daemon.run_stdio_task(spec).await });
 
         // There is no socket to abort over: cancelling a stdio task means
@@ -1529,7 +1762,7 @@ impl SubagentManager {
                 task.status().await.as_str()
             );
         }
-        if self.daemon.transport_mode().await == TransportMode::Stdio {
+        if self.daemon().transport_mode().await == TransportMode::Stdio {
             anyhow::bail!("{STDIO_NO_SESSION}");
         }
         let active_session_id = self.active_session_id(&session).await?;
@@ -1575,7 +1808,7 @@ impl SubagentManager {
         // Stdio mode has no session to abort into: the runner sees the flag
         // and kills its pi process. Answer with whatever it had said by then
         // rather than waiting for the kill to land.
-        if self.daemon.transport_mode().await == TransportMode::Stdio {
+        if self.daemon().transport_mode().await == TransportMode::Stdio {
             session
                 .transcript
                 .append_line(&format!("[cancel] task {task_id} aborted by the being"))
@@ -1671,7 +1904,8 @@ impl SubagentManager {
             return Ok(self.task_detail(&task, &session_state).await);
         }
 
-        let daemon = self.daemon.health().await;
+        let daemon = self.daemon().health().await;
+        let model = self.model();
         let mut sessions = Vec::new();
         for state in self.sessions.lock().await.values() {
             if session.is_some_and(|f| f != state.key) {
@@ -1732,7 +1966,12 @@ impl SubagentManager {
             "state_dir": self.config.resolved_state_dir().display().to_string(),
             "daemon": daemon.to_json(),
             "auth": {
-                "provider": self.config.model.provider,
+                "provider": model.provider,
+                "model": model.model,
+                "thinking": model.thinking,
+                // Masked: enough to recognise, never enough to use.
+                "api_key": model.masked_api_key(),
+                "configured": !self.needs_setup(),
                 "models_available": *self.models_available.lock().await,
             },
             "callback_configured": self.callback.is_configured(),
@@ -1780,7 +2019,7 @@ impl SubagentManager {
     /// Compact section for `portal_status`. Never credentials.
     #[allow(dead_code)] // consumed by tools/status.rs (PRD §4.7), not yet ported
     pub async fn status_summary(&self) -> Value {
-        let daemon = self.daemon.health().await;
+        let daemon = self.daemon().health().await;
         let sessions = self.sessions.lock().await.len();
         let mut running = 0usize;
         for task in self.tasks.lock().await.values() {
@@ -1917,7 +2156,7 @@ impl SubagentManager {
     /// the next spawn just pays a cold start (PRD §9 risk 6).
     async fn maybe_stop_idle_daemon(self: &Arc<Self>) {
         let idle_exit = self.config.daemon_idle_exit_secs;
-        if idle_exit == 0 || self.daemon.client().await.is_none() {
+        if idle_exit == 0 || self.daemon().client().await.is_none() {
             return;
         }
         for task in self.tasks.lock().await.values() {
@@ -1935,7 +2174,7 @@ impl SubagentManager {
             return;
         }
         info!("stopping the pi daemon after {idle_exit}s idle");
-        self.daemon.shutdown(SHUTDOWN_GRACE).await;
+        self.daemon().shutdown(SHUTDOWN_GRACE).await;
     }
 
     /// `kill` the loaded pi session. The file stays, so the next spawn resumes
@@ -1948,7 +2187,7 @@ impl SubagentManager {
         let Some(active_session_id) = active_session_id else {
             return Ok(());
         };
-        if let Some(client) = self.daemon.client().await {
+        if let Some(client) = self.daemon().client().await {
             client
                 .request(Command::Kill { active_session_id }, DEFAULT_REQUEST_TIMEOUT)
                 .await?;
@@ -1969,7 +2208,7 @@ impl SubagentManager {
         self.shutting_down.store(true, Ordering::SeqCst);
 
         let tasks: Vec<Arc<TaskState>> = self.tasks.lock().await.values().cloned().collect();
-        let client = self.daemon.client().await;
+        let client = self.daemon().client().await;
         for task in tasks {
             if task.status().await.is_finished() {
                 continue;
@@ -1995,7 +2234,7 @@ impl SubagentManager {
             ledger.save_lossy();
         }
 
-        self.daemon.shutdown(SHUTDOWN_GRACE).await;
+        self.daemon().shutdown(SHUTDOWN_GRACE).await;
     }
 
     // ── helpers ─────────────────────────────────────────────────────
@@ -2155,8 +2394,218 @@ mod tests {
         let mut config = PortalConfig::default();
         config.security.workspace_root = workspace.to_path_buf();
         config.subagent.state_dir = Some(workspace.join("state").display().to_string());
+        // A provider is "configured": these tests are about everything that
+        // happens after first-use setup.
+        config.subagent.model.provider = Some("anthropic".to_string());
         tweak(&mut config.subagent);
         SubagentManager::new(&config, HeartCallback::new())
+    }
+
+    /// A manager with nothing telling pi which LLM to use, independent of
+    /// whatever `*_API_KEY` this developer machine has exported.
+    fn unconfigured_manager(workspace: &Path) -> Arc<SubagentManager> {
+        manager_for(workspace, |c| {
+            c.command = Some(vec!["/bin/sh".to_string()]);
+            c.model = SubagentModelConfig::default();
+            c.env_passthrough = vec!["PATH".to_string(), "HOME".to_string()];
+        })
+    }
+
+    fn write_config(workspace: &Path, body: &str) -> PathBuf {
+        let path = workspace.join("portal.toml");
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn needs_setup_only_when_nothing_names_a_provider() {
+        let ws = temp_workspace("needsetup");
+        assert!(unconfigured_manager(&ws).needs_setup());
+
+        let with_provider = manager_for(&ws, |c| {
+            c.env_passthrough = vec![];
+            c.model.provider = Some("openrouter".to_string());
+        });
+        assert!(!with_provider.needs_setup());
+
+        // A model id alone is a choice too; pi may have its own login.
+        let with_model = manager_for(&ws, |c| {
+            c.env_passthrough = vec![];
+            c.model = SubagentModelConfig { model: Some("gpt-4o".to_string()), ..Default::default() };
+        });
+        assert!(!with_model.needs_setup());
+
+        // `pi login` credentials in the agent dir count as configured.
+        let logged_in = unconfigured_manager(&ws);
+        let auth = logged_in.daemon().agent_dir().join("auth.json");
+        std::fs::create_dir_all(auth.parent().unwrap()).unwrap();
+        std::fs::write(&auth, "{}").unwrap();
+        assert!(!logged_in.needs_setup());
+        let _ = std::fs::remove_dir_all(ws);
+    }
+
+    #[tokio::test]
+    async fn first_spawn_without_a_provider_returns_setup_guidance() {
+        let ws = temp_workspace("guidance");
+        let m = unconfigured_manager(&ws);
+        let req = SpawnRequest {
+            brief: "do the thing".to_string(),
+            session: "s".to_string(),
+            workdir: None,
+            budget: m.default_budget(),
+            model: None,
+            thinking: None,
+            scene_id: None,
+        };
+        let err = m.spawn(req).await.unwrap_err().to_string();
+        assert_eq!(err, SETUP_GUIDANCE);
+        assert!(err.contains("portal_subagent_setup"), "{err}");
+        assert!(err.contains("Supported providers: anthropic, openrouter, openai, gemini, groq, xai"));
+        let _ = std::fs::remove_dir_all(ws);
+    }
+
+    #[test]
+    fn model_update_merges_and_validates() {
+        let current = SubagentModelConfig {
+            provider: Some("openai".to_string()),
+            model: Some("gpt-4o".to_string()),
+            thinking: Some("low".to_string()),
+            api_key: Some("sk-old".to_string()),
+        };
+
+        // Partial update keeps the rest.
+        let next = ModelConfigUpdate {
+            model: Some(" claude-sonnet-4-5 ".to_string()),
+            ..Default::default()
+        }
+        .apply_to(&current)
+        .unwrap();
+        assert_eq!(next.provider.as_deref(), Some("openai"));
+        assert_eq!(next.model.as_deref(), Some("claude-sonnet-4-5"));
+        assert_eq!(next.api_key.as_deref(), Some("sk-old"));
+
+        // Empty string clears; provider is case-insensitive.
+        let next = ModelConfigUpdate {
+            provider: Some("Anthropic".to_string()),
+            api_key: Some(String::new()),
+            thinking: Some(String::new()),
+            ..Default::default()
+        }
+        .apply_to(&current)
+        .unwrap();
+        assert_eq!(next.provider.as_deref(), Some("anthropic"));
+        assert_eq!(next.api_key, None);
+        assert_eq!(next.thinking, None);
+
+        let bad_provider = ModelConfigUpdate { provider: Some("hal9000".to_string()), ..Default::default() }
+            .apply_to(&current)
+            .unwrap_err()
+            .to_string();
+        assert!(bad_provider.contains("unknown provider 'hal9000'"), "{bad_provider}");
+
+        let bad_thinking = ModelConfigUpdate { thinking: Some("hard".to_string()), ..Default::default() }
+            .apply_to(&current)
+            .unwrap_err()
+            .to_string();
+        assert!(bad_thinking.contains("unknown thinking level"), "{bad_thinking}");
+
+        let key_without_provider = ModelConfigUpdate {
+            api_key: Some("sk-new".to_string()),
+            ..Default::default()
+        }
+        .apply_to(&SubagentModelConfig::default())
+        .unwrap_err()
+        .to_string();
+        assert!(key_without_provider.contains("needs a provider"), "{key_without_provider}");
+
+        let pasted_badly = ModelConfigUpdate {
+            provider: Some("groq".to_string()),
+            api_key: Some("gsk_abc def".to_string()),
+            ..Default::default()
+        }
+        .apply_to(&SubagentModelConfig::default())
+        .unwrap_err()
+        .to_string();
+        assert!(pasted_badly.contains("whitespace"), "{pasted_badly}");
+    }
+
+    #[tokio::test]
+    async fn configure_model_persists_and_takes_effect_in_memory() {
+        let ws = temp_workspace("configure");
+        let path = write_config(&ws, "name = \"vale\"\n# hands off\n");
+        let mut config = PortalConfig::load(path.to_str().unwrap()).unwrap();
+        config.security.workspace_root = ws.clone();
+        config.subagent.state_dir = Some(ws.join("state").display().to_string());
+        config.subagent.command = Some(vec!["/bin/sh".to_string()]);
+        config.subagent.env_passthrough = vec![];
+        let m = SubagentManager::new(&config, HeartCallback::new());
+        assert!(m.needs_setup());
+
+        let outcome = m
+            .configure_model(ModelConfigUpdate {
+                provider: Some("anthropic".to_string()),
+                model: Some("claude-sonnet-4-5".to_string()),
+                api_key: Some("sk-ant-api03-configure-test-key".to_string()),
+                thinking: None,
+            })
+            .await
+            .unwrap();
+        assert!(!outcome.daemon_restarted, "no daemon was running");
+        assert!(!m.needs_setup());
+
+        // In memory: what the next task will run on.
+        let live = m.model_config();
+        assert_eq!(live.provider.as_deref(), Some("anthropic"));
+        assert_eq!(live.api_key.as_deref(), Some("sk-ant-api03-configure-test-key"));
+        let choice = m.model_choice(&SpawnRequest {
+            brief: String::new(),
+            session: String::new(),
+            workdir: None,
+            budget: m.default_budget(),
+            model: None,
+            thinking: None,
+            scene_id: None,
+        });
+        assert_eq!(choice.model.as_deref(), Some("claude-sonnet-4-5"));
+        // And the replacement daemon carries the key into its environment.
+        assert_eq!(m.daemon().config().api_key.as_deref(), Some("sk-ant-api03-configure-test-key"));
+        assert_eq!(m.daemon().config().provider.as_deref(), Some("anthropic"));
+
+        // On disk: the rest of the file untouched, the section reloadable.
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("# hands off"), "{written}");
+        let reloaded = PortalConfig::load(path.to_str().unwrap()).unwrap();
+        assert_eq!(reloaded.subagent.model.provider.as_deref(), Some("anthropic"));
+        assert_eq!(reloaded.subagent.model.model.as_deref(), Some("claude-sonnet-4-5"));
+
+        // Status never carries the raw key.
+        let status = m.status(None, None).await.unwrap();
+        assert_eq!(status["auth"]["api_key"], "sk-ant-...***");
+        assert_eq!(status["auth"]["configured"], true);
+        assert!(!status.to_string().contains("configure-test-key"));
+
+        // A model-only change leaves the daemon alone.
+        let outcome = m
+            .configure_model(ModelConfigUpdate { model: Some("claude-opus-4-1".to_string()), ..Default::default() })
+            .await
+            .unwrap();
+        assert_eq!(outcome.model.model.as_deref(), Some("claude-opus-4-1"));
+        assert_eq!(outcome.model.api_key.as_deref(), Some("sk-ant-api03-configure-test-key"));
+        let _ = std::fs::remove_dir_all(ws);
+    }
+
+    #[tokio::test]
+    async fn configure_model_needs_a_config_file_to_write_to() {
+        let ws = temp_workspace("nofile");
+        let m = unconfigured_manager(&ws);
+        let err = m
+            .configure_model(ModelConfigUpdate { provider: Some("xai".to_string()), ..Default::default() })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("without a config file"), "{err}");
+        assert!(m.needs_setup(), "nothing changed in memory either");
+        let _ = std::fs::remove_dir_all(ws);
     }
 
     #[test]
@@ -2859,6 +3308,12 @@ mod flow_tests {
         config.security.workspace_root = workspace.clone();
         config.subagent.state_dir = Some(state_dir.display().to_string());
         config.subagent.command = Some(vec!["/bin/sh".to_string()]);
+        // The fake daemon is "logged in": skip first-use setup guidance.
+        config.subagent.model.provider = Some("anthropic".to_string());
+        // Somewhere for portal_subagent_setup to write.
+        let config_path = workspace.join("portal.toml");
+        std::fs::write(&config_path, "name = \"vale\"\n").unwrap();
+        config.config_path = Some(config_path);
 
         Harness {
             manager: SubagentManager::new(&config, callback),
@@ -3380,6 +3835,91 @@ mod flow_tests {
     }
 
     #[tokio::test]
+    async fn changing_credentials_restarts_the_daemon_and_resumes_sessions() {
+        let h = harness("recreds", 400).await;
+        let first = h.manager.spawn(h.request("Long task")).await.unwrap();
+        assert!(h.manager.daemon().client().await.is_some(), "daemon adopted");
+
+        // Not while a task is running: that would kill it mid-flight.
+        let err = h
+            .manager
+            .configure_model(ModelConfigUpdate {
+                provider: Some("openrouter".to_string()),
+                api_key: Some("sk-or-v1-new-key-for-the-test".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("still running"), "{err}");
+        assert_eq!(h.manager.model_config().provider.as_deref(), Some("anthropic"));
+
+        // A model-only change is fine mid-task: the daemon env is untouched.
+        let outcome = h
+            .manager
+            .configure_model(ModelConfigUpdate {
+                model: Some("claude-opus-4-1".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(!outcome.daemon_restarted);
+
+        assert_eq!(wait_for_hits(&h.sink, 1, Duration::from_secs(10)).await, 1);
+        assert_eq!(
+            h.manager.status(Some(&first.task_id), None).await.unwrap()["status"],
+            "done"
+        );
+
+        // Now the credentials can change; the live daemon is asked to stop.
+        let outcome = h
+            .manager
+            .configure_model(ModelConfigUpdate {
+                provider: Some("openrouter".to_string()),
+                api_key: Some("sk-or-v1-new-key-for-the-test".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(outcome.daemon_restarted, "a connected daemon was stopped");
+        assert!(h.commands().contains(&"shutdown".to_string()), "{:?}", h.commands());
+        let fresh = h.manager.daemon();
+        assert_eq!(fresh.config().provider.as_deref(), Some("openrouter"));
+        assert_eq!(fresh.config().api_key.as_deref(), Some("sk-or-v1-new-key-for-the-test"));
+        assert!(fresh.client().await.is_none(), "not started until the next task");
+
+        let session = h.manager.session_for_task("scene-42").await.unwrap();
+        assert!(session.inner.lock().await.active_session_id.is_none(), "forgotten, not lost");
+
+        // The next spawn re-creates the session with the new provider.
+        std::fs::create_dir_all(h.fake.session_file.parent().unwrap()).unwrap();
+        std::fs::write(&h.fake.session_file, b"{}\n").unwrap();
+        let receipt = h.manager.spawn(h.request("Second task")).await.unwrap();
+        assert!(receipt.resumed, "session file carried over the restart");
+        let creates: Vec<Value> = h
+            .fake
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c["type"] == "create")
+            .cloned()
+            .collect();
+        assert_eq!(creates.len(), 2);
+        assert_eq!(creates[1]["config"]["provider"], "openrouter");
+        assert_eq!(creates[1]["config"]["model"], "claude-opus-4-1");
+        assert_eq!(wait_for_hits(&h.sink, 2, Duration::from_secs(10)).await, 2);
+
+        // Persisted, and never the raw key in status.
+        let reloaded = PortalConfig::load(h.workspace.join("portal.toml").to_str().unwrap()).unwrap();
+        assert_eq!(reloaded.subagent.model.provider.as_deref(), Some("openrouter"));
+        let status = h.manager.status(None, None).await.unwrap();
+        assert_eq!(status["auth"]["api_key"], "sk-or-v...***");
+        assert!(!status.to_string().contains("new-key-for-the-test"));
+        h.cleanup();
+    }
+
+    #[tokio::test]
     async fn a_session_refuses_to_change_its_working_directory() {
         let h = harness("cwd", 30).await;
         h.manager.spawn(h.request("First task")).await.unwrap();
@@ -3406,6 +3946,7 @@ mod flow_tests {
         config.subagent.state_dir = Some(state_dir.display().to_string());
         config.subagent.command = Some(vec!["/bin/sh".to_string()]);
         config.subagent.max_concurrent = 1;
+        config.subagent.model.provider = Some("anthropic".to_string());
         let manager = SubagentManager::new(&config, callback);
 
         let request = |session: &str| SpawnRequest {

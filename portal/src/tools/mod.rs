@@ -1101,6 +1101,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subagent_setup_is_dispatched_and_no_status_surface_leaks_the_key() {
+        let ws = temp_workspace("setupdispatch");
+        let mut config = config_with_subagent(&ws, Some(vec!["/bin/sh".to_string()]));
+        let path = ws.join("portal.toml");
+        std::fs::write(&path, "name = \"vale\"\n").unwrap();
+        config.config_path = Some(path.clone());
+        config.subagent.env_passthrough = vec!["PATH".to_string()];
+        let host = ToolHost::new(&config);
+        assert!(host.subagent.needs_setup());
+
+        let secret = "sk-ant-api03-host-dispatch-secret";
+        let resp = host
+            .call(
+                "portal_subagent_setup",
+                serde_json::json!({"provider": "anthropic", "model": "claude-sonnet-4-5", "api_key": secret}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp["isError"], false, "{resp}");
+        assert!(!host.subagent.needs_setup());
+        assert!(PortalConfig::load(path.to_str().unwrap())
+            .unwrap()
+            .subagent
+            .model
+            .api_key
+            .is_some());
+
+        for tool in ["portal_subagent_setup", "portal_subagent_status", "portal_status"] {
+            let resp = host.call(tool, serde_json::json!({})).await.unwrap();
+            assert_eq!(resp["isError"], false, "{tool}: {resp}");
+            assert!(!resp.to_string().contains(secret), "{tool} leaked the key: {resp}");
+        }
+        let _ = std::fs::remove_dir_all(ws);
+    }
+
+    #[tokio::test]
     async fn shutdown_and_cleanup_cover_the_subagent() {
         let ws = temp_workspace("shutdown");
         let host = ToolHost::new(&config_with_subagent(&ws, Some(vec!["/bin/sh".to_string()])));

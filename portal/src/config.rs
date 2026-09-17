@@ -105,6 +105,9 @@ pub struct PortalConfig {
     /// Startup diagnostics contain field names and fixed guidance, never values.
     pub warnings: Vec<ConfigWarning>,
     pub subagent: SubagentConfig,
+    /// The file this configuration was loaded from; `None` for in-memory
+    /// defaults. Runtime self-service tools write back to this same file.
+    pub config_path: Option<PathBuf>,
 }
 
 /// Native sub-agent runtime (PRD §4.7).
@@ -219,6 +222,152 @@ pub struct SubagentModelConfig {
     pub api_key: Option<String>,
 }
 
+/// Providers whose API key pi (and Portal's daemon env injection) knows how
+/// to route. `google` is pi's alias for `gemini`.
+pub const SUBAGENT_PROVIDERS: [&str; 7] = [
+    "anthropic",
+    "openrouter",
+    "openai",
+    "gemini",
+    "google",
+    "groq",
+    "xai",
+];
+
+/// Thinking levels pi accepts.
+pub const SUBAGENT_THINKING_LEVELS: [&str; 7] =
+    ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+impl SubagentModelConfig {
+    /// Any of provider / model / key set: the being has said *something*
+    /// about which LLM the sub-agent runs on.
+    pub fn is_configured(&self) -> bool {
+        self.provider.is_some() || self.model.is_some() || self.api_key.is_some()
+    }
+
+    /// `sk-ant-...***` — enough to recognise which key it is, never enough
+    /// to use it. Short keys are fully masked.
+    pub fn masked_api_key(&self) -> Option<String> {
+        self.api_key.as_deref().map(mask_secret)
+    }
+
+    /// Status payload: the key is only ever present in masked form.
+    pub fn to_status_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "configured": self.is_configured(),
+            "provider": self.provider,
+            "model": self.model,
+            "thinking": self.thinking,
+            "api_key": self.masked_api_key(),
+        })
+    }
+}
+
+/// Show a recognisable prefix of a secret and hide the rest.
+pub fn mask_secret(secret: &str) -> String {
+    const VISIBLE: usize = 7;
+    const MIN_LEN_FOR_PREFIX: usize = 16;
+    if secret.chars().count() < MIN_LEN_FOR_PREFIX {
+        return "***".to_string();
+    }
+    let prefix: String = secret.chars().take(VISIBLE).collect();
+    format!("{prefix}...***")
+}
+
+/// Write `[subagent.model]` into `path`, leaving every other line, comment
+/// and blank exactly as it was. A missing file is created with just that
+/// section. Keys that are `None` are removed from the section.
+///
+/// The file is replaced atomically (temp file + rename) and, on unix, made
+/// private (0600) because it may now hold a provider key.
+pub fn write_subagent_model(path: &std::path::Path, model: &SubagentModelConfig) -> Result<()> {
+    use toml_edit::{DocumentMut, Entry, Item, Table};
+
+    let existing = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(e).with_context(|| format!("reading {}", path.display()));
+        }
+    };
+    let mut doc: DocumentMut = existing
+        .trim_start_matches('\u{feff}')
+        .parse()
+        .map_err(|_| anyhow::anyhow!("Invalid TOML configuration in {}", path.display()))?;
+
+    let subagent = match doc.as_table_mut().entry("subagent") {
+        Entry::Vacant(slot) => {
+            // Implicit: emit `[subagent.model]` without an empty `[subagent]`.
+            let mut table = Table::new();
+            table.set_implicit(true);
+            slot.insert(Item::Table(table))
+        }
+        Entry::Occupied(slot) => slot.into_mut(),
+    };
+    let subagent = subagent
+        .as_table_like_mut()
+        .with_context(|| format!("[subagent] in {} is not a table", path.display()))?;
+    let model_item = match subagent.entry("model") {
+        Entry::Vacant(slot) => slot.insert(toml_edit::table()),
+        Entry::Occupied(slot) => slot.into_mut(),
+    };
+    let model_table = model_item
+        .as_table_like_mut()
+        .with_context(|| format!("[subagent.model] in {} is not a table", path.display()))?;
+
+    for (key, value) in [
+        ("provider", &model.provider),
+        ("model", &model.model),
+        ("thinking", &model.thinking),
+        ("api_key", &model.api_key),
+    ] {
+        match value {
+            Some(v) => {
+                model_table.insert(key, toml_edit::value(v.as_str()));
+            }
+            None => {
+                model_table.remove(key);
+            }
+        }
+    }
+
+    write_private_atomic(path, doc.to_string().as_bytes())
+}
+
+/// Temp file in the same directory, then rename over `path`.
+fn write_private_atomic(path: &std::path::Path, content: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => std::env::current_dir()?,
+    };
+    std::fs::create_dir_all(&parent)
+        .with_context(|| format!("creating {}", parent.display()))?;
+    let stage = parent.join(format!(".portal-config-{}.tmp", uuid::Uuid::new_v4()));
+
+    let result = (|| -> Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&stage)?;
+        file.write_all(content)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&stage, path)
+            .with_context(|| format!("replacing {}", path.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&stage);
+    }
+    result
+}
+
 impl Default for SubagentConfig {
     fn default() -> Self {
         Self {
@@ -315,6 +464,7 @@ impl Default for PortalConfig {
             kits_enabled: true,
             warnings: Vec::new(),
             subagent: SubagentConfig::default(),
+            config_path: None,
         }
     }
 }
@@ -425,6 +575,7 @@ impl PortalConfig {
             kits_enabled: raw.kits_enabled.unwrap_or(true),
             warnings,
             subagent: raw.subagent.unwrap_or_default(),
+            config_path: Some(PathBuf::from(path)),
         })
     }
 
@@ -703,6 +854,123 @@ api_key = "sk-or-v1-secret"
         std::fs::write("/tmp/test-portal-suboff.toml", toml).unwrap();
         let config = PortalConfig::load("/tmp/test-portal-suboff.toml").unwrap();
         assert!(!config.subagent.enabled);
+    }
+
+    #[test]
+    fn load_remembers_the_config_path_and_defaults_do_not() {
+        let path = std::env::temp_dir()
+            .join(format!("heart-portal-path-{}.toml", uuid::Uuid::new_v4()));
+        std::fs::write(&path, "name = \"vale\"\n").unwrap();
+        let config = PortalConfig::load(path.to_str().unwrap()).unwrap();
+        assert_eq!(config.config_path.as_deref(), Some(path.as_path()));
+        assert!(PortalConfig::default().config_path.is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn api_key_is_masked_to_a_short_prefix() {
+        let mut model = SubagentModelConfig::default();
+        assert_eq!(model.masked_api_key(), None);
+        assert!(!model.is_configured());
+
+        model.api_key = Some("sk-ant-api03-0123456789abcdefghijklmnop".to_string());
+        assert_eq!(model.masked_api_key().as_deref(), Some("sk-ant-...***"));
+        assert!(model.is_configured());
+
+        // Too short to show any of it.
+        model.api_key = Some("short".to_string());
+        assert_eq!(model.masked_api_key().as_deref(), Some("***"));
+
+        let status = model.to_status_json();
+        assert_eq!(status["api_key"], "***");
+        assert!(!status.to_string().contains("short"));
+    }
+
+    #[test]
+    fn write_subagent_model_preserves_the_rest_of_the_file() {
+        let dir = std::env::temp_dir().join(format!("heart-portal-edit-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("portal.toml");
+        std::fs::write(
+            &path,
+            "# My portal\nname = \"vale\"   # keep this comment\n\n[subagent]\nmax_concurrent = 2\n\n[subagent.model]\nprovider = \"openai\"\nmodel = \"gpt-4o\"\n",
+        )
+        .unwrap();
+
+        let model = SubagentModelConfig {
+            provider: Some("anthropic".to_string()),
+            model: Some("claude-sonnet-4-5".to_string()),
+            thinking: None,
+            api_key: Some("sk-ant-secret-value-1234567890".to_string()),
+        };
+        write_subagent_model(&path, &model).unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.starts_with("# My portal\n"), "{written}");
+        assert!(written.contains("name = \"vale\"   # keep this comment"), "{written}");
+        assert!(written.contains("max_concurrent = 2"), "{written}");
+        assert!(!written.contains("gpt-4o"), "old model replaced: {written}");
+
+        let reloaded = PortalConfig::load(path.to_str().unwrap()).unwrap();
+        assert_eq!(reloaded.subagent.max_concurrent, 2);
+        assert_eq!(reloaded.subagent.model.provider.as_deref(), Some("anthropic"));
+        assert_eq!(reloaded.subagent.model.model.as_deref(), Some("claude-sonnet-4-5"));
+        assert_eq!(reloaded.subagent.model.thinking, None);
+        assert_eq!(
+            reloaded.subagent.model.api_key.as_deref(),
+            Some("sk-ant-secret-value-1234567890")
+        );
+
+        // Clearing a key removes it rather than writing an empty string.
+        let cleared = SubagentModelConfig { api_key: None, ..model };
+        write_subagent_model(&path, &cleared).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(!written.contains("api_key"), "{written}");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "a file that may hold a key is private");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_subagent_model_creates_a_minimal_file_when_missing() {
+        let dir = std::env::temp_dir().join(format!("heart-portal-new-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("nested").join("portal.toml");
+        let model = SubagentModelConfig {
+            provider: Some("openrouter".to_string()),
+            model: Some("deepseek/deepseek-chat".to_string()),
+            thinking: Some("low".to_string()),
+            api_key: None,
+        };
+        write_subagent_model(&path, &model).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("[subagent.model]"), "{written}");
+        assert!(!written.contains("[subagent]\n"), "no empty parent table: {written}");
+        let reloaded = PortalConfig::load(path.to_str().unwrap()).unwrap();
+        assert_eq!(reloaded.subagent.model.provider.as_deref(), Some("openrouter"));
+        assert_eq!(reloaded.subagent.model.thinking.as_deref(), Some("low"));
+        assert_eq!(reloaded.name, "portal", "everything else stays default");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_subagent_model_handles_an_inline_model_table() {
+        let dir = std::env::temp_dir().join(format!("heart-portal-inline-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("portal.toml");
+        std::fs::write(&path, "[subagent]\nmodel = { provider = \"groq\" }\n").unwrap();
+        let model = SubagentModelConfig {
+            provider: Some("xai".to_string()),
+            ..SubagentModelConfig::default()
+        };
+        write_subagent_model(&path, &model).unwrap();
+        let reloaded = PortalConfig::load(path.to_str().unwrap()).unwrap();
+        assert_eq!(reloaded.subagent.model.provider.as_deref(), Some("xai"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
