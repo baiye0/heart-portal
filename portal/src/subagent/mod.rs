@@ -387,6 +387,8 @@ impl SubagentManager {
             state_dir: state_dir.clone(),
             workspace_root: config.security.workspace_root.clone(),
             env_passthrough: sub.env_passthrough.clone(),
+            api_key: sub.model.api_key.clone(),
+            provider: sub.model.provider.clone(),
         }));
 
         let ledger = Ledger::load(state_dir.join("ledger.json"));

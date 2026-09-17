@@ -85,6 +85,11 @@ pub struct PiDaemonConfig {
     pub workspace_root: PathBuf,
     /// Environment variables forwarded into the `env_clear()`ed child.
     pub env_passthrough: Vec<String>,
+    /// API key from portal.toml — injected into daemon env so sessions can auth.
+    pub api_key: Option<String>,
+    /// Provider name (openrouter, anthropic, etc.) — determines which env var
+    /// receives the api_key.
+    pub provider: Option<String>,
 }
 
 /// How Portal talks to pi.
@@ -380,6 +385,21 @@ impl PiDaemon {
             if let Some(val) = std::env::var_os(key) {
                 cmd.env(key, val);
             }
+        }
+        // Inject api_key from portal.toml into daemon env — the provider
+        // determines the env var name. This is the ONLY place where config-level
+        // auth reaches daemon-spawned sessions.
+        if let Some(key) = &self.config.api_key {
+            let env_name = match self.config.provider.as_deref() {
+                Some("openrouter") => "OPENROUTER_API_KEY",
+                Some("anthropic") => "ANTHROPIC_API_KEY",
+                Some("openai") => "OPENAI_API_KEY",
+                Some("gemini" | "google") => "GEMINI_API_KEY",
+                Some("groq") => "GROQ_API_KEY",
+                Some("xai") => "XAI_API_KEY",
+                _ => "OPENAI_API_KEY", // sensible default
+            };
+            cmd.env(env_name, key);
         }
         cmd.env("PRIME_AGENT_CODING_AGENT_DIR", self.agent_dir())
             .env("PRIME_AGENT_SESSION_DIR", self.sessions_dir())
@@ -954,6 +974,7 @@ mod tests {
             state_dir,
             workspace_root: PathBuf::from("/tmp"),
             env_passthrough: vec!["PATH".to_string()],
+            api_key: None, provider: None,
         })
     }
 
@@ -1063,6 +1084,7 @@ mod tests {
             state_dir: root.join("subagent"),
             workspace_root: PathBuf::from("/tmp"),
             env_passthrough: vec!["PATH".to_string()],
+            api_key: None, provider: None,
         });
 
         let err = match d.ensure_running().await {
@@ -1134,6 +1156,7 @@ JSON
             state_dir: root.join("subagent"),
             workspace_root: root.to_path_buf(),
             env_passthrough: vec!["PATH".to_string(), "HOME".to_string()],
+            api_key: None, provider: None,
         })
     }
 

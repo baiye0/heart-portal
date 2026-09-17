@@ -440,7 +440,10 @@ pub struct SessionSummary {
     pub session_file: Option<String>,
     pub name: Option<String>,
     pub cwd: Option<String>,
-    pub model: Option<String>,
+    /// pi ≥0.7 returns a full model object (api/baseUrl/id/name/provider/cost);
+    /// older builds returned a bare id string. Portal never reads this field —
+    /// accept any shape so `create` parsing does not break on it.
+    pub model: Option<serde_json::Value>,
     pub is_streaming: bool,
     pub resumed: bool,
 }
@@ -452,7 +455,8 @@ pub struct SessionSummary {
 pub struct SessionStateInfo {
     pub is_streaming: bool,
     pub session_file: Option<String>,
-    pub model: Option<String>,
+    /// Same shape drift as `SessionSummary::model` — pi sends an object.
+    pub model: Option<serde_json::Value>,
     pub message_count: Option<u64>,
     pub error_message: Option<String>,
 }
