@@ -11,14 +11,17 @@ mod process;
 mod screenshot;
 mod search;
 pub(crate) mod status;
+mod subagent;
 pub(crate) mod text;
 #[cfg(test)]
 mod utf8_tests;
 mod web;
 
 use crate::config::PortalConfig;
+use crate::heart_callback::HeartCallback;
 use crate::kits::{loader, manager::KitManager};
 use crate::process_manager::ProcessManager;
+use crate::subagent::SubagentManager;
 use anyhow::{Context, Result};
 use custom::CustomToolHost;
 use serde_json::Value;
@@ -41,6 +44,12 @@ pub struct ToolHost {
     custom: CustomToolHost,
     kits: KitManager,
     pub process_manager: Arc<ProcessManager>,
+    /// The being's native sub-agent. Always present; unavailable when pi is
+    /// not installed, in which case its tools are not advertised.
+    pub subagent: Arc<SubagentManager>,
+    /// Shared Heart callback handle — every manager that can finish work
+    /// asynchronously delivers through this one client/retry policy.
+    callback: HeartCallback,
     /// Each connected client receives its own change cursor, including idle clients.
     tools_changed: tokio::sync::watch::Sender<u64>,
     kit_refresh_lock: Arc<tokio::sync::Mutex<()>>,
@@ -72,12 +81,16 @@ impl ToolHost {
             }
         };
 
+        let callback = HeartCallback::new();
+
         Self {
             runtime: Arc::new(runtime),
             config: config.clone(),
             custom: CustomToolHost::new(),
             kits: KitManager::new(loaded_kits),
-            process_manager: Arc::new(ProcessManager::new()),
+            process_manager: Arc::new(ProcessManager::new(callback.clone())),
+            subagent: SubagentManager::new(config, callback.clone()),
+            callback,
             tools_changed: tokio::sync::watch::channel(0).0,
             kit_refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
             custom_reload_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -99,17 +112,32 @@ impl ToolHost {
         }
     }
 
+    /// Enable async callbacks for every manager at once (`--connect` mode).
+    /// Replaces the old direct `process_manager.set_callback_config` call.
+    ///
+    /// Reconciliation of sub-agent tasks orphaned by a restart is kicked off
+    /// here rather than at construction: before this point there is nowhere to
+    /// deliver the `interrupted` results to.
+    pub fn set_callback_config(&self, url: String, token: String, portal_name: String) {
+        self.callback.set(url, token, portal_name);
+        let subagent = Arc::clone(&self.subagent);
+        tokio::spawn(async move { subagent.reconcile().await });
+    }
+
     /// Wait until a tool caller has requested a controlled Portal restart.
     pub async fn wait_for_restart(&self) {
         self.restart_notify.notified().await;
     }
 
     pub async fn kill_all_managed_processes(&self) {
+        // Shut the sub-agent down alongside the rest: its daemon is a child
+        // process too, and a leaked pi daemon outlives Portal otherwise.
         let cleanup = async {
             tokio::join!(
                 self.process_manager.kill_all(),
                 self.kits.shutdown(),
                 self.custom.shutdown(),
+                self.subagent.shutdown(),
             );
         };
         if tokio::time::timeout(std::time::Duration::from_secs(10), cleanup)
@@ -122,6 +150,7 @@ impl ToolHost {
 
     pub async fn cleanup_background_sessions(&self) {
         self.process_manager.cleanup().await;
+        self.subagent.cleanup().await;
     }
 
     /// Load custom tools from workspace/tools/mcp.toml
@@ -143,7 +172,8 @@ impl ToolHost {
     /// Pre-spawn eager kits (manifest.eager == true) so the first call has
     /// no cold-start latency. Failures are logged, not fatal.
     pub async fn warmup_kits(&self) {
-        self.kits.warmup().await
+        self.kits.warmup().await;
+        self.subagent.warmup().await;
     }
 
     /// Periodically re-scan the kits directory and refresh manifests in place.
@@ -530,6 +560,12 @@ impl ToolHost {
             });
         }
 
+        // Only advertise the sub-agent when it can actually run: a being should
+        // never be offered a tool that fails on every call.
+        if self.subagent.is_available() {
+            tools.extend(subagent::list_tools());
+        }
+
         if self.config.kits_enabled {
             tools.push(ToolInfo {
                 name: "portal_kits_status".into(),
@@ -615,6 +651,9 @@ impl ToolHost {
             "portal_search" => search::search(&self.config, arguments).await,
             "portal_web_fetch" => web::fetch(arguments).await,
             "portal_oauth_authorize" => oauth::authorize(arguments).await,
+            name if subagent::is_subagent_tool(name) => {
+                subagent::handle(&self.subagent, name, arguments).await
+            }
             "portal_tools_reload" => self.handle_tools_reload().await,
             "portal_kits_setup" => {
                 if !self.config.kits_enabled {
@@ -968,5 +1007,106 @@ mod restart_tests {
             .unwrap();
         handler.abort();
         let _ = handler.await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn temp_workspace(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("portal-toolhost-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn config_with_subagent(workspace: &PathBuf, command: Option<Vec<String>>) -> PortalConfig {
+        let mut config = PortalConfig::default();
+        config.security.workspace_root = workspace.clone();
+        config.kits_enabled = false;
+        config.subagent.state_dir = Some(workspace.join("state").display().to_string());
+        config.subagent.command = command;
+        config
+    }
+
+    fn tool_names(host: &ToolHost) -> Vec<String> {
+        host.list_builtin_tools()
+            .into_iter()
+            .map(|t| t.name)
+            .collect()
+    }
+
+    #[test]
+    fn subagent_tools_are_advertised_only_when_pi_resolves() {
+        let ws = temp_workspace("available");
+        // A resolvable binary stands in for pi: availability is about the
+        // command resolving, not about what it is.
+        let host = ToolHost::new(&config_with_subagent(&ws, Some(vec!["/bin/sh".to_string()])));
+        let names = tool_names(&host);
+        assert!(host.subagent.is_available());
+        for expected in subagent::TOOL_NAMES {
+            assert!(names.contains(&expected.to_string()), "missing {expected} in {names:?}");
+        }
+        let _ = std::fs::remove_dir_all(ws);
+    }
+
+    #[test]
+    fn subagent_tools_are_hidden_when_pi_is_missing() {
+        let ws = temp_workspace("missing");
+        let host = ToolHost::new(&config_with_subagent(
+            &ws,
+            Some(vec![ws.join("no-such-pi").display().to_string()]),
+        ));
+        assert!(!host.subagent.is_available());
+        let names = tool_names(&host);
+        assert!(
+            !names.iter().any(|n| n.starts_with("portal_subagent_")),
+            "a being must not be offered tools that cannot run: {names:?}"
+        );
+        // The rest of the built-ins are unaffected.
+        assert!(names.contains(&"portal_exec".to_string()));
+        let _ = std::fs::remove_dir_all(ws);
+    }
+
+    #[test]
+    fn subagent_tools_are_hidden_when_disabled() {
+        let ws = temp_workspace("disabled");
+        let mut config = config_with_subagent(&ws, Some(vec!["/bin/sh".to_string()]));
+        config.subagent.enabled = false;
+        let host = ToolHost::new(&config);
+        assert!(!host.subagent.is_available());
+        assert!(!tool_names(&host)
+            .iter()
+            .any(|n| n.starts_with("portal_subagent_")));
+        let _ = std::fs::remove_dir_all(ws);
+    }
+
+    #[tokio::test]
+    async fn unavailable_subagent_still_answers_its_tools_with_a_reason() {
+        let ws = temp_workspace("callreason");
+        let host = ToolHost::new(&config_with_subagent(
+            &ws,
+            Some(vec![ws.join("no-such-pi").display().to_string()]),
+        ));
+        // Dispatch does not depend on advertisement: a stale client may still call.
+        let resp = host
+            .call("portal_subagent_spawn", serde_json::json!({"brief": "do it"}))
+            .await
+            .unwrap();
+        assert_eq!(resp["isError"], true);
+        let text = resp["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("no pi binary found"), "{text}");
+        let _ = std::fs::remove_dir_all(ws);
+    }
+
+    #[tokio::test]
+    async fn shutdown_and_cleanup_cover_the_subagent() {
+        let ws = temp_workspace("shutdown");
+        let host = ToolHost::new(&config_with_subagent(&ws, Some(vec!["/bin/sh".to_string()])));
+        // Neither path may hang or panic when nothing is running.
+        host.cleanup_background_sessions().await;
+        host.kill_all_managed_processes().await;
+        let _ = std::fs::remove_dir_all(ws);
     }
 }

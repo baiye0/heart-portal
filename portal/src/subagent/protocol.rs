@@ -1,0 +1,761 @@
+//! Pi daemon JSONL protocol, v7 subset (PRD §3.3 — normative).
+//!
+//! Wire format: newline-delimited JSON, UTF-8, one object per line.
+//!
+//! ```text
+//! connect  ◄── {"type":"daemon_hello", protocol:{name,version}, schemaId, appVersion, …}
+//! request  ──► {"id":"<uuid>","type":"<command>", …fields}
+//! response ◄── {"id":"<uuid>","type":"response","command":"…","success":true,"data":…}
+//! events   ◄── {"type":"session_event","activeSessionId":"…","event":{…}}
+//!              {"type":"session_closed",…} {"type":"extension_ui_request",…}
+//!              {"type":"daemon_closing",…}  anything else → ignored
+//! ```
+//!
+//! Deserialization is deliberately tolerant: unknown message types collapse to
+//! [`DaemonMessage::Unknown`] and unknown fields are ignored, so a pi upgrade
+//! that adds messages or fields cannot break Portal (PRD §9 risk 1).
+
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+
+/// Protocol name Portal asserts on `daemon_hello`.
+pub const DAEMON_PROTOCOL_NAME: &str = "prime-agent.daemon";
+/// Protocol version Portal implements. A mismatch is a hard error.
+pub const DAEMON_PROTOCOL_VERSION: u32 = 7;
+/// pi version Portal is written against; a mismatch is a warning only.
+pub const PINNED_PI_VERSION: &str = "0.7.2";
+/// Capability required for `prompt` / `steer` / `follow_up` to be admitted.
+pub const CAP_SESSION_INPUT_ADMISSION: &str = "session_input_admission";
+/// Max bytes in a single protocol line (mirrors pi's own cap).
+pub const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
+
+// ── greeting ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProtocolInfo {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub version: u32,
+}
+
+/// First line the daemon writes after a client connects.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DaemonHello {
+    #[serde(default = "unknown_protocol")]
+    pub protocol: ProtocolInfo,
+    #[serde(default)]
+    pub schema_id: Option<String>,
+    #[serde(default)]
+    pub app_version: Option<String>,
+    #[serde(default)]
+    pub supervisor_pid: Option<u32>,
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub server_capabilities: Vec<String>,
+}
+
+fn unknown_protocol() -> ProtocolInfo {
+    ProtocolInfo {
+        name: String::new(),
+        version: 0,
+    }
+}
+
+impl DaemonHello {
+    /// Hard gate: the protocol Portal speaks, or refuse to use this daemon.
+    pub fn check_protocol(&self) -> anyhow::Result<()> {
+        if self.protocol.name != DAEMON_PROTOCOL_NAME {
+            anyhow::bail!(
+                "unexpected daemon protocol '{}' (want '{}')",
+                self.protocol.name,
+                DAEMON_PROTOCOL_NAME
+            );
+        }
+        if self.protocol.version != DAEMON_PROTOCOL_VERSION {
+            anyhow::bail!(
+                "pi daemon speaks protocol v{} but Portal implements v{}; \
+                 upgrade Portal or pin pi {}",
+                self.protocol.version,
+                DAEMON_PROTOCOL_VERSION,
+                PINNED_PI_VERSION
+            );
+        }
+        Ok(())
+    }
+
+    pub fn supports(&self, capability: &str) -> bool {
+        self.server_capabilities.iter().any(|c| c == capability)
+    }
+
+    /// A stdio/degraded transport that never sent a hello.
+    pub fn unverified() -> Self {
+        Self {
+            protocol: ProtocolInfo {
+                name: DAEMON_PROTOCOL_NAME.to_string(),
+                version: DAEMON_PROTOCOL_VERSION,
+            },
+            schema_id: None,
+            app_version: None,
+            supervisor_pid: None,
+            client_id: None,
+            server_capabilities: Vec::new(),
+        }
+    }
+}
+
+// ── inbound ─────────────────────────────────────────────────────────
+
+/// Reply to a request, correlated by `id`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandResponse {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub success: bool,
+    #[serde(default)]
+    pub data: Option<Value>,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub error_info: Option<Value>,
+}
+
+impl CommandResponse {
+    /// `data` on success, an `anyhow` error carrying the daemon's message otherwise.
+    pub fn into_data(self) -> anyhow::Result<Value> {
+        if self.success {
+            return Ok(self.data.unwrap_or(Value::Null));
+        }
+        let msg = self
+            .error
+            .unwrap_or_else(|| "daemon reported failure without an error message".to_string());
+        anyhow::bail!("pi {} failed: {}", self.command, msg)
+    }
+}
+
+/// The `event` object inside a `session_event`. Loosely typed on purpose: pi
+/// emits dozens of event kinds and adds more between releases.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionEventBody {
+    #[serde(rename = "type", default)]
+    pub kind: String,
+    #[serde(flatten)]
+    pub rest: Map<String, Value>,
+}
+
+impl SessionEventBody {
+    pub fn str_field(&self, key: &str) -> Option<&str> {
+        self.rest.get(key).and_then(|v| v.as_str())
+    }
+
+    pub fn u64_field(&self, key: &str) -> Option<u64> {
+        self.rest.get(key).and_then(|v| v.as_u64())
+    }
+
+    pub fn f64_field(&self, key: &str) -> Option<f64> {
+        self.rest.get(key).and_then(|v| v.as_f64())
+    }
+}
+
+/// Progress notification for an attached session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionEvent {
+    #[serde(default)]
+    pub active_session_id: String,
+    pub event: SessionEventBody,
+    #[serde(default)]
+    pub meta: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionClosed {
+    #[serde(default)]
+    pub active_session_id: String,
+    #[serde(default)]
+    pub reason: String,
+}
+
+/// A dialog the sub-agent wants a human to answer. Portal always declines
+/// (PRD §9 risk 3) so a headless sub can never block forever.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionUiRequest {
+    #[serde(default)]
+    pub active_session_id: String,
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub method: Option<String>,
+    #[serde(default)]
+    pub payload: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonClosing {
+    #[serde(default)]
+    pub reason: String,
+}
+
+/// Anything the daemon can write on the socket.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type")]
+pub enum DaemonMessage {
+    #[serde(rename = "daemon_hello")]
+    Hello(DaemonHello),
+    #[serde(rename = "response")]
+    Response(CommandResponse),
+    #[serde(rename = "session_event")]
+    SessionEvent(SessionEvent),
+    #[serde(rename = "session_closed")]
+    SessionClosed(SessionClosed),
+    #[serde(rename = "extension_ui_request")]
+    ExtensionUiRequest(ExtensionUiRequest),
+    #[serde(rename = "daemon_closing")]
+    DaemonClosing(DaemonClosing),
+    /// Snapshot streams, telemetry, future message kinds — logged at debug.
+    #[serde(other)]
+    Unknown,
+}
+
+// ── outbound ────────────────────────────────────────────────────────
+
+/// Session lifecycle. `resident` sessions survive client disconnects, which is
+/// what makes a Portal restart non-destructive.
+pub const LIFECYCLE_RESIDENT: &str = "resident";
+
+/// `create.config` — a subset of pi's `AgentSessionRuntimeConfig`.
+/// Only fields Portal actually sets are present; `skip_serializing_if` keeps
+/// the line free of nulls so pi's own defaults apply.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRuntimeConfig {
+    pub cwd: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_dir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_dir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub append_system_prompt: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<String>,
+    pub no_context_files: bool,
+    pub telemetry_disabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub autonomous: Option<AutonomousConfig>,
+}
+
+/// Pi's own budget primitives — Portal maps `[subagent.budget]` onto these
+/// instead of re-implementing turn/token accounting.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutonomousConfig {
+    pub enabled: bool,
+    pub max_turns: u32,
+    pub max_tokens: u64,
+    pub timeout_ms: u64,
+    pub max_continuations: u32,
+}
+
+/// Every command Portal sends. Internally tagged as `type`, matching the
+/// daemon's bare-JSON-line command form.
+///
+/// The full §3.3 subset is modelled even where Portal does not call it yet, so
+/// the protocol surface is reviewable in one place.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Command {
+    #[serde(rename_all = "camelCase")]
+    Create {
+        name: String,
+        lifecycle: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_path: Option<String>,
+        config: SessionRuntimeConfig,
+    },
+    #[serde(rename_all = "camelCase")]
+    Attach {
+        active_session_id: String,
+        supports_extension_ui: bool,
+        client_id: String,
+        capabilities: Vec<String>,
+    },
+    #[serde(rename_all = "camelCase")]
+    Detach { active_session_id: String },
+    #[serde(rename_all = "camelCase")]
+    PromptAndWait {
+        active_session_id: String,
+        message: String,
+        source: String,
+    },
+    #[serde(rename_all = "camelCase")]
+    Steer {
+        active_session_id: String,
+        message: String,
+    },
+    #[serde(rename_all = "camelCase")]
+    FollowUp {
+        active_session_id: String,
+        message: String,
+    },
+    #[serde(rename_all = "camelCase")]
+    Abort { active_session_id: String },
+    #[serde(rename_all = "camelCase")]
+    WaitForIdle { active_session_id: String },
+    #[serde(rename_all = "camelCase")]
+    WaitForHeadlessCompletion { active_session_id: String },
+    #[serde(rename_all = "camelCase")]
+    GetLastAssistantText { active_session_id: String },
+    #[serde(rename_all = "camelCase")]
+    GetSessionStats { active_session_id: String },
+    #[serde(rename_all = "camelCase")]
+    GetState { active_session_id: String },
+    #[serde(rename_all = "camelCase")]
+    GetAvailableModels { active_session_id: String },
+    #[serde(rename_all = "camelCase")]
+    ExtensionUiResponse {
+        active_session_id: String,
+        request_id: String,
+        response: Value,
+    },
+    #[serde(rename_all = "camelCase")]
+    Kill { active_session_id: String },
+    List { all: bool },
+    Shutdown { force: bool },
+}
+
+impl Command {
+    /// The `command` string the daemon echoes back in its response.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Command::Create { .. } => "create",
+            Command::Attach { .. } => "attach",
+            Command::Detach { .. } => "detach",
+            Command::PromptAndWait { .. } => "prompt_and_wait",
+            Command::Steer { .. } => "steer",
+            Command::FollowUp { .. } => "follow_up",
+            Command::Abort { .. } => "abort",
+            Command::WaitForIdle { .. } => "wait_for_idle",
+            Command::WaitForHeadlessCompletion { .. } => "wait_for_headless_completion",
+            Command::GetLastAssistantText { .. } => "get_last_assistant_text",
+            Command::GetSessionStats { .. } => "get_session_stats",
+            Command::GetState { .. } => "get_state",
+            Command::GetAvailableModels { .. } => "get_available_models",
+            Command::ExtensionUiResponse { .. } => "extension_ui_response",
+            Command::Kill { .. } => "kill",
+            Command::List { .. } => "list",
+            Command::Shutdown { .. } => "shutdown",
+        }
+    }
+
+    /// Serialize as a protocol line: the command fields plus the correlation id.
+    pub fn to_line(&self, id: &str) -> anyhow::Result<String> {
+        let mut value = serde_json::to_value(self)?;
+        let obj = value
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("command did not serialize to an object"))?;
+        obj.insert("id".to_string(), Value::String(id.to_string()));
+        Ok(serde_json::to_string(&value)?)
+    }
+
+    /// `attach` with the flags Portal always uses: no UI, sequenced events.
+    pub fn attach(active_session_id: impl Into<String>, client_id: impl Into<String>) -> Self {
+        Command::Attach {
+            active_session_id: active_session_id.into(),
+            supports_extension_ui: false,
+            client_id: client_id.into(),
+            capabilities: vec!["event_sequence".to_string()],
+        }
+    }
+
+    /// Decline a dialog so the sub-agent stops waiting on a human.
+    pub fn decline_ui(active_session_id: impl Into<String>, request_id: impl Into<String>) -> Self {
+        Command::ExtensionUiResponse {
+            active_session_id: active_session_id.into(),
+            request_id: request_id.into(),
+            response: serde_json::json!({ "cancelled": true }),
+        }
+    }
+}
+
+/// One task, rendered as a prompt into a long-lived session (PRD §7.1).
+#[derive(Debug, Clone)]
+pub struct PromptRequest {
+    pub active_session_id: String,
+    pub message: String,
+}
+
+impl PromptRequest {
+    pub fn into_command(self) -> Command {
+        Command::PromptAndWait {
+            active_session_id: self.active_session_id,
+            message: self.message,
+            source: "rpc".to_string(),
+        }
+    }
+}
+
+// ── response payloads ───────────────────────────────────────────────
+
+/// `create` / `list` payload. Every field optional: pi's `SessionSummary`
+/// carries far more than Portal reads.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SessionSummary {
+    pub active_session_id: String,
+    pub session_id: Option<String>,
+    pub session_file: Option<String>,
+    pub name: Option<String>,
+    pub cwd: Option<String>,
+    pub model: Option<String>,
+    pub is_streaming: bool,
+    pub resumed: bool,
+}
+
+/// `get_state` payload.
+#[allow(dead_code)] // read by portal_subagent_session list (PRD §6.5)
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SessionStateInfo {
+    pub is_streaming: bool,
+    pub session_file: Option<String>,
+    pub model: Option<String>,
+    pub message_count: Option<u64>,
+    pub error_message: Option<String>,
+}
+
+/// Token/cost accounting, as reported by `get_session_stats` or the P3
+/// `prompt_and_wait` envelope. Field names vary across pi versions, so
+/// [`Usage::from_value`] probes several shapes.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct Usage {
+    pub input: u64,
+    pub output: u64,
+    pub total: u64,
+    pub cost_usd: Option<f64>,
+}
+
+impl Usage {
+    /// Pull usage out of whatever shape the daemon produced. Missing numbers
+    /// stay zero rather than failing a task that actually succeeded.
+    pub fn from_value(v: &Value) -> Self {
+        let root = ["usage", "tokens", "totals", "stats"]
+            .iter()
+            .find_map(|k| v.get(k))
+            .unwrap_or(v);
+        let pick = |keys: &[&str]| -> u64 {
+            keys.iter()
+                .find_map(|k| root.get(*k).and_then(|x| x.as_u64()))
+                .unwrap_or(0)
+        };
+        let input = pick(&["input", "inputTokens", "input_tokens", "promptTokens"]);
+        let output = pick(&["output", "outputTokens", "output_tokens", "completionTokens"]);
+        let mut total = pick(&["total", "totalTokens", "total_tokens"]);
+        if total == 0 {
+            total = input + output;
+        }
+        let cost_usd = ["cost", "costUsd", "cost_usd", "totalCost"]
+            .iter()
+            .find_map(|k| root.get(*k).and_then(|x| x.as_f64()));
+        Self {
+            input,
+            output,
+            total,
+            cost_usd,
+        }
+    }
+}
+
+/// `wait_for_headless_completion` payload — pi's `AgentAutonomousStatus`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AutonomousStatus {
+    pub turns_used: u32,
+    pub tokens_used: u64,
+    pub last_gate_failure: Option<String>,
+    pub stop_reason: Option<String>,
+    pub limit_reached: Option<String>,
+}
+
+impl AutonomousStatus {
+    /// True when the task stopped because it ran out of budget rather than
+    /// because it finished the work (PRD §4.3 → `BudgetExhausted`).
+    pub fn budget_exhausted(&self, budget_turns: u32, budget_tokens: u64) -> bool {
+        if self.limit_reached.is_some() {
+            return true;
+        }
+        if matches!(
+            self.stop_reason.as_deref(),
+            Some("max_turns") | Some("max_tokens") | Some("timeout") | Some("budget")
+        ) {
+            return true;
+        }
+        (budget_turns > 0 && self.turns_used >= budget_turns)
+            || (budget_tokens > 0 && self.tokens_used >= budget_tokens)
+    }
+}
+
+/// Result of one task. Populated from the P3 `prompt_and_wait` envelope when
+/// present, otherwise assembled from the follow-up round trips (PRD §5 P3).
+#[derive(Debug, Clone, Default)]
+pub struct PromptComplete {
+    pub last_assistant_text: Option<String>,
+    pub stop_reason: Option<String>,
+    pub error_message: Option<String>,
+    pub usage: Usage,
+    pub turns: u32,
+}
+
+impl PromptComplete {
+    /// Read the atomic envelope if this daemon has P3; `None` means Portal must
+    /// fall back to `get_last_assistant_text` + `get_session_stats`.
+    ///
+    /// The result body is what makes an envelope P3, so the `lastAssistantText`
+    /// key must be *present* — a plain response that merely happens to carry a
+    /// `stopReason` is not P3, and treating it as one would silently deliver an
+    /// empty result instead of falling back.
+    pub fn from_value(v: &Value) -> Option<Self> {
+        let obj = v.as_object()?;
+        let text_key = ["lastAssistantText", "last_assistant_text", "text"]
+            .into_iter()
+            .find(|k| obj.contains_key(*k))?;
+        // Present but null is still P3: the task simply said nothing.
+        let text = obj
+            .get(text_key)
+            .and_then(|x| x.as_str())
+            .map(str::to_string);
+        let stop_reason = ["stopReason", "stop_reason"]
+            .iter()
+            .find_map(|k| obj.get(*k).and_then(|x| x.as_str()))
+            .map(str::to_string);
+        let error_message = ["errorMessage", "error_message", "error"]
+            .iter()
+            .find_map(|k| obj.get(*k).and_then(|x| x.as_str()))
+            .map(str::to_string);
+        Some(Self {
+            last_assistant_text: text,
+            stop_reason,
+            error_message,
+            usage: Usage::from_value(v),
+            turns: obj
+                .get("turns")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0) as u32,
+        })
+    }
+
+    /// Pi signalled an error rather than a completed task.
+    pub fn failed(&self) -> bool {
+        self.error_message.is_some()
+            || matches!(self.stop_reason.as_deref(), Some("error") | Some("aborted"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hello_accepts_v7_and_rejects_others() {
+        let line = r#"{"type":"daemon_hello","protocol":{"name":"prime-agent.daemon","version":7},
+            "schemaId":"rev16","appVersion":"0.7.2","supervisorPid":48213,"clientId":"c1",
+            "serverCapabilities":["session_input_admission"],"futureField":123}"#;
+        let msg: DaemonMessage = serde_json::from_str(line).unwrap();
+        let DaemonMessage::Hello(hello) = msg else {
+            panic!("expected hello");
+        };
+        assert!(hello.check_protocol().is_ok());
+        assert!(hello.supports(CAP_SESSION_INPUT_ADMISSION));
+        assert_eq!(hello.supervisor_pid, Some(48213));
+
+        let old = r#"{"type":"daemon_hello","protocol":{"name":"prime-agent.daemon","version":6}}"#;
+        let DaemonMessage::Hello(hello) = serde_json::from_str::<DaemonMessage>(old).unwrap() else {
+            panic!("expected hello");
+        };
+        assert!(hello.check_protocol().is_err());
+    }
+
+    #[test]
+    fn unknown_message_types_are_ignored_not_errors() {
+        let msg: DaemonMessage =
+            serde_json::from_str(r#"{"type":"snapshot_chunk","seq":4,"data":"…"}"#).unwrap();
+        assert!(matches!(msg, DaemonMessage::Unknown));
+    }
+
+    #[test]
+    fn session_event_keeps_unmodelled_fields() {
+        let line = r#"{"type":"session_event","activeSessionId":"as_1",
+            "event":{"type":"tool_execution_start","toolName":"bash","args":{"command":"ls"}},
+            "meta":{"sequence":12}}"#;
+        let DaemonMessage::SessionEvent(ev) = serde_json::from_str::<DaemonMessage>(line).unwrap()
+        else {
+            panic!("expected session_event");
+        };
+        assert_eq!(ev.active_session_id, "as_1");
+        assert_eq!(ev.event.kind, "tool_execution_start");
+        assert_eq!(ev.event.str_field("toolName"), Some("bash"));
+    }
+
+    #[test]
+    fn response_failure_becomes_an_error() {
+        let line = r#"{"id":"r1","type":"response","command":"prompt_and_wait","success":false,
+            "error":"session is busy"}"#;
+        let DaemonMessage::Response(resp) = serde_json::from_str::<DaemonMessage>(line).unwrap()
+        else {
+            panic!("expected response");
+        };
+        let err = resp.into_data().unwrap_err().to_string();
+        assert!(err.contains("prompt_and_wait"), "{err}");
+        assert!(err.contains("session is busy"), "{err}");
+    }
+
+    #[test]
+    fn command_lines_carry_type_id_and_camel_case_fields() {
+        let cmd = Command::PromptAndWait {
+            active_session_id: "as_1".to_string(),
+            message: "do the thing".to_string(),
+            source: "rpc".to_string(),
+        };
+        assert_eq!(cmd.name(), "prompt_and_wait");
+        let v: Value = serde_json::from_str(&cmd.to_line("req-1").unwrap()).unwrap();
+        assert_eq!(v["type"], "prompt_and_wait");
+        assert_eq!(v["id"], "req-1");
+        assert_eq!(v["activeSessionId"], "as_1");
+        assert_eq!(v["message"], "do the thing");
+        assert!(!cmd.to_line("x").unwrap().contains('\n'), "lines must be single-line");
+    }
+
+    #[test]
+    fn create_omits_unset_optional_config() {
+        let cmd = Command::Create {
+            name: "portal:scene-42".to_string(),
+            lifecycle: LIFECYCLE_RESIDENT.to_string(),
+            session_path: None,
+            config: SessionRuntimeConfig {
+                cwd: "/ws/proj".to_string(),
+                session_dir: Some("/state/pi/sessions".to_string()),
+                append_system_prompt: vec!["contract".to_string()],
+                telemetry_disabled: true,
+                execution_mode: Some("rpc".to_string()),
+                autonomous: Some(AutonomousConfig {
+                    enabled: true,
+                    max_turns: 40,
+                    max_tokens: 400_000,
+                    timeout_ms: 1_800_000,
+                    max_continuations: 3,
+                }),
+                ..Default::default()
+            },
+        };
+        let v: Value = serde_json::from_str(&cmd.to_line("c1").unwrap()).unwrap();
+        assert_eq!(v["type"], "create");
+        assert_eq!(v["lifecycle"], "resident");
+        assert!(v.get("sessionPath").is_none(), "unset options must be omitted");
+        assert!(v["config"].get("provider").is_none());
+        assert_eq!(v["config"]["cwd"], "/ws/proj");
+        assert_eq!(v["config"]["autonomous"]["maxTurns"], 40);
+        assert_eq!(v["config"]["autonomous"]["timeoutMs"], 1_800_000);
+    }
+
+    #[test]
+    fn attach_and_decline_ui_use_headless_flags() {
+        let v: Value = serde_json::from_str(&Command::attach("as_1", "portal").to_line("a").unwrap())
+            .unwrap();
+        assert_eq!(v["supportsExtensionUi"], false);
+        assert_eq!(v["capabilities"][0], "event_sequence");
+
+        let v: Value =
+            serde_json::from_str(&Command::decline_ui("as_1", "req_7").to_line("b").unwrap())
+                .unwrap();
+        assert_eq!(v["type"], "extension_ui_response");
+        assert_eq!(v["requestId"], "req_7");
+        assert_eq!(v["response"]["cancelled"], true);
+    }
+
+    #[test]
+    fn usage_reads_nested_and_flat_shapes() {
+        let nested = serde_json::json!({"usage":{"input":30120,"output":8210,"cost":0.42}});
+        let u = Usage::from_value(&nested);
+        assert_eq!((u.input, u.output, u.total), (30120, 8210, 38330));
+        assert_eq!(u.cost_usd, Some(0.42));
+
+        let camel = serde_json::json!({"inputTokens":10,"outputTokens":5,"totalTokens":15});
+        let u = Usage::from_value(&camel);
+        assert_eq!((u.input, u.output, u.total), (10, 5, 15));
+        assert_eq!(Usage::from_value(&serde_json::json!({})).total, 0);
+    }
+
+    #[test]
+    fn prompt_complete_detects_p3_envelope() {
+        let v = serde_json::json!({
+            "lastAssistantText":"## Result\ndone","stopReason":"end_turn","turns":14,
+            "usage":{"input":1,"output":2}
+        });
+        let pc = PromptComplete::from_value(&v).unwrap();
+        assert_eq!(pc.turns, 14);
+        assert_eq!(pc.usage.total, 3);
+        assert!(!pc.failed());
+
+        // Present but null still counts: the envelope is there, the text isn't.
+        let empty = PromptComplete::from_value(&serde_json::json!({
+            "lastAssistantText": Value::Null, "stopReason": "error", "errorMessage": "boom"
+        }))
+        .unwrap();
+        assert!(empty.last_assistant_text.is_none());
+        assert!(empty.failed());
+
+        // Pre-P3 daemons return something unusable → fall back.
+        assert!(PromptComplete::from_value(&serde_json::json!({"ok": true})).is_none());
+        assert!(PromptComplete::from_value(&Value::Null).is_none());
+        assert!(
+            PromptComplete::from_value(&serde_json::json!({"stopReason": "end_turn"})).is_none(),
+            "a stopReason alone is not the P3 envelope; without the result body \
+             Portal must fall back or it would report an empty result"
+        );
+        assert!(
+            PromptComplete::from_value(&serde_json::json!(true)).is_none(),
+            "pi v0.7.2 answers prompt_and_wait with a bare true"
+        );
+    }
+
+    #[test]
+    fn budget_exhaustion_is_detected_from_status() {
+        let hit = AutonomousStatus {
+            turns_used: 40,
+            tokens_used: 1000,
+            ..Default::default()
+        };
+        assert!(hit.budget_exhausted(40, 400_000));
+
+        let fine = AutonomousStatus {
+            turns_used: 14,
+            tokens_used: 38330,
+            ..Default::default()
+        };
+        assert!(!fine.budget_exhausted(40, 400_000));
+
+        let reason = AutonomousStatus {
+            stop_reason: Some("max_turns".to_string()),
+            ..Default::default()
+        };
+        assert!(reason.budget_exhausted(0, 0));
+    }
+}

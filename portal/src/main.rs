@@ -9,6 +9,7 @@ mod config;
 #[cfg(windows)]
 mod connection_status;
 mod exec_policy;
+mod heart_callback;
 mod kits;
 #[cfg(target_os = "macos")]
 mod macos_supervisor;
@@ -20,6 +21,7 @@ mod process_manager;
 mod protocol;
 mod relay_client;
 mod single_instance;
+mod subagent;
 mod tools;
 mod upgrade;
 #[cfg(any(windows, target_os = "macos"))]
@@ -522,11 +524,7 @@ async fn main() -> Result<()> {
         match relay_client::parse_loom_link(loom) {
             Ok((host, being_id, token)) => {
                 let url = callback_url(loom, &host, &being_id);
-                tool_host.process_manager.set_callback_config(
-                    url,
-                    token,
-                    relay_portal_name.clone(),
-                );
+                tool_host.set_callback_config(url, token, relay_portal_name.clone());
             }
             Err(e) => warn!("async callback disabled (invalid Loom link): {e:#}"),
         }
@@ -560,6 +558,12 @@ async fn main() -> Result<()> {
         }
         return Ok(());
     }
+
+    // Standalone mode has no callback target, but the ledger still needs to
+    // close out sub-agent tasks orphaned by the previous run. In --connect mode
+    // this runs from set_callback_config instead, once there is an inbox to
+    // deliver the `interrupted` results to.
+    tool_host.subagent.reconcile().await;
 
     // Track active connections
     let active_connections = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
