@@ -199,6 +199,21 @@ impl PiClient {
         &self.client_id
     }
 
+    /// True when connected to a daemon (vs stdio pipe).
+    /// Daemon transport requires protocol-7 command envelopes.
+    fn uses_envelope(&self) -> bool {
+        self.hello.protocol.name == super::protocol::DAEMON_PROTOCOL_NAME
+    }
+
+    /// Serialize a command for this client's transport: envelope for daemon, bare for stdio.
+    fn serialize_command(&self, cmd: &Command, id: &str) -> anyhow::Result<String> {
+        if self.uses_envelope() {
+            cmd.to_envelope(id, &self.client_id)
+        } else {
+            cmd.to_line(id)
+        }
+    }
+
     pub fn label(&self) -> &str {
         &self.label
     }
@@ -230,7 +245,7 @@ impl PiClient {
 
         let name = cmd.name();
         let id = format!("portal-{}", self.next_id.fetch_add(1, Ordering::SeqCst));
-        let line = cmd.to_line(&id)?;
+        let line = self.serialize_command(&cmd, &id)?;
         let (tx, rx) = oneshot::channel();
         self.insert_pending(id.clone(), tx);
 
@@ -257,7 +272,7 @@ impl PiClient {
     pub async fn notify(&self, cmd: Command) {
         let name = cmd.name();
         let id = format!("portal-n{}", self.next_id.fetch_add(1, Ordering::SeqCst));
-        match cmd.to_line(&id) {
+        match self.serialize_command(&cmd, &id) {
             Ok(line) => {
                 if let Err(e) = self.write_line(&line).await {
                     debug!("pi {name} (fire-and-forget) failed: {e:#}");
@@ -446,7 +461,18 @@ mod tests {
             let mut buf = Vec::new();
             let n = read_line_capped(&mut self.reader, &mut buf).await.unwrap();
             assert_ne!(n, 0, "client closed the connection");
-            serde_json::from_slice(&buf).unwrap()
+            let raw: Value = serde_json::from_slice(&buf).unwrap();
+            // Unwrap protocol-7 envelope if present.
+            if raw.get("type").and_then(|t| t.as_str()) == Some("command") {
+                let mut inner = raw["command"].clone();
+                // Hoist the envelope id into the inner command so callers see it.
+                if let Some(id) = raw.get("id") {
+                    inner["id"] = id.clone();
+                }
+                inner
+            } else {
+                raw
+            }
         }
     }
 

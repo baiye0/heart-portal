@@ -366,7 +366,8 @@ impl Command {
         }
     }
 
-    /// Serialize as a protocol line: the command fields plus the correlation id.
+    /// Serialize as a bare protocol line: command fields + correlation id.
+    /// Used for stdio transport where the process reads commands directly.
     pub fn to_line(&self, id: &str) -> anyhow::Result<String> {
         let mut value = serde_json::to_value(self)?;
         let obj = value
@@ -374,6 +375,20 @@ impl Command {
             .ok_or_else(|| anyhow::anyhow!("command did not serialize to an object"))?;
         obj.insert("id".to_string(), Value::String(id.to_string()));
         Ok(serde_json::to_string(&value)?)
+    }
+
+    /// Serialize as a protocol-7 daemon command envelope.
+    /// The daemon rejects bare commands with "Daemon commands require protocol envelope".
+    pub fn to_envelope(&self, id: &str, client_id: &str) -> anyhow::Result<String> {
+        let command = serde_json::to_value(self)?;
+        let envelope = serde_json::json!({
+            "type": "command",
+            "id": id,
+            "protocol": { "name": DAEMON_PROTOCOL_NAME, "version": DAEMON_PROTOCOL_VERSION },
+            "clientId": client_id,
+            "command": command
+        });
+        Ok(serde_json::to_string(&envelope)?)
     }
 
     /// `attach` with the flags Portal always uses: no UI, sequenced events.

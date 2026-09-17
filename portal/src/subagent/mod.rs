@@ -2666,12 +2666,20 @@ mod flow_tests {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {}
             }
-            let Ok(cmd) = serde_json::from_str::<Value>(line.trim()) else {
+            let Ok(raw) = serde_json::from_str::<Value>(line.trim()) else {
                 continue;
+            };
+            // Unwrap protocol-7 envelope if present, otherwise treat as bare command.
+            let (cmd, id) = if raw.get("type").and_then(|t| t.as_str()) == Some("command") {
+                let inner = raw.get("command").cloned().unwrap_or(raw.clone());
+                let envelope_id = raw["id"].as_str().unwrap_or_default().to_string();
+                (inner, envelope_id)
+            } else {
+                let bare_id = raw["id"].as_str().unwrap_or_default().to_string();
+                (raw.clone(), bare_id)
             };
             seen.lock().unwrap().push(cmd.clone());
 
-            let id = cmd["id"].as_str().unwrap_or_default().to_string();
             let kind = cmd["type"].as_str().unwrap_or_default().to_string();
             let reply = |data: Value| {
                 serde_json::json!({
