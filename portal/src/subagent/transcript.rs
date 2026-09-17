@@ -21,7 +21,7 @@ use tokio::time;
 
 use crate::process_manager::OutputBuffer;
 
-use super::protocol::{SessionEvent, SessionEventBody};
+use super::protocol::{assistant_text, SessionEvent, SessionEventBody};
 
 /// Ring size per session — same 1 MiB budget as a background shell session.
 pub const TRANSCRIPT_MAX_BYTES: usize = 1024 * 1024;
@@ -200,7 +200,7 @@ pub fn render(event: &SessionEventBody) -> Option<String> {
             format!("tool ◀ {} {}{}", tool_name(event), outcome, secs)
         }
         "message_end" => {
-            let text = event
+            let owned = event
                 .str_field("text")
                 .or_else(|| event.str_field("content"))
                 .or_else(|| {
@@ -209,8 +209,12 @@ pub fn render(event: &SessionEventBody) -> Option<String> {
                         .get("message")
                         .and_then(|m| m.get("text"))
                         .and_then(|t| t.as_str())
-                })?;
-            let text = text.trim();
+                })
+                .map(str::to_string)
+                // pi's `--mode json` shape: `message.content` is a block array,
+                // and the user's own echoed message is not worth a line.
+                .or_else(|| event.rest.get("message").and_then(assistant_text))?;
+            let text = owned.trim();
             if text.is_empty() {
                 return None;
             }
@@ -345,6 +349,27 @@ mod tests {
         assert!(rendered(json!({"type":"token_delta","delta":"a"})).is_none());
         assert!(rendered(json!({"type":"message_end","text":"   "})).is_none());
         assert!(rendered(json!({"type":"message_end"})).is_none());
+    }
+
+    #[test]
+    fn the_stdio_message_shape_renders_only_what_the_assistant_said() {
+        // `pi --print --mode json` puts the text in a content block array…
+        assert_eq!(
+            rendered(json!({"type":"message_end","message":{"role":"assistant",
+                            "content":[{"type":"thinking","thinking":"hmm"},
+                                       {"type":"text","text":"Tests pass."}]}}))
+            .unwrap(),
+            "assistant: Tests pass."
+        );
+        // …and echoes the being's own prompt back as an event, which is not
+        // progress and must not be shown as if the sub-agent said it.
+        assert!(rendered(json!({"type":"message_end","message":{"role":"user",
+                                "content":[{"type":"text","text":"# Task sub_1"}]}}))
+        .is_none());
+        // A turn that only called tools says nothing.
+        assert!(rendered(json!({"type":"message_end","message":{"role":"assistant",
+                                "content":[]}}))
+        .is_none());
     }
 
     #[test]

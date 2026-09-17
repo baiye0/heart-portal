@@ -6,14 +6,24 @@
 //! restart is adopted rather than duplicated.
 //!
 //! ```text
-//! ensure_running()
+//! ensure_transport()
+//!   mode == Stdio? ───────────────────────────────────► per-task stdio
 //!   connected client? ────────────────────────────────► reuse
 //!   probe socket  ─ v7 hello ─────────────────────────► adopt (child = None)
 //!                 ─ wrong version ─► shutdown, respawn
 //!                 ─ nothing there ─► spawn + readiness loop (≤30 s)
+//!                                    └ no daemon mode ─► latch Stdio
 //! shutdown(grace)
 //!   `shutdown{}` ─► wait for exit ─► SIGTERM ─► SIGKILL   (adopted: cmd only)
 //! ```
+//!
+//! Not every pi has a daemon mode — 0.73.1 rejects `--daemon-socket` outright
+//! and exits. Rather than making the whole sub-agent unavailable, the first
+//! failed start latches [`TransportMode::Stdio`] and every task then runs as
+//! its own `pi --print --mode json` process ([`PiDaemon::run_stdio_task`]).
+//! The decision is cached for the life of the process: a pi that cannot
+//! daemonise will not learn to during one Portal run, and retrying would cost
+//! a doomed spawn on every single task.
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -21,8 +31,9 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command as TokioCommand};
+use tokio::sync::mpsc;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time;
 use tracing::{debug, info, warn};
@@ -30,7 +41,8 @@ use tracing::{debug, info, warn};
 #[cfg(not(unix))]
 use super::pi_client::ConnectPolicy;
 use super::pi_client::{PiClient, DEFAULT_REQUEST_TIMEOUT};
-use super::protocol::Command;
+use super::protocol::{Command, StdioResult};
+use super::transcript;
 
 /// Candidate binaries, in resolution order, when `[subagent].command` is unset.
 const PI_BINARY_CANDIDATES: [&str; 2] = ["pi", "prime-agent"];
@@ -44,6 +56,15 @@ pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const SIGKILL_GRACE: Duration = Duration::from_secs(2);
 /// Time allowed for a wrong-version daemon to vacate the socket.
 const REPLACE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a fresh child gets to *create* the socket file before Portal
+/// decides this pi has no daemon mode at all. Well under [`STARTUP_TIMEOUT`],
+/// which stays the budget for a daemon that exists but is still warming up.
+#[cfg(unix)]
+const STDIO_FALLBACK_PROBE: Duration = Duration::from_secs(5);
+/// Grace between SIGTERM and SIGKILL for a timed-out stdio task.
+const STDIO_KILL_GRACE: Duration = Duration::from_secs(2);
+/// Stderr kept from a stdio task, to explain a failure without the log file.
+const STDIO_STDERR_TAIL_BYTES: usize = 4096;
 /// daemon.log is truncated once it passes this size.
 const DAEMON_LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
 /// Tail of daemon.log quoted in startup failures.
@@ -66,6 +87,42 @@ pub struct PiDaemonConfig {
     pub env_passthrough: Vec<String>,
 }
 
+/// How Portal talks to pi.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TransportMode {
+    /// One long-lived `pi --mode daemon` child, one session per session key.
+    #[default]
+    Daemon,
+    /// One `pi --print --mode json` process per task. The fallback for pi
+    /// builds without a daemon mode; no session reuse, no steering.
+    Stdio,
+}
+
+impl TransportMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TransportMode::Daemon => "daemon",
+            TransportMode::Stdio => "stdio",
+        }
+    }
+}
+
+/// What [`PiDaemon::ensure_transport`] resolved to for this Portal run.
+pub enum Transport {
+    Daemon(Arc<PiClient>),
+    Stdio,
+}
+
+impl Transport {
+    #[allow(dead_code)] // read by tests and by future status surfaces
+    pub fn mode(&self) -> TransportMode {
+        match self {
+            Transport::Daemon(_) => TransportMode::Daemon,
+            Transport::Stdio => TransportMode::Stdio,
+        }
+    }
+}
+
 /// Snapshot for `portal_subagent_status` / `portal_status`. Paths and versions
 /// only — never credentials (PRD §8 acceptance).
 #[derive(Debug, Clone, Default)]
@@ -76,6 +133,7 @@ pub struct DaemonHealth {
     pub app_version: Option<String>,
     pub adopted: bool,
     pub socket: Option<String>,
+    pub transport: TransportMode,
 }
 
 impl DaemonHealth {
@@ -87,6 +145,7 @@ impl DaemonHealth {
             "app_version": self.app_version,
             "adopted": self.adopted,
             "socket": self.socket,
+            "transport": self.transport.as_str(),
         })
     }
 }
@@ -100,6 +159,8 @@ struct DaemonState {
     client: Option<Arc<PiClient>>,
     adopted: bool,
     pid: Option<u32>,
+    /// Latched to `Stdio` by a failed daemon start; never latched back.
+    mode: TransportMode,
 }
 
 pub struct PiDaemon {
@@ -200,12 +261,48 @@ impl PiDaemon {
             app_version: hello.and_then(|h| h.app_version),
             adopted: state.adopted,
             socket: Some(self.socket_path().display().to_string()),
+            transport: state.mode,
+        }
+    }
+
+    /// Which transport this Portal run settled on. `Daemon` until a start
+    /// actually fails the daemon way.
+    pub async fn transport_mode(&self) -> TransportMode {
+        self.state.lock().await.mode
+    }
+
+    /// Idempotent: the transport to run the next task over. Falls back to the
+    /// per-task stdio mode — permanently, for this process — the first time a
+    /// daemon start shows that this pi has no daemon mode.
+    pub async fn ensure_transport(&self) -> Result<Transport> {
+        if self.transport_mode().await == TransportMode::Stdio {
+            return Ok(Transport::Stdio);
+        }
+        match self.ensure_running().await {
+            Ok(client) => Ok(Transport::Daemon(client)),
+            // `await_socket_ready` latches the mode when the failure *was*
+            // "this pi has no daemon mode"; any other failure is still one.
+            Err(e) if self.transport_mode().await == TransportMode::Stdio => {
+                warn!(
+                    "pi has no usable daemon mode ({e:#}); falling back to one \
+                     `pi --print --mode json` process per task"
+                );
+                Ok(Transport::Stdio)
+            }
+            Err(e) => Err(e),
         }
     }
 
     /// Idempotent: returns a live client, starting or adopting a daemon if needed.
     pub async fn ensure_running(&self) -> Result<Arc<PiClient>> {
         let mut state = self.state.lock().await;
+
+        if state.mode == TransportMode::Stdio {
+            anyhow::bail!(
+                "this pi has no daemon mode; the sub-agent is running tasks over the \
+                 per-task stdio transport"
+            );
+        }
 
         if let Some(client) = state.client.as_ref().filter(|c| c.is_connected()) {
             return Ok(Arc::clone(client));
@@ -350,17 +447,27 @@ impl PiDaemon {
 
     /// Readiness loop: connect + hello every 100 ms for up to 30 s, aborting
     /// early (with the log tail) if the child dies first.
+    ///
+    /// Two shapes of failure mean "this pi cannot daemonise" rather than
+    /// "this start went wrong", and both latch [`TransportMode::Stdio`]: the
+    /// child exiting during startup (pi 0.73.1 prints `Unknown option:
+    /// --daemon-socket` and exits 1), and no socket file existing at all
+    /// after [`STDIO_FALLBACK_PROBE`]. A socket that exists but does not
+    /// answer yet is a slow daemon, not a missing one, so it keeps the full
+    /// [`STARTUP_TIMEOUT`].
     #[cfg(unix)]
     async fn await_socket_ready(
         &self,
         state: &mut DaemonState,
         socket: &Path,
     ) -> Result<Arc<PiClient>> {
-        let deadline = time::Instant::now() + STARTUP_TIMEOUT;
+        let started = time::Instant::now();
+        let deadline = started + STARTUP_TIMEOUT;
         let mut last_err;
         loop {
             if let Some(child) = state.child.as_mut() {
                 if let Ok(Some(status)) = child.try_wait() {
+                    state.mode = TransportMode::Stdio;
                     anyhow::bail!(
                         "pi daemon exited during startup ({status}){}",
                         self.log_tail_suffix()
@@ -371,6 +478,15 @@ impl PiDaemon {
             match PiClient::connect_unix(socket).await {
                 Ok(client) => return Ok(client),
                 Err(e) => last_err = format!("{e:#}"),
+            }
+
+            if !socket.exists() && started.elapsed() >= STDIO_FALLBACK_PROBE {
+                state.mode = TransportMode::Stdio;
+                anyhow::bail!(
+                    "pi never created the daemon socket {} within {STDIO_FALLBACK_PROBE:?}{}",
+                    socket.display(),
+                    self.log_tail_suffix()
+                );
             }
 
             if time::Instant::now() >= deadline {
@@ -444,6 +560,117 @@ impl PiDaemon {
         state.pid = None;
     }
 
+    // ── per-task stdio transport ────────────────────────────────────
+
+    /// Run one task as its own `pi --print --mode json` process.
+    ///
+    /// This is the whole of the stdio fallback: no daemon, no session reuse,
+    /// no steering. The prompt goes in as a positional message (`--print` is
+    /// a flag, not an option that takes one), pi's JSONL lands on stdout and
+    /// is folded into a [`StdioResult`] as it streams, and its human-readable
+    /// noise on stderr is appended to the same `daemon.log`.
+    ///
+    /// Cancellation is by drop: the child is `kill_on_drop`, so aborting the
+    /// future kills pi. The only deadline enforced here is `task.timeout` —
+    /// turn and token budgets have no CLI equivalent.
+    pub async fn run_stdio_task(&self, task: StdioTask) -> Result<StdioRun> {
+        let argv = &self.config.command;
+        if argv.is_empty() {
+            anyhow::bail!("no pi command configured; set [subagent].command in portal.toml");
+        }
+        self.prepare_dirs()?;
+
+        let mut cmd = TokioCommand::new(&argv[0]);
+        cmd.args(&argv[1..]);
+        cmd.args(["--print", "--mode", "json"]);
+        if let Some(provider) = task.provider.as_deref() {
+            cmd.args(["--provider", provider]);
+        }
+        if let Some(model) = task.model.as_deref() {
+            cmd.args(["--model", model]);
+        }
+        if let Some(thinking) = task.thinking.as_deref() {
+            cmd.args(["--thinking", thinking]);
+        }
+        if let Some(key) = task.api_key.as_deref() {
+            cmd.args(["--api-key", key]);
+        }
+        cmd.arg(&task.prompt);
+
+        cmd.env_clear();
+        for key in &self.config.env_passthrough {
+            if let Some(val) = std::env::var_os(key) {
+                cmd.env(key, val);
+            }
+        }
+        cmd.env("PRIME_AGENT_CODING_AGENT_DIR", self.agent_dir())
+            .env("PRIME_AGENT_SESSION_DIR", self.sessions_dir())
+            .env("PRIME_AGENT_HEADLESS", "1")
+            .current_dir(&task.workdir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("spawning a pi task: {}", argv.join(" ")))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("pi stdout was not piped"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("pi stderr was not piped"))?;
+
+        debug!(
+            "running a pi task (pid {:?}) in {}",
+            child.id(),
+            task.workdir.display()
+        );
+
+        let stdout_reader = tokio::spawn(fold_stdout(stdout, task.transcript.clone()));
+        let stderr_reader = tokio::spawn(read_stderr_tail(stderr, STDIO_STDERR_TAIL_BYTES));
+
+        let (exit_code, timed_out) = match time::timeout(task.timeout, child.wait()).await {
+            Ok(Ok(status)) => (status.code(), false),
+            Ok(Err(e)) => {
+                warn!("waiting for the pi task failed: {e}");
+                (None, false)
+            }
+            Err(_) => {
+                warn!("pi task exceeded {:?}; terminating", task.timeout);
+                let _ = child.start_kill();
+                let _ = time::timeout(STDIO_KILL_GRACE, child.wait()).await;
+                (None, true)
+            }
+        };
+
+        // The readers end at EOF, which the exit above guarantees — but a
+        // grandchild holding the pipe open must not hang the task forever.
+        let result = time::timeout(STDIO_KILL_GRACE, stdout_reader)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default();
+        let stderr_tail = time::timeout(STDIO_KILL_GRACE, stderr_reader)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default();
+        if !stderr_tail.is_empty() {
+            append_log(&self.log_path(), &stderr_tail);
+        }
+
+        Ok(StdioRun {
+            result,
+            exit_code,
+            timed_out,
+            stderr_tail,
+        })
+    }
+
     /// `" (daemon.log tail: …)"`, or empty when there is nothing to show.
     fn log_tail_suffix(&self) -> String {
         match read_log_tail(&self.log_path(), DAEMON_LOG_TAIL_BYTES) {
@@ -478,6 +705,133 @@ impl PiDaemon {
             .find_map(|name| find_on_path(name))
             .map(|p| vec![p.display().to_string()])
     }
+}
+
+/// One task to run as its own pi process ([`PiDaemon::run_stdio_task`]).
+#[derive(Debug, Clone)]
+pub struct StdioTask {
+    /// The full prompt, exactly as a daemon session would have received it.
+    pub prompt: String,
+    /// cwd for the process; the sub-agent's working directory.
+    pub workdir: PathBuf,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    /// Passed as `--api-key`. A daemon inherits keys from the environment
+    /// instead, which is why this is only needed here.
+    pub api_key: Option<String>,
+    pub thinking: Option<String>,
+    /// Wall clock for the whole run; past it pi is terminated.
+    pub timeout: Duration,
+    /// Rendered transcript lines, pushed as pi emits them. The run dropping
+    /// the sender is the reader's signal that the task is over.
+    pub transcript: Option<mpsc::UnboundedSender<String>>,
+}
+
+/// What one `pi --print --mode json` run produced.
+#[derive(Debug, Clone)]
+pub struct StdioRun {
+    pub result: StdioResult,
+    /// `None` when pi was killed (timeout) or never reported a code.
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+    /// Tail of pi's stderr, for explaining a failure in the callback.
+    pub stderr_tail: String,
+}
+
+impl StdioRun {
+    /// Why this run should be reported as a failure, if it should. A non-zero
+    /// exit with a clean JSON stream still counts: pi said it went wrong.
+    pub fn error(&self) -> Option<String> {
+        if let Some(message) = self.result.error_message.clone() {
+            return Some(message);
+        }
+        if self.result.failed() {
+            return Some(format!(
+                "pi stopped with '{}'",
+                self.result.stop_reason.as_deref().unwrap_or("error")
+            ));
+        }
+        match self.exit_code {
+            Some(0) => None,
+            // A kill is the caller's own doing; it reports the timeout itself.
+            _ if self.timed_out => None,
+            Some(code) => Some(match self.stderr_tail.is_empty() {
+                true => format!("pi exited {code}"),
+                false => format!("pi exited {code}: {}", last_line(&self.stderr_tail)),
+            }),
+            None => Some(match self.stderr_tail.is_empty() {
+                true => "pi exited without a status".to_string(),
+                false => format!("pi exited without a status: {}", last_line(&self.stderr_tail)),
+            }),
+        }
+    }
+}
+
+/// Fold pi's stdout JSONL, mirroring anything worth showing into the
+/// transcript as it arrives so `portal_subagent_log` still works.
+async fn fold_stdout(
+    stdout: tokio::process::ChildStdout,
+    transcript: Option<mpsc::UnboundedSender<String>>,
+) -> StdioResult {
+    let mut result = StdioResult::default();
+    let mut lines = BufReader::new(stdout).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        result.fold_line(&line);
+        if let Some(tx) = transcript.as_ref() {
+            if let Some(rendered) = render_stdio_line(&line) {
+                let _ = tx.send(rendered);
+            }
+        }
+    }
+    result
+}
+
+/// pi's `--mode json` lines are shaped like daemon session events, so the
+/// transcript renderer works on them verbatim.
+fn render_stdio_line(line: &str) -> Option<String> {
+    let body = serde_json::from_str(line.trim()).ok()?;
+    transcript::render(&body)
+}
+
+/// Last `max` bytes of a child's stderr.
+async fn read_stderr_tail(mut stderr: tokio::process::ChildStderr, max: usize) -> String {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = match stderr.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.len() > max * 2 {
+            buf.drain(..buf.len() - max);
+        }
+    }
+    if buf.len() > max {
+        buf.drain(..buf.len() - max);
+    }
+    String::from_utf8_lossy(&buf).trim().to_string()
+}
+
+fn append_log(path: &Path, text: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(f, "{text}");
+    }
+}
+
+/// The last non-blank line — where a CLI usually puts the actual complaint.
+fn last_line(text: &str) -> String {
+    text.lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim()
+        .to_string()
 }
 
 /// Copy the daemon's stderr into `<state>/pi/daemon.log`, truncating at 5 MiB.
@@ -729,4 +1083,231 @@ mod tests {
         d.shutdown(Duration::from_millis(50)).await;
         assert!(!d.health().await.running);
     }
+
+    // ── stdio fallback ──────────────────────────────────────────────
+
+    /// A stand-in pi that behaves like 0.73.1: no daemon mode at all, but a
+    /// working `--print --mode json`. Every invocation appends its argv and
+    /// cwd to `<root>/argv.log`.
+    #[cfg(unix)]
+    fn fake_pi(root: &Path) -> PathBuf {
+        fake_pi_with(root, "")
+    }
+
+    /// As [`fake_pi`], with `extra` shell run before the JSON is printed.
+    #[cfg(unix)]
+    fn fake_pi_with(root: &Path, extra: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let log = root.join("argv.log");
+        let path = root.join("fake-pi");
+        let script = format!(
+            r###"#!/bin/sh
+echo "argv: $* | cwd: $(pwd)" >> '{log}'
+case "$*" in
+  *--daemon-socket*) echo 'Error: Unknown option: --daemon-socket' >&2; exit 1 ;;
+esac
+{extra}
+cat <<'JSON'
+{{"type":"session","version":3,"id":"fake-1","cwd":"."}}
+{{"type":"agent_start"}}
+{{"type":"message_end","message":{{"role":"assistant","content":[{{"type":"text","text":"## Result\nthe fake pi did the work."}}],"usage":{{"input":11,"output":7}},"stopReason":"stop"}}}}
+{{"type":"turn_end"}}
+{{"type":"agent_end","messages":[]}}
+JSON
+"###,
+            log = log.display(),
+        );
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn argv_log(root: &Path) -> String {
+        std::fs::read_to_string(root.join("argv.log")).unwrap_or_default()
+    }
+
+    #[cfg(unix)]
+    fn daemon_running(root: &Path, command: Vec<String>) -> PiDaemon {
+        PiDaemon::new(PiDaemonConfig {
+            command,
+            state_dir: root.join("subagent"),
+            workspace_root: root.to_path_buf(),
+            env_passthrough: vec!["PATH".to_string(), "HOME".to_string()],
+        })
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pi_without_daemon_mode_falls_back_to_the_stdio_transport() {
+        let root = temp_dir("fallback");
+        let pi = fake_pi(&root);
+        let d = daemon_running(&root, vec![pi.display().to_string()]);
+
+        assert_eq!(d.transport_mode().await, TransportMode::Daemon, "daemon first");
+
+        let transport = d.ensure_transport().await.unwrap();
+        assert_eq!(transport.mode(), TransportMode::Stdio);
+        assert_eq!(d.transport_mode().await, TransportMode::Stdio);
+        assert!(
+            argv_log(&root).contains("--daemon-socket"),
+            "the daemon way must be tried before it is written off"
+        );
+
+        // The decision is cached: a pi that cannot daemonise will not learn
+        // to, and a doomed spawn per task is pure latency.
+        let again = d.ensure_transport().await.unwrap();
+        assert_eq!(again.mode(), TransportMode::Stdio);
+        assert_eq!(
+            argv_log(&root).matches("--daemon-socket").count(),
+            1,
+            "daemon mode must not be retried"
+        );
+
+        // The daemon-only entry point now says why, rather than respawning.
+        let err = match d.ensure_running().await {
+            Ok(_) => panic!("a pi with no daemon mode must not hand back a client"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(err.contains("no daemon mode"), "{err}");
+        assert_eq!(d.health().await.to_json()["transport"], "stdio");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stdio_task_runs_a_fresh_pi_and_reports_its_result() {
+        let root = temp_dir("stdiorun");
+        let pi = fake_pi(&root);
+        let d = daemon_running(&root, vec![pi.display().to_string()]);
+        let workdir = root.join("work");
+        std::fs::create_dir_all(&workdir).unwrap();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let run = d
+            .run_stdio_task(StdioTask {
+                prompt: "# Task sub_1\nrefactor the thing".to_string(),
+                workdir: workdir.clone(),
+                provider: Some("openrouter".to_string()),
+                model: Some("deepseek/deepseek-chat-v4-0324".to_string()),
+                api_key: Some("sk-or-test".to_string()),
+                thinking: None,
+                timeout: Duration::from_secs(30),
+                transcript: Some(tx),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(run.exit_code, Some(0));
+        assert!(!run.timed_out);
+        assert_eq!(run.error(), None);
+        assert_eq!(
+            run.result.last_assistant_text.as_deref(),
+            Some("## Result\nthe fake pi did the work.")
+        );
+        assert_eq!(run.result.turns, 1);
+        assert_eq!(run.result.usage.total, 18);
+
+        let argv = argv_log(&root);
+        assert!(argv.contains("--print --mode json"), "{argv}");
+        assert!(argv.contains("--provider openrouter"), "{argv}");
+        assert!(argv.contains("--model deepseek/deepseek-chat-v4-0324"), "{argv}");
+        assert!(argv.contains("--api-key sk-or-test"), "{argv}");
+        assert!(argv.contains("refactor the thing"), "the prompt is the last argument: {argv}");
+        // `pwd` resolves /tmp → /private/tmp on macOS, so compare realpaths.
+        let real_workdir = workdir.canonicalize().unwrap();
+        assert!(
+            argv.contains(&format!("cwd: {}", real_workdir.display())),
+            "the task runs in its own workdir: {argv}"
+        );
+
+        // Progress was mirrored while it ran, not only at the end.
+        drop(d);
+        let mut lines = Vec::new();
+        while let Ok(line) = rx.try_recv() {
+            lines.push(line);
+        }
+        assert!(
+            lines.iter().any(|l| l.contains("the fake pi did the work")),
+            "{lines:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stdio_task_that_overruns_its_budget_is_killed() {
+        let root = temp_dir("stdiokill");
+        let pi = fake_pi_with(&root, "sleep 30");
+        let d = daemon_running(&root, vec![pi.display().to_string()]);
+
+        let started = time::Instant::now();
+        let run = d
+            .run_stdio_task(StdioTask {
+                prompt: "take too long".to_string(),
+                workdir: root.clone(),
+                provider: None,
+                model: None,
+                api_key: None,
+                thinking: None,
+                timeout: Duration::from_millis(300),
+                transcript: None,
+            })
+            .await
+            .unwrap();
+
+        assert!(run.timed_out);
+        assert_eq!(run.exit_code, None);
+        assert_eq!(run.error(), None, "the timeout is the caller's to report");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "a timed-out task must not wait for the child to finish on its own"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failing_stdio_task_explains_itself_from_stderr() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_dir("stdiofail");
+        let pi = root.join("broken-pi");
+        std::fs::write(
+            &pi,
+            "#!/bin/sh\necho 'pi: no provider configured' >&2\nexit 2\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&pi, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let d = daemon_running(&root, vec![pi.display().to_string()]);
+
+        let run = d
+            .run_stdio_task(StdioTask {
+                prompt: "anything".to_string(),
+                workdir: root.clone(),
+                provider: None,
+                model: None,
+                api_key: None,
+                thinking: None,
+                timeout: Duration::from_secs(10),
+                transcript: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(run.exit_code, Some(2));
+        let error = run.error().unwrap();
+        assert!(error.contains("no provider configured"), "{error}");
+        assert!(
+            read_log_tail(&d.log_path(), 4096)
+                .unwrap_or_default()
+                .contains("no provider configured"),
+            "stderr belongs in daemon.log too"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
+

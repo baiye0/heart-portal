@@ -569,6 +569,166 @@ impl PromptComplete {
     }
 }
 
+// ── per-task stdio transport ────────────────────────────────────────
+
+/// Result of one `pi --print --mode json` run, folded out of its stdout.
+///
+/// Not every pi has a daemon mode (0.73.1 has no `--daemon-socket`), so
+/// Portal falls back to one pi process per task. That process speaks a
+/// simpler, one-way dialect than the daemon: a JSON object per stdout line,
+/// discriminated by `type`, ending in `agent_end`.
+///
+/// ```text
+/// {"type":"session","id":"b13…","cwd":"/work"}
+/// {"type":"agent_start"}
+/// {"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"…"}],
+///                                  "usage":{"input":12,"output":7,"totalTokens":19,"cost":{"total":0.002}},
+///                                  "stopReason":"stop"}}
+/// {"type":"turn_end","message":{…}}
+/// {"type":"agent_end","messages":[…]}
+/// ```
+///
+/// Anything unparseable is skipped rather than failing the task: pi prints
+/// the odd non-JSON line (update notices, warnings) and a task that actually
+/// did the work must not be reported as failed over a stray line.
+#[derive(Debug, Clone, Default)]
+pub struct StdioResult {
+    pub last_assistant_text: Option<String>,
+    pub stop_reason: Option<String>,
+    pub error_message: Option<String>,
+    pub usage: Usage,
+    pub turns: u32,
+    /// pi's own session id for the run, for cross-referencing its session file.
+    pub session_id: Option<String>,
+}
+
+impl StdioResult {
+    /// Fold a whole stdout capture. The runtime folds line by line as pi
+    /// streams; this is the same thing for a capture you already have.
+    #[allow(dead_code)]
+    pub fn parse(stdout: &str) -> Self {
+        let mut out = Self::default();
+        for line in stdout.lines() {
+            out.fold_line(line);
+        }
+        out
+    }
+
+    /// Fold one line, so a long run can be accounted for as it streams.
+    pub fn fold_line(&mut self, line: &str) {
+        let line = line.trim();
+        if !line.starts_with('{') {
+            return;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            return;
+        };
+        match v.get("type").and_then(|t| t.as_str()).unwrap_or_default() {
+            "session" => {
+                self.session_id = v.get("id").and_then(|i| i.as_str()).map(str::to_string);
+            }
+            "message_end" => {
+                if let Some(message) = v.get("message") {
+                    self.fold_message(message, true);
+                }
+            }
+            "turn_end" => self.turns = self.turns.saturating_add(1),
+            "agent_end" => {
+                // Belt and braces: a pi that emits no per-message events (or a
+                // capture we joined late) still carries everything here.
+                if self.last_assistant_text.is_none() {
+                    let count_usage = self.usage.total == 0;
+                    if let Some(messages) = v.get("messages").and_then(|m| m.as_array()) {
+                        for message in messages {
+                            self.fold_message(message, count_usage);
+                        }
+                    }
+                }
+            }
+            "error" => {
+                if let Some(msg) = ["message", "error", "errorMessage"]
+                    .iter()
+                    .find_map(|k| v.get(*k).and_then(|x| x.as_str()))
+                {
+                    self.error_message = Some(msg.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Accumulate one message. Usage is summed across assistant messages
+    /// because pi reports it per request, not per run.
+    fn fold_message(&mut self, message: &Value, count_usage: bool) {
+        if message.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+            return;
+        }
+        if let Some(text) = assistant_text(message) {
+            self.last_assistant_text = Some(text);
+        }
+        if let Some(reason) = message.get("stopReason").and_then(|r| r.as_str()) {
+            self.stop_reason = Some(reason.to_string());
+        }
+        if let Some(error) = ["errorMessage", "error_message"]
+            .iter()
+            .find_map(|k| message.get(*k).and_then(|x| x.as_str()))
+        {
+            self.error_message = Some(error.to_string());
+        }
+        if count_usage {
+            if let Some(usage) = message.get("usage") {
+                self.add_usage(usage);
+            }
+        }
+    }
+
+    fn add_usage(&mut self, usage: &Value) {
+        let one = Usage::from_value(usage);
+        self.usage.input = self.usage.input.saturating_add(one.input);
+        self.usage.output = self.usage.output.saturating_add(one.output);
+        self.usage.total = self.usage.total.saturating_add(one.total);
+        // pi nests the price under `cost.total`; flat shapes are handled by
+        // `Usage::from_value` itself.
+        let cost = one.cost_usd.or_else(|| {
+            usage
+                .get("cost")
+                .and_then(|c| c.get("total"))
+                .and_then(|t| t.as_f64())
+        });
+        if let Some(cost) = cost {
+            self.usage.cost_usd = Some(self.usage.cost_usd.unwrap_or(0.0) + cost);
+        }
+    }
+
+    /// pi reported an error rather than a finished task.
+    pub fn failed(&self) -> bool {
+        self.error_message.is_some()
+            || matches!(self.stop_reason.as_deref(), Some("error") | Some("aborted"))
+    }
+}
+
+/// The text blocks of an assistant message, joined. `None` for anyone else's
+/// message (pi echoes the user's own prompt back as an event) and `None` when
+/// the assistant said nothing, so a tool-only turn cannot overwrite a real
+/// answer.
+pub(super) fn assistant_text(message: &Value) -> Option<String> {
+    if message.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+        return None;
+    }
+    let content = message.get("content")?;
+    let text = match content {
+        Value::String(s) => s.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => return None,
+    };
+    (!text.trim().is_empty()).then_some(text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -757,5 +917,77 @@ mod tests {
             ..Default::default()
         };
         assert!(reason.budget_exhausted(0, 0));
+    }
+
+    /// Verbatim shape of `pi --print --mode json`, trimmed of the bulk.
+    const STDIO_STREAM: &str = r###"
+{"type":"session","version":3,"id":"b13175af","timestamp":"2026-09-17T06:20:33.970Z","cwd":"/work"}
+{"type":"agent_start"}
+{"type":"turn_start"}
+{"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"do the thing"}]}}
+{"type":"message_end","message":{"role":"user","content":[{"type":"text","text":"do the thing"}]}}
+{"type":"message_end","message":{"role":"assistant","content":[{"type":"thinking","thinking":"hmm"},{"type":"text","text":"## Result\nDid the thing."}],"provider":"openrouter","usage":{"input":120,"output":40,"totalTokens":160,"cost":{"input":0.001,"output":0.002,"total":0.003}},"stopReason":"stop"}}
+{"type":"turn_end","message":{"role":"assistant","content":[]},"toolResults":[]}
+{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"## Result\nDid the thing."}]}]}
+"###;
+
+    #[test]
+    fn stdio_json_lines_fold_into_one_result() {
+        let r = StdioResult::parse(STDIO_STREAM);
+        assert_eq!(
+            r.last_assistant_text.as_deref(),
+            Some("## Result\nDid the thing.")
+        );
+        assert_eq!(r.session_id.as_deref(), Some("b13175af"));
+        assert_eq!(r.turns, 1);
+        assert_eq!((r.usage.input, r.usage.output, r.usage.total), (120, 40, 160));
+        assert_eq!(r.usage.cost_usd, Some(0.003), "cost is nested under cost.total");
+        assert_eq!(r.stop_reason.as_deref(), Some("stop"));
+        assert!(!r.failed());
+    }
+
+    #[test]
+    fn stdio_usage_sums_across_turns_and_ignores_noise() {
+        let stream = "\
+pi: a new version is available\n\
+{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"one\"}],\"usage\":{\"input\":10,\"output\":5}}}\n\
+{ not json at all\n\
+{\"type\":\"turn_end\"}\n\
+{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[],\"usage\":{\"input\":20,\"output\":7}}}\n\
+{\"type\":\"turn_end\"}\n";
+        let r = StdioResult::parse(stream);
+        assert_eq!(r.turns, 2);
+        assert_eq!(r.usage.total, 42, "usage is per request, so it must be summed");
+        assert_eq!(
+            r.last_assistant_text.as_deref(),
+            Some("one"),
+            "a silent tool-only turn must not erase the last real answer"
+        );
+    }
+
+    #[test]
+    fn a_stdio_run_that_errored_is_reported_as_failed() {
+        let stream = r#"{"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"401 User not found."}}"#;
+        let r = StdioResult::parse(stream);
+        assert!(r.failed());
+        assert_eq!(r.error_message.as_deref(), Some("401 User not found."));
+        assert!(r.last_assistant_text.is_none());
+
+        // A bare error line (no message envelope) counts too.
+        let bare = StdioResult::parse(r#"{"type":"error","message":"no provider configured"}"#);
+        assert!(bare.failed());
+        assert_eq!(bare.error_message.as_deref(), Some("no provider configured"));
+
+        assert!(!StdioResult::parse("").failed());
+    }
+
+    #[test]
+    fn agent_end_alone_still_yields_the_result() {
+        // Some builds only emit the final envelope; Portal must not lose the
+        // answer just because it saw no per-message events.
+        let stream = r#"{"type":"agent_end","messages":[{"role":"user","content":[{"type":"text","text":"go"}]},{"role":"assistant","content":[{"type":"text","text":"done"}],"usage":{"input":3,"output":4}}]}"#;
+        let r = StdioResult::parse(stream);
+        assert_eq!(r.last_assistant_text.as_deref(), Some("done"));
+        assert_eq!(r.usage.total, 7);
     }
 }

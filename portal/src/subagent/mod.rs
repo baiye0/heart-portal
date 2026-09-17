@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
-use tokio::sync::{Mutex as AsyncMutex, Semaphore};
+use tokio::sync::{mpsc, Mutex as AsyncMutex, Semaphore};
 use tokio::time;
 use tracing::{debug, info, warn};
 
@@ -42,7 +42,9 @@ use crate::heart_callback::{
 
 use ledger::{Ledger, LedgerCallbackState, LedgerTaskStatus, TaskRecord};
 use pi_client::{PiClient, DEFAULT_REQUEST_TIMEOUT};
-use pi_daemon::{PiDaemon, PiDaemonConfig, SHUTDOWN_GRACE};
+use pi_daemon::{
+    PiDaemon, PiDaemonConfig, StdioRun, StdioTask, Transport, TransportMode, SHUTDOWN_GRACE,
+};
 use protocol::{
     AutonomousConfig, AutonomousStatus, Command, DaemonMessage, PromptComplete, PromptRequest,
     SessionRuntimeConfig, SessionSummary, Usage, CAP_SESSION_INPUT_ADMISSION, LIFECYCLE_RESIDENT,
@@ -69,6 +71,17 @@ const PARTIAL_RESULT_BYTES: usize = 8 * 1024;
 const RESULT_HEAD_BYTES: usize = 2 * 1024;
 /// Default page size for `portal_subagent_log`.
 pub const DEFAULT_LOG_LIMIT: usize = 64 * 1024;
+/// How often a stdio task checks whether it has been cancelled. There is no
+/// socket to abort over: cancelling means killing the process.
+const STDIO_CANCEL_POLL: Duration = Duration::from_millis(250);
+/// Synthetic `active_session_id` for a stdio session. Nothing is loaded in a
+/// daemon behind it, but the rest of the manager — status, busy tracking,
+/// unload — is written against one.
+const STDIO_SESSION_PREFIX: &str = "stdio:";
+/// Why the session-level controls are unavailable in stdio mode.
+const STDIO_NO_SESSION: &str = "this pi has no daemon mode, so each task runs as its own \
+     process: there is no live session to steer into. Cancel the task (which kills the \
+     process) or spawn a new one with a fuller brief.";
 
 /// The contract every sub-agent session is created with (PRD §7.1). It exists
 /// because the sub-agent cannot ask questions: it must decide, state its
@@ -279,6 +292,18 @@ impl SpawnReceipt {
     }
 }
 
+/// The model the task will run on: `[subagent.model]` with the per-task
+/// overrides applied. Carried separately from [`TaskState`] because only the
+/// stdio transport needs it — a daemon session is *created* with it instead.
+#[derive(Debug, Clone, Default)]
+struct ModelChoice {
+    provider: Option<String>,
+    model: Option<String>,
+    thinking: Option<String>,
+    /// Never logged, never in a status payload.
+    api_key: Option<String>,
+}
+
 /// Outcome of one run, before it becomes a callback.
 #[derive(Debug, Clone, Default)]
 struct TaskOutcome {
@@ -411,17 +436,23 @@ impl SubagentManager {
 
     // ── daemon / client ─────────────────────────────────────────────
 
-    /// A connected client, starting or adopting the daemon if needed. Also
+    /// The transport for the next task: a connected daemon client, or the
+    /// per-task stdio fallback when this pi has no daemon mode. Also
     /// (re)starts the event pump when the client generation changes.
-    async fn client(self: &Arc<Self>) -> Result<Arc<PiClient>> {
+    async fn transport(self: &Arc<Self>) -> Result<Transport> {
         self.ensure_available()?;
-        // `ensure_running` would start a fresh pi daemon; during shutdown that
-        // resurrects the very process we are tearing down (and outlives us).
+        // `ensure_transport` would start a fresh pi daemon; during shutdown
+        // that resurrects the very process we are tearing down (and outlives
+        // us).
         if self.shutting_down.load(Ordering::SeqCst) {
             anyhow::bail!("Portal is shutting down; the pi daemon will not be started again");
         }
-        let client = self.daemon.ensure_running().await?;
+        let transport = self.daemon.ensure_transport().await?;
         *self.last_activity.lock().await = time::Instant::now();
+
+        let Transport::Daemon(client) = &transport else {
+            return Ok(transport);
+        };
 
         if !client.hello().supports(CAP_SESSION_INPUT_ADMISSION)
             && !client.hello().server_capabilities.is_empty()
@@ -435,12 +466,35 @@ impl SubagentManager {
         let mut pump = self.pump_generation.lock().await;
         let same = pump
             .as_ref()
-            .is_some_and(|c| Arc::ptr_eq(c, &client) && c.is_connected());
+            .is_some_and(|c| Arc::ptr_eq(c, client) && c.is_connected());
         if !same {
-            *pump = Some(Arc::clone(&client));
-            self.spawn_event_pump(Arc::clone(&client));
+            *pump = Some(Arc::clone(client));
+            self.spawn_event_pump(Arc::clone(client));
         }
-        Ok(client)
+        Ok(transport)
+    }
+
+    /// A connected client. The session-level controls (steer, abort,
+    /// recovery) only exist in daemon mode, so they say so rather than
+    /// pretending.
+    async fn client(self: &Arc<Self>) -> Result<Arc<PiClient>> {
+        match self.transport().await? {
+            Transport::Daemon(client) => Ok(client),
+            Transport::Stdio => anyhow::bail!("{STDIO_NO_SESSION}"),
+        }
+    }
+
+    /// `[subagent.model]` with this task's overrides applied.
+    fn model_choice(&self, req: &SpawnRequest) -> ModelChoice {
+        ModelChoice {
+            provider: self.config.model.provider.clone(),
+            model: req.model.clone().or_else(|| self.config.model.model.clone()),
+            thinking: req
+                .thinking
+                .clone()
+                .or_else(|| self.config.model.thinking.clone()),
+            api_key: self.config.model.api_key.clone(),
+        }
     }
 
     /// Start the daemon ahead of the first task (`[subagent].eager`).
@@ -448,11 +502,14 @@ impl SubagentManager {
         if !self.wants_eager_start() {
             return;
         }
-        match self.client().await {
-            Ok(client) => info!(
+        match self.transport().await {
+            Ok(Transport::Daemon(client)) => info!(
                 "pi daemon warm ({})",
                 client.hello().app_version.as_deref().unwrap_or("unknown version")
             ),
+            Ok(Transport::Stdio) => {
+                info!("pi has no daemon mode; each task will run as its own pi process")
+            }
             Err(e) => warn!("eager pi daemon start failed: {e:#}"),
         }
     }
@@ -592,9 +649,9 @@ impl SubagentManager {
                 )
             })?;
 
-        let client = self.client().await?;
+        let transport = self.transport().await?;
         let (session, resumed) = self
-            .ensure_session(&client, &key, &workdir, &req)
+            .ensure_session(&transport, &key, &workdir, &req)
             .await?;
 
         // Claim the session under one lock hold: checking `busy_task` and then
@@ -642,11 +699,18 @@ impl SubagentManager {
         let manager = Arc::clone(self);
         let run_task = Arc::clone(&task);
         let run_session = Arc::clone(&session);
-        let run_client = Arc::clone(&client);
+        let choice = self.model_choice(&req);
         let message = render_prompt(&task, &brief);
         tokio::spawn(async move {
             manager
-                .run_task(run_client, run_session, run_task, active_session_id, message)
+                .run_task(
+                    transport,
+                    run_session,
+                    run_task,
+                    active_session_id,
+                    message,
+                    choice,
+                )
                 .await;
             drop(permit);
         });
@@ -719,7 +783,7 @@ impl SubagentManager {
     /// Get or create the pi session for `key`, resuming its file if we have one.
     async fn ensure_session(
         self: &Arc<Self>,
-        client: &Arc<PiClient>,
+        transport: &Transport,
         key: &str,
         workdir: &Path,
         req: &SpawnRequest,
@@ -739,7 +803,7 @@ impl SubagentManager {
             if session.inner.lock().await.active_session_id.is_some() {
                 return Ok((session, true));
             }
-            let resumed = self.open_pi_session(client, &session, req).await?;
+            let resumed = self.open_pi_session(transport, &session, req).await?;
             return Ok((session, resumed));
         }
 
@@ -761,7 +825,7 @@ impl SubagentManager {
                 attached: false,
             }),
         });
-        let resumed = self.open_pi_session(client, &session, req).await?;
+        let resumed = self.open_pi_session(transport, &session, req).await?;
         self.sessions
             .lock()
             .await
@@ -773,10 +837,15 @@ impl SubagentManager {
     /// session file so the harness survives a restart.
     async fn open_pi_session(
         self: &Arc<Self>,
-        client: &Arc<PiClient>,
+        transport: &Transport,
         session: &Arc<SessionState>,
         req: &SpawnRequest,
     ) -> Result<bool> {
+        let client = match transport {
+            Transport::Daemon(client) => client,
+            Transport::Stdio => return self.open_stdio_session(session).await,
+        };
+
         let session_path = {
             let inner = session.inner.lock().await;
             inner
@@ -880,6 +949,30 @@ impl SubagentManager {
         Ok(resumed)
     }
 
+    /// The stdio stand-in for `open_pi_session`. There is nothing to create:
+    /// each task brings its own process. The session still exists as Portal
+    /// bookkeeping — a cwd, a transcript, a busy flag, a ledger row — so
+    /// everything the being can ask about a task keeps working.
+    async fn open_stdio_session(self: &Arc<Self>, session: &Arc<SessionState>) -> Result<bool> {
+        {
+            let mut inner = session.inner.lock().await;
+            inner.active_session_id = Some(format!("{STDIO_SESSION_PREFIX}{}", session.key));
+            inner.attached = false;
+            inner.last_used = time::Instant::now();
+        }
+        {
+            let mut ledger = self.ledger.lock().await;
+            ledger.upsert_session(&session.key, &session.cwd.display().to_string(), None);
+            ledger.save_lossy();
+        }
+        info!(
+            "session '{}' runs over stdio: one pi process per task, no shared context",
+            session.key
+        );
+        // Never "resumed": a fresh process carries nothing of the last task.
+        Ok(false)
+    }
+
     /// Fail the first spawn loudly rather than letting every task die on a
     /// missing provider (PRD §9 risk 5).
     async fn check_auth(&self, client: &Arc<PiClient>, active_session_id: &str) -> Result<()> {
@@ -920,7 +1013,137 @@ impl SubagentManager {
 
     // ── run ─────────────────────────────────────────────────────────
 
+    /// Run the task over whichever transport `spawn` resolved.
     async fn run_task(
+        self: Arc<Self>,
+        transport: Transport,
+        session: Arc<SessionState>,
+        task: Arc<TaskState>,
+        active_session_id: String,
+        message: String,
+        choice: ModelChoice,
+    ) {
+        match transport {
+            Transport::Daemon(client) => {
+                self.run_task_daemon(client, session, task, active_session_id, message)
+                    .await
+            }
+            Transport::Stdio => self.run_task_stdio(session, task, message, choice).await,
+        }
+    }
+
+    /// One `pi --print --mode json` process for this task, killed if the
+    /// being cancels or Portal shuts down. Everything after the run — status,
+    /// ledger, transcript, callback — is the same `finalize` the daemon path
+    /// uses, so the being cannot tell the two apart.
+    async fn run_task_stdio(
+        self: Arc<Self>,
+        session: Arc<SessionState>,
+        task: Arc<TaskState>,
+        message: String,
+        choice: ModelChoice,
+    ) {
+        // Rendered progress lines, drained into the session transcript so
+        // `portal_subagent_log` keeps working without an event pump.
+        let (lines_tx, mut lines_rx) = mpsc::unbounded_channel::<String>();
+        let pump_session = Arc::clone(&session);
+        let pump = tokio::spawn(async move {
+            while let Some(line) = lines_rx.recv().await {
+                pump_session.transcript.append_line(&line).await;
+            }
+        });
+
+        let spec = StdioTask {
+            prompt: message,
+            workdir: task.workdir.clone(),
+            provider: choice.provider,
+            model: choice.model,
+            api_key: choice.api_key,
+            thinking: choice.thinking,
+            timeout: Duration::from_secs(task.budget.timeout_secs),
+            transcript: Some(lines_tx),
+        };
+
+        let daemon = Arc::clone(&self.daemon);
+        let mut handle = tokio::spawn(async move { daemon.run_stdio_task(spec).await });
+
+        // There is no socket to abort over: cancelling a stdio task means
+        // dropping the run, which kills pi (`kill_on_drop`).
+        let run = loop {
+            tokio::select! {
+                joined = &mut handle => {
+                    break joined
+                        .map_err(|e| anyhow::anyhow!("the pi task panicked: {e}"))
+                        .and_then(|inner| inner);
+                }
+                _ = time::sleep(STDIO_CANCEL_POLL) => {
+                    if task.is_cancelled() || self.shutting_down.load(Ordering::SeqCst) {
+                        handle.abort();
+                        let _ = handle.await;
+                        break Err(anyhow::anyhow!("the pi task was stopped before it finished"));
+                    }
+                }
+            }
+        };
+        // The sender lives in the run; with it dropped the pump sees the end.
+        let _ = time::timeout(SHUTDOWN_GRACE, pump).await;
+
+        let (status, outcome) = match run {
+            Ok(run) => self.stdio_outcome(&task, run).await,
+            Err(e) => {
+                let cancelled = task.is_cancelled();
+                let interrupted = self.shutting_down.load(Ordering::SeqCst);
+                if cancelled || interrupted {
+                    (
+                        if cancelled {
+                            TaskStatus::Cancelled
+                        } else {
+                            TaskStatus::Interrupted
+                        },
+                        TaskOutcome::default(),
+                    )
+                } else {
+                    (
+                        TaskStatus::Failed,
+                        TaskOutcome {
+                            error: Some(format!("{e:#}")),
+                            ..Default::default()
+                        },
+                    )
+                }
+            }
+        };
+
+        self.finalize(&session, &task, status, outcome).await;
+    }
+
+    /// Classify a finished stdio run the way the daemon path classifies a
+    /// finished prompt, so both produce the same callback shapes.
+    async fn stdio_outcome(&self, task: &Arc<TaskState>, run: StdioRun) -> (TaskStatus, TaskOutcome) {
+        let error = run.error();
+        let outcome = TaskOutcome {
+            status_override: error.is_some().then_some("failed"),
+            text: run.result.last_assistant_text.clone(),
+            error,
+            usage: run.result.usage,
+            turns: run.result.turns,
+        };
+        if run.timed_out {
+            // Whatever it managed to say before the wall clock is still worth
+            // handing back; the status is what says it was cut short.
+            return (TaskStatus::Timeout, outcome);
+        }
+        // `classify` reads the accounting an autonomous daemon would report,
+        // so budget exhaustion is judged by one rule in one place.
+        let reported = json!({
+            "turnsUsed": run.result.turns,
+            "tokensUsed": run.result.usage.total,
+            "stopReason": run.result.stop_reason,
+        });
+        (classify(task, &outcome, &reported).await, outcome)
+    }
+
+    async fn run_task_daemon(
         self: Arc<Self>,
         client: Arc<PiClient>,
         session: Arc<SessionState>,
@@ -1304,6 +1527,9 @@ impl SubagentManager {
                 task.status().await.as_str()
             );
         }
+        if self.daemon.transport_mode().await == TransportMode::Stdio {
+            anyhow::bail!("{STDIO_NO_SESSION}");
+        }
         let active_session_id = self.active_session_id(&session).await?;
         let client = self.client().await?;
 
@@ -1343,6 +1569,31 @@ impl SubagentManager {
 
         // Set before signalling: `run_task` may finalize the moment we abort.
         task.cancelled.store(true, Ordering::SeqCst);
+
+        // Stdio mode has no session to abort into: the runner sees the flag
+        // and kills its pi process. Answer with whatever it had said by then
+        // rather than waiting for the kill to land.
+        if self.daemon.transport_mode().await == TransportMode::Stdio {
+            session
+                .transcript
+                .append_line(&format!("[cancel] task {task_id} aborted by the being"))
+                .await;
+            let partial = task
+                .inner
+                .lock()
+                .await
+                .result_text
+                .clone()
+                .map(|text| clamp_str_tail(&text, PARTIAL_RESULT_BYTES));
+            return Ok(json!({
+                "task_id": task_id,
+                "status": TaskStatus::Cancelled.as_str(),
+                "partial_result": partial,
+                "elapsed_s": task.elapsed_secs().await,
+                "note": "Cancelled deliberately, so no callback will arrive for this task.",
+            }));
+        }
+
         let active_session_id = self.active_session_id(&session).await?;
         let client = self.client().await?;
 
@@ -3185,6 +3436,204 @@ mod flow_tests {
         assert_eq!(status["status"], "running");
         assert_eq!(status["callback"], "pending");
         h.manager.cancel(&receipt.task_id).await.unwrap();
+        h.cleanup();
+    }
+
+    // ── the stdio fallback, end to end ──────────────────────────────
+
+    /// What the fake pi reports for every task it is given.
+    const STDIO_RESULT: &str = "## Result\nThe stdio pi finished the job.";
+
+    struct StdioHarness {
+        manager: Arc<SubagentManager>,
+        workspace: PathBuf,
+        sink: Sink,
+    }
+
+    /// A pi shaped like 0.73.1: `--daemon-socket` is not a thing it knows,
+    /// but `--print --mode json` works. `linger` seconds pass before it
+    /// answers, so a task can be caught mid-flight — and it only touches
+    /// `finished.marker` if it was allowed to run to the end.
+    fn write_stdio_pi(root: &Path, linger: u32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = root.join("fake-pi");
+        let script = format!(
+            r###"#!/bin/sh
+case "$*" in
+  *--daemon-socket*) echo 'Error: Unknown option: --daemon-socket' >&2; exit 1 ;;
+esac
+echo '{{"type":"agent_start"}}'
+sleep {linger}
+touch '{marker}'
+cat <<'JSON'
+{{"type":"message_end","message":{{"role":"assistant","content":[{{"type":"text","text":"{result}"}}],"usage":{{"input":11,"output":7}},"stopReason":"stop"}}}}
+{{"type":"turn_end"}}
+{{"type":"agent_end","messages":[]}}
+JSON
+"###,
+            marker = root.join("finished.marker").display(),
+            result = STDIO_RESULT.replace('\n', "\\n"),
+        );
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// Like [`harness`], but with nothing listening on the socket: the
+    /// manager tries daemon mode, is rebuffed, and latches stdio.
+    async fn stdio_harness(tag: &str, linger: u32) -> StdioHarness {
+        let workspace = short_temp_root(tag);
+        std::fs::create_dir_all(workspace.join("proj")).unwrap();
+        let state_dir = workspace.join("state");
+        let pi = write_stdio_pi(&workspace, linger);
+        let sink = start_sink().await;
+
+        let callback = HeartCallback::new();
+        callback.set(
+            sink.url.clone(),
+            "tok_secret".to_string(),
+            "alice-laptop".to_string(),
+        );
+
+        let mut config = PortalConfig::default();
+        config.security.workspace_root = workspace.clone();
+        config.subagent.state_dir = Some(state_dir.display().to_string());
+        config.subagent.command = Some(vec![pi.display().to_string()]);
+        config.subagent.model.provider = Some("openrouter".to_string());
+        config.subagent.model.model = Some("deepseek/deepseek-chat-v4-0324".to_string());
+        config.subagent.model.api_key = Some("sk-or-v1-test".to_string());
+
+        StdioHarness {
+            manager: SubagentManager::new(&config, callback),
+            workspace,
+            sink,
+        }
+    }
+
+    impl StdioHarness {
+        fn request(&self, brief: &str) -> SpawnRequest {
+            SpawnRequest {
+                brief: brief.to_string(),
+                session: "scene-42".to_string(),
+                workdir: Some("proj".to_string()),
+                budget: Budget {
+                    max_turns: 40,
+                    max_tokens: 400_000,
+                    timeout_secs: 60,
+                    max_continuations: 3,
+                },
+                model: None,
+                thinking: None,
+                scene_id: Some("desktop-1".to_string()),
+            }
+        }
+
+        async fn status_of(&self, task_id: &str) -> String {
+            self.manager
+                .status(Some(task_id), None)
+                .await
+                .unwrap()["status"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        }
+
+        async fn wait_for_status(&self, task_id: &str, want: &str, timeout: Duration) -> String {
+            let deadline = time::Instant::now() + timeout;
+            loop {
+                let got = self.status_of(task_id).await;
+                if got == want || time::Instant::now() >= deadline {
+                    return got;
+                }
+                time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+
+        fn cleanup(&self) {
+            let _ = std::fs::remove_dir_all(&self.workspace);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pi_without_daemon_mode_runs_the_task_and_wakes_the_being() {
+        let h = stdio_harness("stdio", 0).await;
+        let receipt = h.manager.spawn(h.request("Refactor the parser")).await.unwrap();
+        assert_eq!(receipt.status, TaskStatus::Running);
+        assert!(!receipt.resumed, "a fresh process resumes nothing");
+
+        assert_eq!(
+            wait_for_hits(&h.sink, 1, Duration::from_secs(20)).await,
+            1,
+            "the being is woken over stdio exactly as over the daemon"
+        );
+        let hit = h.sink.hits.lock().unwrap()[0].clone();
+        assert_eq!(hit["source"], "portal");
+        assert_eq!(hit["result"]["kind"], "subagent");
+        assert_eq!(hit["result"]["status"], "done");
+        assert_eq!(hit["result"]["session"], "scene-42");
+        assert_eq!(hit["result"]["result"], STDIO_RESULT);
+        assert_eq!(hit["result"]["turns"], 1);
+        assert_eq!(hit["result"]["tokens"]["total"], 18);
+        assert_eq!(hit["result"]["scene_id"], "desktop-1");
+
+        // The being can see which transport is in play, and read the run.
+        let status = h.manager.status(None, None).await.unwrap();
+        assert_eq!(status["daemon"]["transport"], "stdio");
+        assert_eq!(status["available"], true);
+        let log = h
+            .manager
+            .log(&receipt.task_id, 0, DEFAULT_LOG_LIMIT, 0)
+            .await
+            .unwrap();
+        let output = log["output"].as_str().unwrap();
+        assert!(output.contains("agent_start"), "{output}");
+        assert!(output.contains("The stdio pi finished"), "{output}");
+        assert!(output.contains("→ done"), "{output}");
+        // A run that was left alone leaves the marker — which is what makes
+        // its absence meaningful in the cancel test below.
+        assert!(h.workspace.join("finished.marker").exists());
+
+        h.cleanup();
+    }
+
+    #[tokio::test]
+    async fn a_stdio_task_is_cancelled_by_killing_its_process() {
+        let h = stdio_harness("stdiocancel", 3).await;
+        let receipt = h.manager.spawn(h.request("Take your time")).await.unwrap();
+
+        // Steering has nowhere to land: there is no live session behind a
+        // one-shot process, and saying so is better than a silent no-op.
+        let err = h
+            .manager
+            .steer(&receipt.task_id, "also fix the tests", false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no daemon mode"), "{err}");
+
+        let answer = h.manager.cancel(&receipt.task_id).await.unwrap();
+        assert_eq!(answer["status"], "cancelled");
+        assert_eq!(
+            h.wait_for_status(&receipt.task_id, "cancelled", Duration::from_secs(10))
+                .await,
+            "cancelled",
+            "cancelling must actually kill the pi process"
+        );
+        assert_eq!(
+            wait_for_hits(&h.sink, 1, Duration::from_millis(500)).await,
+            0,
+            "a deliberate cancel never wakes the being"
+        );
+
+        // The fake pi only leaves this behind if it was allowed to finish, so
+        // its absence past its own runtime is proof the child was killed and
+        // is not still burning tokens somewhere.
+        time::sleep(Duration::from_secs(4)).await;
+        assert!(
+            !h.workspace.join("finished.marker").exists(),
+            "cancel must kill the pi process, not just stop reading it"
+        );
+
         h.cleanup();
     }
 }

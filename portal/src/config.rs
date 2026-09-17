@@ -210,6 +210,13 @@ pub struct SubagentModelConfig {
     /// off | minimal | low | medium | high | xhigh | max
     #[serde(default)]
     pub thinking: Option<String>,
+    /// Provider key for the per-task stdio fallback, where there is no
+    /// daemon to have logged in. Never logged and never surfaced by
+    /// `portal_status`, but it does reach pi as `--api-key`, so it is visible
+    /// in `ps` on this machine: prefer `env_passthrough` of the provider's
+    /// own variable (`OPENROUTER_API_KEY`, …) when that is an option.
+    #[serde(default)]
+    pub api_key: Option<String>,
 }
 
 impl Default for SubagentConfig {
@@ -656,6 +663,7 @@ timeout_secs = 300
 provider = "anthropic"
 model = "claude-sonnet-4-5"
 thinking = "medium"
+api_key = "sk-or-v1-secret"
 "#;
         std::fs::write("/tmp/test-portal-sub.toml", toml).unwrap();
         let config = PortalConfig::load("/tmp/test-portal-sub.toml").unwrap();
@@ -675,6 +683,8 @@ thinking = "medium"
         assert_eq!(s.budget.max_continuations, 3);
         assert_eq!(s.model.provider.as_deref(), Some("anthropic"));
         assert_eq!(s.model.thinking.as_deref(), Some("medium"));
+        // Only the stdio fallback needs it, but it is read either way.
+        assert_eq!(s.model.api_key.as_deref(), Some("sk-or-v1-secret"));
         assert_eq!(s.skills, vec!["/skills/review".to_string()]);
         assert_eq!(s.append_system_prompt.as_deref(), Some("Prefer small diffs."));
     }
