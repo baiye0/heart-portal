@@ -494,7 +494,22 @@ async fn main() -> Result<()> {
         connect_link.is_some(),
         runtime_started,
     );
-    let tool_host = ToolHost::new_with_runtime(&config, runtime);
+    let mut tool_host = ToolHost::new_with_runtime(&config, runtime);
+    if let (Ok(file), Some(link)) = (
+        std::env::var("HEART_PORTAL_CLIENT_FILE"),
+        connect_link.as_deref(),
+    ) {
+        if let Ok(mut endpoint) = url::Url::parse(link) {
+            endpoint.set_query(None);
+            endpoint.set_fragment(None);
+            tool_host = tool_host.with_client_handler(std::sync::Arc::new(
+                tools::client::DesktopClientHandler {
+                    file: file.into(),
+                    endpoint: endpoint.as_str().trim_end_matches('/').to_string(),
+                },
+            ));
+        }
+    }
 
     if config.kits_enabled {
         tool_host.start_kit_refresh_task();
@@ -1182,7 +1197,16 @@ async fn handle_request(
             let start = std::time::Instant::now();
             info!("⚡ {} called", tool_name);
 
-            let result = tool_host.call(tool_name, arguments).await;
+            let scene_id = request
+                .params
+                .get("_meta")
+                .or_else(|| request.params.get("meta"))
+                .or(Some(&request.meta))
+                .and_then(|meta| meta.get("scene_id"))
+                .and_then(serde_json::Value::as_str);
+            let result = tool_host
+                .call_with_scene(tool_name, arguments, scene_id)
+                .await;
             let elapsed = start.elapsed();
 
             match result {

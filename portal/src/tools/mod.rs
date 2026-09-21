@@ -1,6 +1,7 @@
 //! Tool host — manages built-in, custom (being-defined), and kit tools.
 //! Built-in: exec, file, web. Custom: loaded from workspace/tools/mcp.toml.
 
+pub mod client;
 pub mod custom;
 mod exec;
 mod file;
@@ -41,6 +42,7 @@ pub struct ToolInfo {
 #[derive(Clone)]
 pub struct ToolHost {
     config: PortalConfig,
+    client_handler: Arc<dyn client::ClientHandler>,
     custom: CustomToolHost,
     kits: KitManager,
     pub process_manager: Arc<ProcessManager>,
@@ -86,6 +88,7 @@ impl ToolHost {
         Self {
             runtime: Arc::new(runtime),
             config: config.clone(),
+            client_handler: Arc::new(client::NoClientHandler),
             custom: CustomToolHost::new(),
             kits: KitManager::new(loaded_kits),
             process_manager: Arc::new(ProcessManager::new(callback.clone())),
@@ -110,6 +113,11 @@ impl ToolHost {
                     }
                 },
         }
+    }
+
+    pub fn with_client_handler(mut self, handler: Arc<dyn client::ClientHandler>) -> Self {
+        self.client_handler = handler;
+        self
     }
 
     /// Enable async callbacks for every manager at once (`--connect` mode).
@@ -288,7 +296,7 @@ impl ToolHost {
         if self.config.tools.exec {
             tools.push(ToolInfo {
                 name: "portal_exec".to_string(),
-                description: "Execute a shell command. With background=true it returns a session_id immediately and, when the task finishes, Portal notifies you automatically — you will be woken with the exit code and output, so you can let go of it instead of polling. Prefer background=true for anything slow (builds, tests, long downloads). On Windows, select shell='powershell' and pass the script directly for PowerShell; do not invoke powershell.exe from the default cmd shell.".to_string(),
+                description: "Execute a shell command, or a client command: @context [scene_id] reads recent scene conversation history (defaults to the calling scene); @scenes lists available scenes. Client commands never run in a shell. With background=true it returns a session_id immediately and, when the task finishes, Portal notifies you automatically — you will be woken with the exit code and output, so you can let go of it instead of polling. Prefer background=true for anything slow (builds, tests, long downloads). On Windows, select shell='powershell' and pass the script directly for PowerShell; do not invoke powershell.exe from the default cmd shell.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -601,6 +609,15 @@ impl ToolHost {
 
     /// Execute a tool call (built-in or custom)
     pub async fn call(&self, tool_name: &str, arguments: Value) -> Result<Value> {
+        self.call_with_scene(tool_name, arguments, None).await
+    }
+
+    pub async fn call_with_scene(
+        &self,
+        tool_name: &str,
+        arguments: Value,
+        scene_id: Option<&str>,
+    ) -> Result<Value> {
         // Reserve the diagnostic endpoint: an installed server must not replace
         // a read-only status query with an arbitrary custom or kit operation.
         if tool_name == "portal_status" {
@@ -632,6 +649,21 @@ impl ToolHost {
             "portal_exec" => {
                 if !self.config.tools.exec {
                     anyhow::bail!("portal_exec is disabled in configuration");
+                }
+                if let Some(command) = arguments
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .and_then(|s| s.trim_start().strip_prefix('@'))
+                {
+                    let (verb, args) = command
+                        .split_once(char::is_whitespace)
+                        .unwrap_or((command, ""));
+                    anyhow::ensure!(!verb.is_empty(), "Missing client command after @");
+                    let text = self
+                        .client_handler
+                        .handle_client_command(verb, args.trim(), scene_id)
+                        .await?;
+                    return Ok(serde_json::json!({"content": [{"type": "text", "text": text}]}));
                 }
                 exec::execute(&self.config, &self.process_manager, arguments).await
             }
