@@ -411,11 +411,7 @@ impl PiDaemon {
         }
 
         cmd.env_clear();
-        for key in &self.config.env_passthrough {
-            if let Some(val) = std::env::var_os(key) {
-                cmd.env(key, val);
-            }
-        }
+        cmd.envs(child_environment(&self.config.env_passthrough, |key| std::env::var_os(key)));
         // Inject api_key from portal.toml into daemon env — the provider
         // determines the env var name. This is the ONLY place where config-level
         // auth reaches daemon-spawned sessions.
@@ -648,11 +644,7 @@ impl PiDaemon {
         cmd.arg(&task.prompt);
 
         cmd.env_clear();
-        for key in &self.config.env_passthrough {
-            if let Some(val) = std::env::var_os(key) {
-                cmd.env(key, val);
-            }
-        }
+        cmd.envs(child_environment(&self.config.env_passthrough, |key| std::env::var_os(key)));
         cmd.env("PRIME_AGENT_CODING_AGENT_DIR", self.agent_dir())
             .env("PRIME_AGENT_SESSION_DIR", self.sessions_dir())
             .env("PRIME_AGENT_HEADLESS", "1")
@@ -1039,6 +1031,25 @@ fn unix_now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Windows runtime dependencies survive `env_clear`, including with an older
+/// explicit passthrough list. Values come from this machine, never fixed paths.
+/// ProgramFiles lets pi locate Git Bash; SystemRoot is needed by Node's DNS.
+fn child_environment(
+    configured: &[String],
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<(String, std::ffi::OsString)> {
+    #[cfg(windows)]
+    const SYSTEM_KEYS: &[&str] = &[
+        "SystemRoot", "SystemDrive", "ProgramFiles", "ProgramFiles(x86)",
+        "USERPROFILE", "APPDATA", "LOCALAPPDATA", "TEMP", "TMP", "COMSPEC",
+    ];
+    #[cfg(not(windows))]
+    const SYSTEM_KEYS: &[&str] = &[];
+    configured.iter().map(String::as_str).chain(SYSTEM_KEYS.iter().copied())
+        .filter_map(|key| lookup(key).map(|value| (key.to_string(), value)))
+        .collect()
 }
 
 /// One task to run as its own pi process ([`PiDaemon::run_stdio_task`]).
@@ -1838,3 +1849,50 @@ JSON
     }
 }
 
+#[cfg(all(test, windows))]
+mod windows_env_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::ffi::OsString;
+
+    #[test]
+    fn runtime_environment_survives_default_and_legacy_configs() {
+        // Simulate different installation drives and Unicode paths without
+        // mutating process-wide environment variables in parallel tests.
+        let machine = HashMap::from([
+            ("SystemRoot", OsString::from(r"D:\Windows")),
+            ("ProgramFiles", OsString::from(r"E:\Applications 空格")),
+            ("ProgramFiles(x86)", OsString::from(r"F:\Legacy Apps")),
+            ("PATH", OsString::from(r"E:\Portable Git\bin")),
+            ("MY_PROVIDER_TOKEN", OsString::from("explicit-credential")),
+            ("UNRELATED_SECRET", OsString::from("do-not-inherit")),
+        ]);
+        for configured in [
+            crate::config::SubagentConfig::default().env_passthrough,
+            vec!["PATH".to_string(), "MY_PROVIDER_TOKEN".to_string()],
+            vec![],
+        ] {
+            let child: HashMap<_, _> = child_environment(&configured, |key| machine.get(key).cloned())
+                .into_iter().collect();
+            for key in ["SystemRoot", "ProgramFiles", "ProgramFiles(x86)"] {
+                assert_eq!(child.get(key), machine.get(key), "lost machine path {key}");
+            }
+            assert_eq!(child.contains_key("MY_PROVIDER_TOKEN"), configured.iter().any(|k| k == "MY_PROVIDER_TOKEN"));
+            assert_eq!(child.contains_key("PATH"), configured.iter().any(|k| k == "PATH"));
+            assert!(!child.contains_key("UNRELATED_SECRET"));
+            assert!(!child.contains_key("LOCALAPPDATA"), "do not invent missing paths");
+        }
+    }
+
+    #[test]
+    fn child_process_can_start_with_an_empty_legacy_allowlist() {
+        let root = std::env::var_os("SystemRoot").unwrap();
+        let mut cmd = std::process::Command::new(PathBuf::from(root).join("System32").join("cmd.exe"));
+        let output = cmd.env_clear()
+            .envs(child_environment(&[], |key| std::env::var_os(key)))
+            .args(["/d", "/c", "if defined SystemRoot (echo WINDOWS_RUNTIME_OK) else (exit /b 1)"])
+            .output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "WINDOWS_RUNTIME_OK");
+    }
+}
