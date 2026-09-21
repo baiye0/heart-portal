@@ -189,7 +189,8 @@ pub struct SubagentConfig {
     #[serde(default)]
     pub extensions: Vec<String>,
 
-    /// Variables forwarded into the otherwise-cleared daemon environment.
+    /// Variables forwarded into the otherwise-cleared child environment.
+    /// Windows also preserves its runtime and installation directory variables.
     #[serde(default = "default_env_passthrough")]
     pub env_passthrough: Vec<String>,
 
