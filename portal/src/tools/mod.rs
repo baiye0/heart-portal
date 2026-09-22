@@ -42,7 +42,7 @@ pub struct ToolInfo {
 #[derive(Clone)]
 pub struct ToolHost {
     config: PortalConfig,
-    client_handler: Arc<dyn client::ClientHandler>,
+    client_handler: Option<Arc<dyn client::ClientHandler>>,
     custom: CustomToolHost,
     kits: KitManager,
     pub process_manager: Arc<ProcessManager>,
@@ -88,7 +88,7 @@ impl ToolHost {
         Self {
             runtime: Arc::new(runtime),
             config: config.clone(),
-            client_handler: Arc::new(client::NoClientHandler),
+            client_handler: None,
             custom: CustomToolHost::new(),
             kits: KitManager::new(loaded_kits),
             process_manager: Arc::new(ProcessManager::new(callback.clone())),
@@ -116,7 +116,7 @@ impl ToolHost {
     }
 
     pub fn with_client_handler(mut self, handler: Arc<dyn client::ClientHandler>) -> Self {
-        self.client_handler = handler;
+        self.client_handler = Some(handler);
         self
     }
 
@@ -296,7 +296,7 @@ impl ToolHost {
         if self.config.tools.exec {
             tools.push(ToolInfo {
                 name: "portal_exec".to_string(),
-                description: "Execute a shell command, or a client command: @context [scene_id] reads recent scene conversation history (defaults to the calling scene); @scenes lists available scenes. Client commands never run in a shell. With background=true it returns a session_id immediately and, when the task finishes, Portal notifies you automatically — you will be woken with the exit code and output, so you can let go of it instead of polling. Prefer background=true for anything slow (builds, tests, long downloads). On Windows, select shell='powershell' and pass the script directly for PowerShell; do not invoke powershell.exe from the default cmd shell.".to_string(),
+                description: format!("Execute a shell command. {}With background=true it returns a session_id immediately and, when the task finishes, Portal notifies you automatically — you will be woken with the exit code and output, so you can let go of it instead of polling. Prefer background=true for anything slow (builds, tests, long downloads). On Windows, select shell='powershell' and pass the script directly for PowerShell; do not invoke powershell.exe from the default cmd shell.", if self.client_handler.is_some() { "Client commands (omit shell): @context [scene_id] reads recent scene conversation history (defaults to the calling scene); @scenes lists available scenes. Set shell explicitly to execute shell syntax beginning with @. " } else { "" }),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -650,17 +650,18 @@ impl ToolHost {
                 if !self.config.tools.exec {
                     anyhow::bail!("portal_exec is disabled in configuration");
                 }
-                if let Some(command) = arguments
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .and_then(|s| s.trim_start().strip_prefix('@'))
-                {
+                if let (Some(handler), None, Some(command)) = (
+                    self.client_handler.as_ref(),
+                    arguments.get("shell"),
+                    arguments.get("command")
+                        .and_then(Value::as_str)
+                        .and_then(|s| s.trim_start().strip_prefix('@')),
+                ) {
                     let (verb, args) = command
                         .split_once(char::is_whitespace)
                         .unwrap_or((command, ""));
                     anyhow::ensure!(!verb.is_empty(), "Missing client command after @");
-                    let text = self
-                        .client_handler
+                    let text = handler
                         .handle_client_command(verb, args.trim(), scene_id)
                         .await?;
                     return Ok(serde_json::json!({"content": [{"type": "text", "text": text}]}));

@@ -1,6 +1,6 @@
 # Town-Client integration
 
-This branch follows upstream main and keeps only desktop lifecycle compatibility.
+Portal supports both standalone operation and desktop-managed operation from main.
 Town-Client pins this repository as a source submodule, builds it on each target
 platform, and ships it inside the client release. No separate Portal release is
 needed for client updates.
@@ -18,3 +18,19 @@ Portal installation and upgrades otherwise retain upstream behavior.
 `HEART_PORTAL_READY_NONCE` and `HEART_PORTAL_READY_FILE` identify the supervised
 launch. Both macOS and Windows publish PID/nonce-bound connection telemetry;
 readiness remains independent of cloud reachability. The client owns rollback.
+
+## Shared main and desktop behavior
+
+Both launch modes include the same sub-agent runtime.
+A standalone launch retains its shell behavior and does not advertise client commands.
+When `HEART_PORTAL_CLIENT_FILE` and a connection link register the desktop handler,
+`portal_exec` routes commands beginning with `@` to the client, including
+`@context [scene_id]` and `@scenes`. Set `shell` explicitly (`default` or, on Windows,
+`powershell`) to execute literal shell syntax beginning with `@` instead.
+Client request failures never fall back to shell execution.
+
+Scene IDs are read from `params._meta`, `params.meta`, then envelope `meta`/`_meta`;
+metadata without a string `scene_id` does not prevent fallback to the next source.
+The hidden `--exec-enabled` and `--kits-enabled` flags override configuration for
+that process only. With no override, the saved configuration remains authoritative.
+Client-managed upgrade attempts are rejected before installation migration.

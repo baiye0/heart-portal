@@ -49,6 +49,14 @@ class ConfigCliTests(unittest.TestCase):
         self.assertEqual(state.read_bytes() if state.exists() else None, previous_state)
         return json.loads(result.stdout) if success else result
 
+    def test_client_owned_upgrade_rejected_before_installation_migration(self):
+        self.env['HEART_PORTAL_CLIENT_MANAGED'] = '1'
+        for args in [('upgrade',), ('--upgrade',), ('upgrade', '--file', str(self.root / 'missing.zip'))]:
+            result = self.run_cli(*args, success=False)
+            self.assertIn('managed by Town-Client', result.stderr)
+            self.assertFalse(self.home.exists())
+            self.assertEqual(list(self.install.iterdir()), [self.binary])
+
     def test_inspection_and_legacy_precedence_without_bootstrap(self):
         location = self.run_cli('config', 'path')['config']
         self.assertEqual(Path(location['path']), self.data / 'portal.toml')

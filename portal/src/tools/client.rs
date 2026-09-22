@@ -11,18 +11,6 @@ pub trait ClientHandler: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>>;
 }
 
-pub struct NoClientHandler;
-impl ClientHandler for NoClientHandler {
-    fn handle_client_command<'a>(
-        &'a self,
-        _: &'a str,
-        _: &'a str,
-        _: Option<&'a str>,
-    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
-        Box::pin(async { anyhow::bail!("no client handler registered") })
-    }
-}
-
 /// Desktop publishes a rotating local capability. Re-read it on every call so
 /// a supervised Portal can survive Desktop restarts without retaining a token.
 pub struct DesktopClientHandler {
@@ -114,15 +102,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unregistered_and_disabled_commands_never_fall_through_to_shell() {
+    async fn disabled_client_commands_never_fall_through_to_shell() {
         let mut config = PortalConfig::default();
-        let host = ToolHost::new(&config);
-        assert!(host
-            .call("portal_exec", json!({"command":"@context"}))
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("no client handler"));
         config.tools.exec = false;
         let host = ToolHost::new(&config).with_client_handler(Arc::new(Echo));
         assert!(host
@@ -132,6 +113,49 @@ mod tests {
             .to_string()
             .contains("disabled"));
     }
+    #[tokio::test]
+    async fn standalone_and_explicit_shell_preserve_at_syntax() {
+        let mut config = PortalConfig::default();
+        config.security.workspace_root = std::env::temp_dir();
+        #[cfg(unix)]
+        let command = "@portal_missing_fixture 2>/dev/null; printf compat-shell";
+        #[cfg(windows)]
+        let command = "@echo compat-shell";
+        let standalone = ToolHost::new(&config);
+        let desktop = ToolHost::new(&config).with_client_handler(Arc::new(Echo));
+        for (host, arguments) in [
+            (&standalone, json!({"command": command})),
+            (&desktop, json!({"command": command, "shell": "default"})),
+        ] {
+            let response = host.call("portal_exec", arguments).await.unwrap();
+            assert_eq!(response["isError"], false, "{response}");
+            assert!(response["content"][0]["text"].as_str().unwrap().contains("compat-shell"));
+        }
+        for (host, advertised) in [(&standalone, false), (&desktop, true)] {
+            let tool = host.list_builtin_tools().into_iter().find(|t| t.name == "portal_exec").unwrap();
+            assert_eq!(tool.description.contains("@context"), advertised);
+        }
+    }
+
+    #[tokio::test]
+    async fn scene_metadata_falls_back_when_higher_priority_metadata_has_no_scene() {
+        let host = ToolHost::new(&PortalConfig::default()).with_client_handler(Arc::new(Echo));
+        for (params_meta, params_legacy_meta, envelope, expected) in [
+            (json!({"scene_id":"first"}), json!({"scene_id":"second"}), json!({"scene_id":"third"}), "first"),
+            (json!({"trace":"unrelated"}), json!({"scene_id":"second"}), json!({"scene_id":"third"}), "second"),
+            (json!({"scene_id":42}), json!(null), json!({"scene_id":"third"}), "third"),
+        ] {
+            for envelope_key in ["meta", "_meta"] {
+                let mut value = json!({"jsonrpc":"2.0", "id":1, "method":"tools/call",
+                    "params":{"name":"portal_exec", "arguments":{"command":"@context"}, "_meta":params_meta, "meta":params_legacy_meta}});
+                value[envelope_key] = envelope.clone();
+                let request = serde_json::from_value(value).unwrap();
+                let response = crate::handle_request(&request, &host, "test").await;
+                assert_eq!(response.result.unwrap()["content"][0]["text"], format!("context||{expected}"));
+            }
+        }
+    }
+
     #[tokio::test]
     async fn desktop_transport_authenticates_and_reloads_registration() {
         use axum::{http::HeaderMap, routing::post, Json, Router};

@@ -104,6 +104,15 @@ above. `python3 scripts/package-portal-macos.py` builds/signs that artifact loca
 Notarization is postponed.
 See [macOS signing and upgrade validation](docs/macos-upgrade.md).
 
+### Desktop client integration
+
+The same Portal build supports standalone use and Town-Client integration.
+Standalone launches retain their own installation and upgrade flow. Client-managed
+launches use the client's bundled executable, supervisor, configuration and upgrade
+flow. An optional local client bridge adds `@context` and `@scenes` through
+`portal_exec`; standalone tools do not advertise these commands.
+See [desktop integration](docs/town-client.md) for launch markers and shell compatibility.
+
 ### macOS background recovery
 
 Normal macOS startup automatically attaches a background supervisor while

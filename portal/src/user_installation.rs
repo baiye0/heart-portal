@@ -272,6 +272,14 @@ pub fn delegate(target: &Path, cli: &crate::Cli) -> Result<()> {
     if let Some(name) = &cli.name {
         command.arg("--name").arg(name);
     }
+    for (flag, enabled) in [
+        ("--exec-enabled", cli.exec_enabled),
+        ("--kits-enabled", cli.kits_enabled),
+    ] {
+        if let Some(enabled) = enabled {
+            command.arg(flag).arg(enabled.to_string());
+        }
+    }
     if let Some(connect) = &cli.connect {
         command.env("PORTAL_CONNECT_LINK", connect);
     }

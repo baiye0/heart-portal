@@ -99,7 +99,7 @@ class LifecycleTests(unittest.TestCase):
                 retired_http_port = unused_http.getsockname()[1]
             (root / 'portal.toml').write_text(
                 'name = "fixture"\nworkspace = "./workspace"\nbind = "127.0.0.1:0"\n'
-                f'kits_enabled = false\n[cowork]\nenabled = true\nhttp_port = {retired_http_port}\n')
+                f'kits_enabled = false\n[cowork]\nenabled = true\nhttp_port = {retired_http_port}\n[subagent]\nenabled=false\n')
             location = json.loads(subprocess.check_output(
                 [str(root / 'target/release/heart-portal'), 'config', 'path'], text=True))
             self.assertEqual(Path(location['config']['path']), root / 'portal.toml')
@@ -227,7 +227,7 @@ class LifecycleTests(unittest.TestCase):
                     port = listener.getsockname()[1]
                 config = config_dir / 'portal.toml'
                 config_text = f'name="relative-fixture"\nbind="127.0.0.1:{port}"\nworkspace="./workspace"\nkits_dir="./kits"\n'
-                config_text += "\n[security]\nexpose_host_details=true\n"
+                config_text += "\n[subagent]\nenabled=false\n[security]\nexpose_host_details=true\n"
                 config.write_text(config_text)
                 env = {k: v for k, v in os.environ.items()
                        if not k.startswith(('HEART_PORTAL_', 'PORTAL_'))}
@@ -266,12 +266,12 @@ class LifecycleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='portal-review-argv-') as tmp:
             root=Path(tmp).resolve();download=root/'download';download.mkdir();home=root/'home';home.mkdir()
             binary=download/'heart-portal';shutil.copy2(BINARY,binary)
-            config=root/'portal.toml';config.write_text('workspace="./workspace"\nkits_enabled=false\nbind="127.0.0.1:0"\n')
+            config=root/'portal.toml';config.write_text('workspace="./workspace"\nkits_enabled=false\nbind="127.0.0.1:0"\n[subagent]\nenabled=false\n')
             env={k:v for k,v in os.environ.items() if not k.startswith(('PORTAL_','HEART_PORTAL_'))};env['HOME']=str(home)
             token='synthetic-review-argv-token'
             installed=home/'.heart-portal/runtime/heart-portal'
             with (root/'log').open('w') as log:
-                p=subprocess.Popen([str(binary),'--name','fixture','--config',str(config),'--connect','http://127.0.0.1:9/fixture/?token='+token],env=env,cwd=download,stdout=log,stderr=log)
+                p=subprocess.Popen([str(binary),'--name','fixture','--exec-enabled','false','--kits-enabled','false','--config',str(config),'--connect','http://127.0.0.1:9/fixture/?token='+token],env=env,cwd=download,stdout=log,stderr=log)
                 try:
                     deadline=time.monotonic()+45
                     while time.monotonic()<deadline:
@@ -281,6 +281,8 @@ class LifecycleTests(unittest.TestCase):
                         time.sleep(.1)
                     else:self.fail('Delegation did not become ready')
                     self.assertNotIn(token,argv)
+                    self.assertIn('--exec-enabled false', argv)
+                    self.assertIn('--kits-enabled false', argv)
                     snapshot = manager.launch_snapshot(manager.process_identity(p.pid))
                     self.assertTrue(snapshot['environment']['PORTAL_CONNECT_LINK'].endswith(token))
                 finally:

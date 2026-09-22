@@ -174,6 +174,10 @@ async fn main() -> Result<()> {
         anyhow::ensure!(read_only && !cli.legacy_upgrade && cli.export_windows_runtime.is_none() && !cli.install_user_runtime,
             "Managed external tools cannot start, stop, upgrade or reconfigure Portal; use the host management channel");
     }
+    // Reject client-owned upgrades before installation migration/delegation.
+    if cli.legacy_upgrade || matches!(&cli.command, Some(Commands::Upgrade { status: false, .. })) {
+        upgrade::ensure_standalone_upgrade()?;
+    }
     if let Some(path) = &cli.export_windows_runtime {
         #[cfg(windows)]
         return windows_upgrade::export_runtime(path);
@@ -1197,13 +1201,14 @@ async fn handle_request(
             let start = std::time::Instant::now();
             info!("⚡ {} called", tool_name);
 
-            let scene_id = request
-                .params
-                .get("_meta")
-                .or_else(|| request.params.get("meta"))
-                .or(Some(&request.meta))
-                .and_then(|meta| meta.get("scene_id"))
-                .and_then(serde_json::Value::as_str);
+            let scene_id = [
+                request.params.get("_meta"),
+                request.params.get("meta"),
+                Some(&request.meta),
+            ]
+            .into_iter()
+            .flatten()
+            .find_map(|meta| meta.get("scene_id").and_then(serde_json::Value::as_str));
             let result = tool_host
                 .call_with_scene(tool_name, arguments, scene_id)
                 .await;

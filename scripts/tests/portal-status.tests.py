@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import socket
 import struct
+import sys
 import subprocess
 import tempfile
 import time
@@ -104,7 +105,7 @@ class RuntimeStatusTests(unittest.TestCase):
             f"name='configured-name'\nbind='127.0.0.1:{port}'\n"
             "workspace='./workspace'\nkits_dir='./kits'\nkits_enabled=false\n"
             "portal_mcp_token='private-config-token'\n" + extra +
-            "[tools]\nexec=false\nfile=false\ncustom_tools_enabled=false\n[security]\nexpose_host_details=true\n", encoding='utf-8')
+            "[subagent]\nenabled=false\n[tools]\nexec=false\nfile=false\ncustom_tools_enabled=false\n[security]\nexpose_host_details=true\n", encoding='utf-8')
         self.process = subprocess.Popen([str(self.binary), '--config', str(self.config), *args],
             cwd=self.root, env=self.env, stdout=self.log, stderr=self.log,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
@@ -210,6 +211,45 @@ class RuntimeStatusTests(unittest.TestCase):
                 with self.accept_relay(relay) as recovered:
                     self.relay_status(recovered)
                     self.assertIsNone(self.process.poll())
+
+    @unittest.skipUnless(os.name == 'nt' or sys.platform == 'darwin', 'desktop readiness')
+    def test_client_managed_installation_and_runtime_overrides(self):
+        bundled = self.root / 'desktop' / BINARY.name
+        bundled.parent.mkdir()
+        shutil.copy2(self.binary, bundled)
+        self.binary = bundled
+        ready = self.root / 'client-ready.json'
+        self.env.update(HEART_PORTAL_CLIENT_MANAGED='1',
+                        HEART_PORTAL_READY_FILE=str(ready), HEART_PORTAL_READY_NONCE='fixture-nonce')
+        with socket.socket() as reserve:
+            reserve.bind(('127.0.0.1', 0))
+            port = reserve.getsockname()[1]
+        self.start(port, '--exec-enabled', 'true', '--kits-enabled', 'false')
+        deadline = time.monotonic() + 20
+        while not ready.exists():
+            self.assertIsNone(self.process.poll(), (self.root / 'runtime.log').read_text(errors='replace'))
+            self.assertLess(time.monotonic(), deadline, 'Client readiness missing')
+            time.sleep(0.1)
+        payload = json.loads(ready.read_text())
+        self.assertEqual(payload['pid'], self.process.pid)
+        self.assertEqual(payload['nonce'], 'fixture-nonce')
+        with socket.create_connection(('127.0.0.1', port), timeout=5) as connection, connection.makefile('rb') as reader:
+            for index, method, params in [
+                (1, 'auth', {'token': 'private-env-token'}),
+                (2, 'tools/call', {'name': 'portal_status', 'arguments': {}}),
+            ]:
+                connection.sendall((json.dumps(dict(jsonrpc='2.0', id=index, method=method, params=params)) + '\n').encode())
+                reply = json.loads(reader.readline())
+                self.assertFalse(reply.get('error'), reply)
+            status = json.loads(reply['result']['content'][0]['text'])
+            self.assertEqual(Path(status['portal']['executable']).resolve(), bundled.resolve())
+            self.assertTrue(status['tools']['exec'])
+            self.assertEqual(status['kits']['loaded'], 0)
+        self.assertIn('exec=false', self.config.read_text())
+        telemetry = json.loads((self.root / '.portal-connection-status.json').read_text())
+        self.assertEqual(telemetry['pid'], self.process.pid)
+        self.assertEqual(telemetry['nonce'], 'fixture-nonce')
+        self.assertEqual(telemetry['state'], 'local')
 
     def test_tcp_reports_running_binary_and_loaded_configuration(self):
         with socket.socket() as reserve:
